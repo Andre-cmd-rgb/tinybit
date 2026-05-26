@@ -5,6 +5,7 @@
 /sessions/
 .agents/
 .codex/
+.gcloud/
 *.safetensors
 *.gguf
 .env

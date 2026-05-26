@@ -1,14 +1,14 @@
 use crate::{
-    checkpoint::{save_checkpoint, CheckpointMeta},
+    checkpoint::{load_checkpoint, save_checkpoint, CheckpointMeta},
     data::{DataLoader, TokenDataset},
     loss::cross_entropy_loss,
     scheduler::WsdScheduler,
 };
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{VarBuilder, VarMap};
+use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use indicatif::{ProgressBar, ProgressStyle};
 use tiny_bit_core::{config::ModelConfig, model::TinyBit};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, serde::Deserialize)]
 pub struct TrainingConfig {
@@ -40,13 +40,15 @@ impl TrainingConfig {
 pub struct Trainer {
     pub config: TrainingConfig,
     pub model_config: ModelConfig,
+    pub resume: bool,
 }
 
 impl Trainer {
-    pub fn new(config: TrainingConfig, model_config: ModelConfig) -> Self {
+    pub fn new(config: TrainingConfig, model_config: ModelConfig, resume: bool) -> Self {
         Self {
             config,
             model_config,
+            resume,
         }
     }
 
@@ -58,11 +60,35 @@ impl Trainer {
     }
 
     pub fn run(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.config.batch_size > 0, "batch_size must be > 0");
+        anyhow::ensure!(self.config.grad_accum > 0, "grad_accum must be > 0");
+        anyhow::ensure!(self.config.eval_every > 0, "eval_every must be > 0");
+        anyhow::ensure!(self.config.save_every > 0, "save_every must be > 0");
+
         let device = Self::auto_device()?;
         info!("training device: {device:?}");
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let model = TinyBit::new(self.model_config.clone(), vb)?;
+
+        let (model, varmap, mut step, mut tokens_seen) =
+            if self.resume && self.config.checkpoint_dir.exists() {
+                match load_checkpoint(&self.config.checkpoint_dir, &device) {
+                    Ok((model, meta, varmap)) => {
+                        info!("resumed checkpoint at step={}", meta.step);
+                        (model, varmap, meta.step, meta.tokens_seen)
+                    }
+                    Err(err) => {
+                        warn!("could not resume checkpoint, starting from scratch: {err}");
+                        let varmap = VarMap::new();
+                        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+                        let model = TinyBit::new(self.model_config.clone(), vb)?;
+                        (model, varmap, 0, 0)
+                    }
+                }
+            } else {
+                let varmap = VarMap::new();
+                let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+                let model = TinyBit::new(self.model_config.clone(), vb)?;
+                (model, varmap, 0, 0)
+            };
 
         let train_ds = TokenDataset::open(&self.config.train_data, self.model_config.max_seq_len)?;
         let val_ds = TokenDataset::open(&self.config.val_data, self.model_config.max_seq_len)?;
@@ -71,6 +97,14 @@ impl Trainer {
         let mut val_loader = DataLoader::new(val_ds, self.config.batch_size, false);
 
         let scheduler = WsdScheduler::new(self.config.peak_lr, self.config.total_steps);
+        let params = ParamsAdamW {
+            lr: self.config.peak_lr,
+            beta1: 0.9,
+            beta2: 0.95,
+            eps: 1e-8,
+            weight_decay: self.config.weight_decay,
+        };
+        let mut optimizer = AdamW::new(varmap.all_vars(), params)?;
 
         let total_steps = if self.config.smoke_test_steps > 0 {
             self.config.smoke_test_steps
@@ -87,8 +121,8 @@ impl Trainer {
 
         let mut grad_accum_count = 0usize;
         let mut accum_loss = 0.0f64;
-        let mut tokens_seen = 0usize;
-        let mut step = 0usize;
+        let mut accum_loss_tensor: Option<Tensor> = None;
+        let mut last_val_loss = f64::INFINITY;
 
         while step < total_steps {
             if let Some((inputs, targets)) = train_loader.next_batch()? {
@@ -106,11 +140,21 @@ impl Trainer {
                 let loss = cross_entropy_loss(&logits, &target_t)?;
                 let loss_val = loss.to_scalar::<f32>()? as f64;
                 accum_loss += loss_val;
+                let scaled_loss = (loss / self.config.grad_accum as f64)?;
+                accum_loss_tensor = Some(match accum_loss_tensor.take() {
+                    Some(accum) => (accum + scaled_loss)?,
+                    None => scaled_loss,
+                });
                 tokens_seen += b * t;
                 grad_accum_count += 1;
 
                 if grad_accum_count >= self.config.grad_accum {
                     let lr = scheduler.get_lr(step);
+                    let train_loss = accum_loss / grad_accum_count as f64;
+                    optimizer.set_learning_rate(lr);
+                    if let Some(loss) = accum_loss_tensor.take() {
+                        optimizer.backward_step(&loss)?;
+                    }
                     info!(
                         "step={step} lr={lr:.2e} loss={:.4}",
                         accum_loss / grad_accum_count as f64
@@ -123,14 +167,15 @@ impl Trainer {
 
                     if step % self.config.eval_every == 0 {
                         let val_loss = self.eval_loss(&model, &mut val_loader, &device)?;
+                        last_val_loss = val_loss;
                         info!("step={step} val_loss={val_loss:.4}");
                     }
 
                     if step % self.config.save_every == 0 || step == total_steps {
                         let meta = CheckpointMeta {
                             step,
-                            train_loss: loss_val,
-                            val_loss: 0.0,
+                            train_loss,
+                            val_loss: last_val_loss,
                             tokens_seen,
                             config: self.model_config.clone(),
                             timestamp: chrono::Utc::now().to_rfc3339(),

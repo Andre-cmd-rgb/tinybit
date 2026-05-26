@@ -27,6 +27,6 @@ pub fn run(args: TrainArgs) -> anyhow::Result<()> {
         train_config.smoke_test_steps = 200;
     }
 
-    let trainer = Trainer::new(train_config, model_config);
+    let trainer = Trainer::new(train_config, model_config, args.resume);
     trainer.run()
 }
