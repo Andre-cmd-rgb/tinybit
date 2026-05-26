@@ -32,13 +32,14 @@ gcloud compute instances create "$INSTANCE_NAME" \
   --metadata=startup-script="
 #!/bin/bash
 set -euo pipefail
-apt-get update -q && apt-get install -y curl build-essential screen
+apt-get update -q && apt-get install -y curl build-essential screen python3-pip
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source \$HOME/.cargo/env
 export PATH=\"/usr/local/cuda/bin:\$PATH\"
 export LD_LIBRARY_PATH=\"/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}\"
 nvidia-smi
 nvcc --version
+python3 -m pip install --break-system-packages datasets tokenizers tqdm || python3 -m pip install --user datasets tokenizers tqdm
 
 # Fetch code from GCS
 gsutil -m cp -r ${BUCKET}/tiny-bit/ /workspace/
@@ -48,7 +49,7 @@ cd /workspace/tiny-bit
 RUSTFLAGS='-C target-cpu=native' cargo build --release -p tiny-bit-cli --features cuda
 
 # Prepare data
-./scripts/prepare_data.sh data/
+TOTAL_TOKENS=${TOTAL_TOKENS:-500000000} ./scripts/prepare_data.sh data/
 
 # Run smoke test first
 echo 'Running smoke test...'

@@ -30,15 +30,16 @@ gcloud compute instances create "$INSTANCE_NAME" \
   --metadata=startup-script="
 #!/bin/bash
 set -euo pipefail
-apt-get update -q && apt-get install -y curl build-essential screen
+apt-get update -q && apt-get install -y curl build-essential screen python3-pip
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source \$HOME/.cargo/env
+python3 -m pip install --break-system-packages datasets tokenizers tqdm || python3 -m pip install --user datasets tokenizers tqdm
 
 gsutil -m cp -r ${BUCKET}/tiny-bit/ /workspace/
 cd /workspace/tiny-bit
 
 RUSTFLAGS='-C target-cpu=native' cargo build --release -p tiny-bit-cli
-./scripts/prepare_data.sh data/
+TOTAL_TOKENS=${TOTAL_TOKENS:-500000000} ./scripts/prepare_data.sh data/
 
 screen -dm -S train bash -c '
   ./target/release/tiny-bit train \

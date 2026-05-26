@@ -10,7 +10,7 @@
 #   - dolphin-r1: reasoning + general QA
 #
 # Requirements: pip install datasets tokenizers tqdm
-# Total size: ~30-50GB raw, ~8GB tokenized
+# Total size depends on TOTAL_TOKENS. Default target is 500M tokens.
 #
 # Mixing ratios:
 #   40% FineWeb-Edu + 30% Wikipedia + 15% OpenHermes + 10% Stack + 5% Dolphin
@@ -22,8 +22,8 @@ mkdir -p "$OUTPUT_DIR"
 
 echo "Preparing data in $OUTPUT_DIR ..."
 
-python3 - <<'PYTHON'
-import sys, struct, random
+python3 - "$OUTPUT_DIR" <<'PYTHON'
+import os, sys, struct, random
 from pathlib import Path
 
 OUTPUT_DIR = sys.argv[1] if len(sys.argv) > 1 else "data"
@@ -50,8 +50,8 @@ except Exception:
         sys.exit(1)
 
 EOS_ID = tokenizer.token_to_id("</s>") or 2
-SEQ_LEN = 1024
-TOTAL_TOKENS = 500_000_000  # 500M tokens target
+SEQ_LEN = int(os.environ.get("SEQ_LEN", "1024"))
+TOTAL_TOKENS = int(os.environ.get("TOTAL_TOKENS", "500000000"))
 
 # Dataset configs: (name, config, split, text_field, weight)
 datasets_config = [
@@ -116,4 +116,4 @@ def write_bin(tokens, path):
 write_bin(train_tokens, f"{OUTPUT_DIR}/train.bin")
 write_bin(val_tokens,   f"{OUTPUT_DIR}/val.bin")
 print("Done!")
-PYTHON "$OUTPUT_DIR"
+PYTHON
