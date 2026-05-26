@@ -7,6 +7,7 @@
 #
 # Optional env:
 #   GCP_ZONE=us-central1-a
+#   GCP_MACHINE_TYPE=g2-standard-4
 #   DATA_TOKENS=20000000
 #   TRAIN_STEPS=2000
 #   PROVISIONING_MODEL=STANDARD  # or SPOT
@@ -21,6 +22,7 @@ MODEL_SIZE="${1:-nano}"
 
 REGION="${GCP_REGION:-us-central1}"
 ZONE="${GCP_ZONE:-${REGION}-a}"
+MACHINE_TYPE="${GCP_MACHINE_TYPE:-g2-standard-4}"
 DATA_TOKENS="${DATA_TOKENS:-20000000}"
 TRAIN_STEPS="${TRAIN_STEPS:-2000}"
 PROVISIONING_MODEL="${PROVISIONING_MODEL:-STANDARD}"
@@ -28,6 +30,7 @@ INSTANCE_NAME="tiny-bit-overnight-$(date +%s)"
 
 echo "Launching overnight training for model: $MODEL_SIZE"
 echo "Project: $GCP_PROJECT | Zone: $ZONE | Bucket: $GCP_BUCKET"
+echo "Machine type: $MACHINE_TYPE"
 echo "Data tokens: $DATA_TOKENS | Train steps: $TRAIN_STEPS | Provisioning: $PROVISIONING_MODEL"
 
 INSTANCE_FLAGS=(--maintenance-policy="TERMINATE")
@@ -38,7 +41,7 @@ fi
 gcloud compute instances create "$INSTANCE_NAME" \
   --project="$GCP_PROJECT" \
   --zone="$ZONE" \
-  --machine-type="g2-standard-8" \
+  --machine-type="$MACHINE_TYPE" \
   --image-family="common-cu129-ubuntu-2204-nvidia-580" \
   --image-project="deeplearning-platform-release" \
   --boot-disk-size="200GB" \
