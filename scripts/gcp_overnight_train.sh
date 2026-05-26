@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bounded overnight GCP training run on a spot L4 GPU.
+# Bounded overnight GCP training run on an L4 GPU.
 #
 # Required env:
 #   GCP_PROJECT=tinybit-run-0
