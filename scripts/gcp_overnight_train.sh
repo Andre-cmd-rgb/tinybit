@@ -9,6 +9,7 @@
 #   GCP_ZONE=us-central1-a
 #   DATA_TOKENS=20000000
 #   TRAIN_STEPS=2000
+#   PROVISIONING_MODEL=STANDARD  # or SPOT
 #
 # Usage: ./scripts/gcp_overnight_train.sh [nano|micro|small]
 
@@ -22,11 +23,17 @@ REGION="${GCP_REGION:-us-central1}"
 ZONE="${GCP_ZONE:-${REGION}-a}"
 DATA_TOKENS="${DATA_TOKENS:-20000000}"
 TRAIN_STEPS="${TRAIN_STEPS:-2000}"
+PROVISIONING_MODEL="${PROVISIONING_MODEL:-STANDARD}"
 INSTANCE_NAME="tiny-bit-overnight-$(date +%s)"
 
 echo "Launching overnight training for model: $MODEL_SIZE"
 echo "Project: $GCP_PROJECT | Zone: $ZONE | Bucket: $GCP_BUCKET"
-echo "Data tokens: $DATA_TOKENS | Train steps: $TRAIN_STEPS"
+echo "Data tokens: $DATA_TOKENS | Train steps: $TRAIN_STEPS | Provisioning: $PROVISIONING_MODEL"
+
+INSTANCE_FLAGS=(--maintenance-policy="TERMINATE")
+if [ "$PROVISIONING_MODEL" = "SPOT" ]; then
+  INSTANCE_FLAGS+=(--provisioning-model="SPOT" --instance-termination-action="STOP")
+fi
 
 gcloud compute instances create "$INSTANCE_NAME" \
   --project="$GCP_PROJECT" \
@@ -36,9 +43,7 @@ gcloud compute instances create "$INSTANCE_NAME" \
   --image-project="deeplearning-platform-release" \
   --boot-disk-size="200GB" \
   --boot-disk-type="pd-ssd" \
-  --provisioning-model="SPOT" \
-  --instance-termination-action="STOP" \
-  --maintenance-policy="TERMINATE" \
+  "${INSTANCE_FLAGS[@]}" \
   --scopes="storage-full" \
   --metadata=startup-script="
 #!/bin/bash
