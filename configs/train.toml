@@ -1,0 +1,16 @@
+train_data     = "data/train.bin"
+val_data       = "data/val.bin"
+checkpoint_dir = "checkpoints/"
+
+batch_size     = 4
+grad_accum     = 8
+total_steps    = 100000
+peak_lr        = 3e-4
+weight_decay   = 0.01
+grad_clip      = 1.0
+
+save_every     = 500
+eval_every     = 100
+eval_batches   = 50
+
+smoke_test_steps = 0

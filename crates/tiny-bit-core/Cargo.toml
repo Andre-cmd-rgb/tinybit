@@ -1,0 +1,23 @@
+[package]
+name    = "tiny-bit-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
+[dependencies]
+candle-core  = { workspace = true }
+candle-nn    = { workspace = true }
+tokenizers   = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+toml         = { workspace = true }
+safetensors  = { workspace = true }
+anyhow       = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+hf-hub       = { workspace = true }
+half         = { workspace = true }
+tokio        = { workspace = true }

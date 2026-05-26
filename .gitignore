@@ -1,0 +1,10 @@
+/target/
+/data/*.bin
+/checkpoints/
+/models/
+/sessions/
+.agents/
+.codex/
+*.safetensors
+*.gguf
+.env

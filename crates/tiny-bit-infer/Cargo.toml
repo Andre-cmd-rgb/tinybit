@@ -1,0 +1,22 @@
+[package]
+name    = "tiny-bit-infer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+cuda = ["tiny-bit-core/cuda", "candle-core/cuda", "candle-nn/cuda"]
+
+[dependencies]
+tiny-bit-core  = { path = "../tiny-bit-core" }
+tiny-bit-tools = { path = "../tiny-bit-tools" }
+candle-core    = { workspace = true }
+candle-nn      = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+anyhow         = { workspace = true }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }
+chrono         = { workspace = true }
+rand           = { workspace = true }
+tokio          = { workspace = true }

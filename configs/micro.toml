@@ -1,0 +1,11 @@
+vocab_size  = 32000
+num_layers  = 12
+d_model     = 512
+d_ffn       = 1024
+num_heads   = 8
+head_dim    = 64
+max_seq_len = 1024
+dropout     = 0.05
+spec_heads  = 0
+ternary_ffn = false
+int8_time   = false
