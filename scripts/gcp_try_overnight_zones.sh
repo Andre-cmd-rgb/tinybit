@@ -1,12 +1,13 @@
 #!/bin/bash
-# Try multiple L4 zones until an overnight training VM starts.
+# Try multiple GPU zones until an overnight training VM starts.
 #
 # Required env:
 #   GCP_PROJECT=tinybit-run-0
 #   GCP_BUCKET=gs://tinybit-run-0-tiny-bit
 #
 # Optional env:
-#   GCP_MACHINE_TYPE=g2-standard-4
+#   GCP_MACHINE_TYPE=n1-standard-4
+#   GCP_ACCELERATOR_TYPE=nvidia-tesla-t4
 #   DATA_TOKENS=20000000
 #   TRAIN_STEPS=2000
 #   PROVISIONING_MODEL=STANDARD
@@ -23,15 +24,16 @@ MODEL_SIZE="${1:-nano}"
 DEFAULT_ZONES=(
   europe-west1-b
   europe-west1-c
+  europe-west4-a
   europe-west4-b
   europe-west4-c
-  europe-west4-a
   europe-west3-a
   europe-west3-b
   europe-west2-a
   europe-west2-b
   europe-west6-b
   europe-west6-c
+  us-central1-a
   us-central1-b
   us-central1-c
   us-west1-a

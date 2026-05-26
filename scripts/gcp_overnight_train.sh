@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bounded overnight GCP training run on an L4 GPU.
+# Bounded overnight GCP training run on a GPU VM.
 #
 # Required env:
 #   GCP_PROJECT=tinybit-run-0
@@ -7,7 +7,8 @@
 #
 # Optional env:
 #   GCP_ZONE=us-central1-a
-#   GCP_MACHINE_TYPE=g2-standard-4
+#   GCP_MACHINE_TYPE=n1-standard-4
+#   GCP_ACCELERATOR_TYPE=nvidia-tesla-t4
 #   DATA_TOKENS=20000000
 #   TRAIN_STEPS=2000
 #   PROVISIONING_MODEL=STANDARD  # or SPOT
@@ -22,7 +23,12 @@ MODEL_SIZE="${1:-nano}"
 
 REGION="${GCP_REGION:-us-central1}"
 ZONE="${GCP_ZONE:-${REGION}-a}"
-MACHINE_TYPE="${GCP_MACHINE_TYPE:-g2-standard-4}"
+MACHINE_TYPE="${GCP_MACHINE_TYPE:-n1-standard-4}"
+if [[ "$MACHINE_TYPE" == g2-* && -z "${GCP_ACCELERATOR_TYPE+x}" ]]; then
+  ACCELERATOR_TYPE=""
+else
+  ACCELERATOR_TYPE="${GCP_ACCELERATOR_TYPE:-nvidia-tesla-t4}"
+fi
 DATA_TOKENS="${DATA_TOKENS:-20000000}"
 TRAIN_STEPS="${TRAIN_STEPS:-2000}"
 PROVISIONING_MODEL="${PROVISIONING_MODEL:-STANDARD}"
@@ -31,9 +37,13 @@ INSTANCE_NAME="tiny-bit-overnight-$(date +%s)"
 echo "Launching overnight training for model: $MODEL_SIZE"
 echo "Project: $GCP_PROJECT | Zone: $ZONE | Bucket: $GCP_BUCKET"
 echo "Machine type: $MACHINE_TYPE"
+echo "Accelerator: ${ACCELERATOR_TYPE:-included-with-machine}"
 echo "Data tokens: $DATA_TOKENS | Train steps: $TRAIN_STEPS | Provisioning: $PROVISIONING_MODEL"
 
 INSTANCE_FLAGS=(--maintenance-policy="TERMINATE")
+if [ -n "$ACCELERATOR_TYPE" ]; then
+  INSTANCE_FLAGS+=(--accelerator="type=${ACCELERATOR_TYPE},count=1")
+fi
 if [ "$PROVISIONING_MODEL" = "SPOT" ]; then
   INSTANCE_FLAGS+=(--provisioning-model="SPOT" --instance-termination-action="STOP")
 fi
