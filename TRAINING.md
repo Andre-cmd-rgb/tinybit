@@ -94,8 +94,8 @@ int8_time   = false
 Controls the training run. Key fields:
 
 ```toml
-batch_size  = 4     # sequences per microbatch (per GPU forward pass)
-grad_accum  = 16    # microbatches before one optimizer step
+batch_size  = 6     # sequences per microbatch (per GPU forward pass)
+grad_accum  = 11    # microbatches before one optimizer step
 total_steps = 25000 # optimizer steps to run
 peak_lr     = 3e-4  # warmup target and stable-phase LR
 grad_clip   = 1.0   # global L2 norm clip
@@ -106,24 +106,25 @@ eval_every  = 500   # compute val loss every N optimizer steps
 **Token budget:**
 ```
 effective_batch = batch_size × seq_len × grad_accum
-               = 4 × 512 × 16 = 32_768 tokens/step
+               = 6 × 512 × 11 = 33_792 tokens/step
 
 total_tokens = total_steps × effective_batch
-             = 25_000 × 32_768 ≈ 819 M tokens
+             = 25_000 × 33_792 ≈ 845 M tokens
 ```
 
-Set `DATA_TOKENS=1500000000` (~80 % headroom over the training budget) so
+Set `DATA_TOKENS=1500000000` (~75 % headroom over the training budget) so
 data preparation collects enough tokens even if some datasets fail or are
 skipped.
 
-Why `batch_size = 4`: the RWKV-7 WKV scan in
+Why `batch_size = 6`: the RWKV-7 WKV scan in
 `crates/tinybit-core/src/model/time_mix.rs` is a candle-side sequential
 loop that retains every intermediate state in the autograd graph for
-backward. Peak training VRAM therefore scales linearly with
+backward. Peak training VRAM scales linearly with
 `batch_size × max_seq_len × num_layers`. On a 24 GB L4 with the 16-layer
-50M micro at `max_seq_len = 512`, `batch_size = 4` is comfortable with
-several GB of headroom; pushing higher risks OOM under candle's pool
-allocator overhead.
+50M micro at `max_seq_len = 512`, `batch_size = 6` peaks at ~19.5 GB with
+~3 GB headroom — a balance between throughput and OOM safety. B=4 is
+safer but ~30 % slower; B=8 lands right at the OOM cliff under candle's
+pool allocator overhead.
 
 ---
 

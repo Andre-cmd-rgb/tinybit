@@ -1,13 +1,13 @@
 # 50M `micro` model on a single NVIDIA L4 (24 GB VRAM).
 #
 # Per-step token budget:
-#   batch 4 × seq 512 × grad_accum 16 = 32_768 tokens / step
+#   batch 6 × seq 512 × grad_accum 11 = 33_792 tokens / step
 #
 # Total token budget:
-#   25_000 steps × 32_768 ≈ 0.82 B tokens
+#   25_000 steps × 33_792 ≈ 0.84 B tokens
 #
 # Wall-clock estimate on L4 SPOT (~$0.22/hr):
-#   ~15-22 h, ~$4-6 total.
+#   ~10-15 h, ~$3-5 total.
 #
 # Pair with:
 #   DATA_TOKENS=1500000000
@@ -16,8 +16,8 @@ train_data     = "data/train.bin"
 val_data       = "data/val.bin"
 checkpoint_dir = "checkpoints/"
 
-batch_size     = 4
-grad_accum     = 16
+batch_size     = 6
+grad_accum     = 11
 total_steps    = 25000
 peak_lr        = 3e-4
 weight_decay   = 0.01

@@ -96,9 +96,9 @@ Watch it:
 ## What `configs/train-micro-l4.toml` does
 
 ```
-batch_size     = 4       # × max_seq_len 512 (from configs/micro.toml)
-grad_accum     = 16      # → effective batch 64  →  64 * 512 = 32_768 tokens / step
-total_steps    = 25000   # → 25000 * 32_768 ≈ 819M token-passes
+batch_size     = 6       # × max_seq_len 512 (from configs/micro.toml)
+grad_accum     = 11      # → effective batch 66  →  66 * 512 = 33_792 tokens / step
+total_steps    = 25000   # → 25000 * 33_792 ≈ 845M token-passes
 peak_lr        = 3e-4    # WSD: 2% warmup, 78% stable, 20% cosine decay to 3e-5
 weight_decay   = 0.01
 grad_clip      = 1.0     # global L2 norm clipping
@@ -109,17 +109,17 @@ eval_batches   = 20
 ```
 
 Paired with `configs/micro.toml` (50M params), this is roughly Chinchilla-
-optimal (16 toks/param) — enough for genuinely coherent English, simple
+optimal (17 toks/param) — enough for genuinely coherent English, simple
 question following, and recognizable knowledge from the FineWeb-Edu /
 Wikipedia / OpenHermes mix.
 
-Why the moderate `batch_size`: candle's sequential WKV scan in
+Why this `batch_size`: candle's sequential WKV scan in
 `crates/tinybit-core/src/model/time_mix.rs` retains every intermediate
 state in the autograd graph for backward, so peak training VRAM scales
 linearly with `batch_size × max_seq_len × num_layers`. On a 24 GB L4 with
-the 16-layer 50M micro, `batch_size = 4` at `max_seq_len = 512` is roughly
-the largest microbatch that reliably fits with headroom for optimizer
-state and the logits projection.
+the 16-layer 50M micro at `max_seq_len = 512`, `batch_size = 6` lands at
+~19.5 GB peak with ~3 GB headroom; B=4 leaves more headroom but ~30%
+slower, B=8 lands at the OOM cliff.
 
 If you're tighter on time:
 
