@@ -93,20 +93,20 @@ fi
 
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)-${MODEL_SIZE}}"
 
-# Default zone list — broad set with US first.
+# Default zone list — EU first, then US, then Asia.
 # A100 / H100 capacity is much tighter than L4/T4; the launcher will still
 # try every zone in order. If you know which zone has the GPU you want,
 # pass GCP_ZONES="zone1 zone2 ..." to skip the others.
 DEFAULT_ZONES=(
+  europe-west4-a europe-west4-b europe-west4-c
+  europe-west1-b europe-west1-c
+  europe-west3-a europe-west3-b
+  europe-west2-a europe-west2-b
   us-central1-a us-central1-b us-central1-c us-central1-f
   us-west1-a us-west1-b us-west4-a us-west4-c
   us-east1-b us-east1-c us-east1-d
   us-east4-a us-east4-b us-east4-c
   us-east5-a us-east5-b us-east5-c
-  europe-west1-b europe-west1-c
-  europe-west4-a europe-west4-b europe-west4-c
-  europe-west3-a europe-west3-b
-  europe-west2-a europe-west2-b
   asia-southeast1-b asia-southeast1-c
 )
 if [ -n "${GCP_ZONES:-}" ]; then
