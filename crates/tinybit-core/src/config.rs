@@ -81,6 +81,21 @@ impl ModelConfig {
         }
     }
 
+    /// Validate config consistency. Call after loading from TOML.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.d_model == self.num_heads * self.head_dim,
+            "d_model ({}) must equal num_heads ({}) * head_dim ({})",
+            self.d_model, self.num_heads, self.head_dim
+        );
+        anyhow::ensure!(self.vocab_size > 0, "vocab_size must be > 0");
+        anyhow::ensure!(self.num_layers > 0, "num_layers must be > 0");
+        anyhow::ensure!(self.d_model > 0, "d_model must be > 0");
+        anyhow::ensure!(self.d_ffn > 0, "d_ffn must be > 0");
+        anyhow::ensure!(self.max_seq_len > 0, "max_seq_len must be > 0");
+        Ok(())
+    }
+
     /// Load from a TOML config file.
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;

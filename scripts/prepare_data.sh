@@ -21,6 +21,7 @@
 set -Eeuo pipefail
 
 OUTPUT_DIR="${1:-data}"
+OUTPUT_DIR="${OUTPUT_DIR%/}"  # strip trailing slash to avoid double-slash paths
 mkdir -p "$OUTPUT_DIR"
 
 echo "Preparing data in $OUTPUT_DIR ..."

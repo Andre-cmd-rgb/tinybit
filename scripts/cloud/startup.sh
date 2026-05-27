@@ -350,6 +350,26 @@ smoke_test_steps = 0
 TOML
 fi
 
+# ---------- free_gpu_memory ---------------------------------------------------
+# GCP deep-learning images keep background CUDA processes alive (Jupyter,
+# Python ML services) that hold GPU memory and cause immediate OOM when
+# tinybit tries to allocate its model. Kill them before starting training.
+log_stage free_gpu_memory
+pkill -9 -f 'jupyter|tensorboard|python3 -m|/.local/lib' 2>/dev/null || true
+sleep 5
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null \
+    | while IFS=, read -r pid _mem; do
+        pid="${pid// /}"
+        [ -z "$pid" ] && continue
+        comm="$(cat /proc/$pid/comm 2>/dev/null || echo unknown)"
+        log "[gpu-free] killing pid=$pid ($comm) still holding GPU memory"
+        kill -9 "$pid" 2>/dev/null || true
+      done
+  sleep 3
+  nvidia-smi || true
+fi
+
 # ---------- start_training ----------------------------------------------------
 log_stage start_training
 if pgrep -fa "target/release/tinybit train" >/dev/null 2>&1; then

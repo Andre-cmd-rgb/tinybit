@@ -60,7 +60,7 @@ impl TimeMix {
 
     fn group_norm(&self, x: &Tensor) -> anyhow::Result<Tensor> {
         let shape = x.dims().to_vec();
-        let last = *shape.last().unwrap();
+        let last = *shape.last().ok_or_else(|| anyhow::anyhow!("group_norm: empty tensor shape"))?;
         let prefix: Vec<usize> = shape[..shape.len() - 1].to_vec();
 
         let mut nh_shape = prefix.clone();

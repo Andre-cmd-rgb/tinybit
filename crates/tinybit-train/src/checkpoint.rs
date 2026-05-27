@@ -71,7 +71,7 @@ pub fn prune_checkpoints(dir: &Path, keep_best: usize, keep_recent: usize) -> an
 
     // Best by val_loss
     let mut by_loss = metas.clone();
-    by_loss.sort_by(|(_, a), (_, b)| a.val_loss.partial_cmp(&b.val_loss).unwrap());
+    by_loss.sort_by(|(_, a), (_, b)| a.val_loss.partial_cmp(&b.val_loss).unwrap_or(std::cmp::Ordering::Equal));
     let keep_paths: std::collections::HashSet<std::path::PathBuf> = by_loss
         .iter()
         .take(keep_best)

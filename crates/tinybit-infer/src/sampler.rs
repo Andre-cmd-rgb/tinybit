@@ -50,7 +50,7 @@ pub fn sample(
         let best = logits_v
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
             .unwrap_or(0);
         return Ok(best as u32);
@@ -69,7 +69,7 @@ pub fn sample(
     if params.top_k > 0 {
         let k = params.top_k.min(probs.len());
         let mut sorted = probs.clone();
-        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
         let threshold = sorted[k - 1];
         for p in &mut probs {
             if *p < threshold { *p = 0.0; }
@@ -81,7 +81,7 @@ pub fn sample(
         let sum: f32 = probs.iter().sum();
         if sum > 0.0 {
             let mut sorted_idx: Vec<usize> = (0..probs.len()).collect();
-            sorted_idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            sorted_idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
             let mut cumsum = 0.0f32;
             for &idx in &sorted_idx {
                 cumsum += probs[idx] / sum;

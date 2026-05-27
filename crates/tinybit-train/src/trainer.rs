@@ -58,8 +58,10 @@ impl Trainer {
     pub fn run(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.config.batch_size > 0, "batch_size must be > 0");
         anyhow::ensure!(self.config.grad_accum > 0, "grad_accum must be > 0");
+        anyhow::ensure!(self.config.total_steps > 0, "total_steps must be > 0");
         anyhow::ensure!(self.config.eval_every > 0, "eval_every must be > 0");
         anyhow::ensure!(self.config.save_every > 0, "save_every must be > 0");
+        self.model_config.validate()?;
 
         let device = Self::auto_device()?;
         info!("training device: {device:?}");
