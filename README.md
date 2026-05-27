@@ -1,6 +1,6 @@
 # tinybit
 
-A local AI assistant built on **RWKV-7** with **ternary BitLinear** quantization. Configurable from 10M to 400M parameters. Train on Google Cloud free credits; run on Linux, macOS (M-series), or Windows.
+A local AI assistant built on **RWKV-7** with **ternary BitLinear** quantization. Configurable from 25M to 400M parameters. Train on Google Cloud free credits; run on Linux, macOS (M-series), or Windows.
 
 Apache 2.0 — all Rust, no C++ compiler required.
 
@@ -11,7 +11,7 @@ Apache 2.0 — all Rust, no C++ compiler required.
 - **RWKV-7 architecture** — recurrent transformer with O(1) memory at inference (no KV cache)
 - **BitLinear quantization** — ternary weights `{-1, 0, +1}` via BitNet b1.58 STE
 - **Built-in tools** — calculator, time, todos, notes, calendar (SQLite-backed, user-extensible)
-- **Four size presets** — nano (10M), micro (50M), small (150M), base (400M)
+- **Four size presets** — nano (25M), micro (50M), small (150M), base (400M)
 - **Muon + AdamW optimizer** — Newton-Schulz gradient orthogonalization for weight matrices
 - **OpenAI-compatible HTTP server** — drop-in for local inference
 - **Speculative decoding heads** — optional extra heads on small/base for faster sampling
@@ -43,7 +43,7 @@ tinybit download --out data/tokenizer.json
 
 | Preset | Params | Layers | d_model | Notes |
 |--------|--------|--------|---------|-------|
-| nano   | ~10M   | 6      | 256     | Edge devices, fast iteration |
+| nano   | ~25M   | 12     | 320     | Smallest coherent model, fast iteration |
 | micro  | ~50M   | 12     | 512     | Laptop inference |
 | small  | ~150M  | 18     | 768     | Default training target |
 | base   | ~400M  | 32     | 1024    | Best quality |
@@ -52,12 +52,12 @@ Config files live in `configs/`. Override any field:
 
 ```toml
 # configs/nano.toml
-vocab_size = 32000
-num_layers = 6
-d_model = 256
-d_ffn = 512
-num_heads = 4
-head_dim = 64
+vocab_size  = 32008
+num_layers  = 12
+d_model     = 320
+d_ffn       = 640
+num_heads   = 5
+head_dim    = 64
 ```
 
 ---
@@ -76,28 +76,32 @@ bash scripts/prepare_data.sh data/
 ### 2. Train
 
 ```bash
-# Local (CPU, slow — good for smoke testing)
-tinybit train --model-config configs/nano.toml --train-config configs/train.toml
+# Local smoke test (CPU, ~15 min)
+cargo build --release -p tinybit-cli
+./target/release/tinybit train \
+  --model-config configs/nano.toml \
+  --train-config configs/train.toml \
+  --smoke-test
 
 # GCP — unified launcher
 export GCP_PROJECT="your-project-id"
 export GCP_BUCKET="gs://your-bucket"
 
-# Sanity check the environment before paying for a GPU
-./scripts/preflight.sh nano
+# 25M nano (~4-6 h, ~$1-2 SPOT)
+DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-nano-l4.toml \
+PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh nano
 
-# Launch: tries L4 first, then T4; tries all common US/EU zones; stops as
-# soon as one VM is created. Run id, version, machine, zone are printed.
-DATA_TOKENS=20000000 TRAIN_STEPS=2000 \
-  ./scripts/gcp_launch.sh nano
+# 50M micro (~12-18 h, ~$3-5 SPOT)
+DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-micro-l4.toml \
+PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh micro
 
-# Use SPOT pricing
-PROVISIONING_MODEL=SPOT ./scripts/gcp_launch.sh nano
+# 150M small (~30-40 h, ~$7-9 SPOT)
+DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-small-l4.toml \
+PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh small
 
 # Watch the run
-./scripts/gcp_status.sh                        # uses latest_run.txt
-./scripts/gcp_tail_logs.sh <RUN_ID> bootstrap  # while the VM sets itself up
-./scripts/gcp_tail_logs.sh <RUN_ID> training   # once training starts
+./scripts/gcp_status.sh <RUN_ID>           # stage, step, last checkpoint
+./scripts/gcp_tail_logs.sh <RUN_ID>        # tail training log live
 ```
 
 Output layout in the bucket:
@@ -116,16 +120,16 @@ gs://$GCP_BUCKET/latest_run.txt
 Failure handling: any error before training starts uploads `FAILED.json` and
 shuts the VM down (set `KEEP_VM_ON_FAILURE=1` to keep it for debugging).
 
-Training config (`configs/train.toml`):
+Key training config fields (`configs/train-nano-l4.toml` etc.):
 
 ```toml
-batch_size = 16
-seq_len = 1024
-learning_rate = 3e-4
-warmup_steps = 1000
-max_steps = 100000
-checkpoint_every = 5000
-keep_checkpoints = 3
+batch_size     = 16      # sequences per microbatch
+grad_accum     = 4       # microbatches per optimizer step
+total_steps    = 15000   # optimizer steps
+peak_lr        = 3e-4
+grad_clip      = 1.0
+save_every     = 500
+eval_every     = 500
 ```
 
 ### 3. WSD learning rate schedule
