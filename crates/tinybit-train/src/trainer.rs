@@ -1,10 +1,10 @@
 use crate::{
-    checkpoint::{load_checkpoint, save_checkpoint, CheckpointMeta},
+    checkpoint::{load_checkpoint, prune_checkpoints, save_checkpoint, CheckpointMeta},
     data::{DataLoader, TokenDataset},
     loss::cross_entropy_loss,
     scheduler::WsdScheduler,
 };
-use candle_core::{DType, Device, Tensor};
+use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use indicatif::{ProgressBar, ProgressStyle};
 use tinybit_core::{config::ModelConfig, model::TinyBit};
@@ -104,7 +104,9 @@ impl Trainer {
             eps: 1e-8,
             weight_decay: self.config.weight_decay,
         };
-        let mut optimizer = AdamW::new(varmap.all_vars(), params)?;
+        let all_vars = varmap.all_vars();
+        let mut optimizer = AdamW::new(all_vars.clone(), params)?;
+        let mut skipped_steps = 0usize;
 
         let total_steps = if self.config.smoke_test_steps > 0 {
             self.config.smoke_test_steps
@@ -152,14 +154,53 @@ impl Trainer {
                     let lr = scheduler.get_lr(step);
                     let train_loss = accum_loss / grad_accum_count as f64;
                     optimizer.set_learning_rate(lr);
-                    if let Some(loss) = accum_loss_tensor.take() {
-                        optimizer.backward_step(&loss)?;
+
+                    let loss = match accum_loss_tensor.take() {
+                        Some(l) => l,
+                        None => continue,
+                    };
+
+                    // Guard: never let a NaN/Inf microbatch poison the
+                    // optimizer state. Skip the update and reset accumulators.
+                    if !train_loss.is_finite() {
+                        warn!(
+                            "step={step} skipping update — non-finite loss ({:.4})",
+                            train_loss
+                        );
+                        skipped_steps += 1;
+                        grad_accum_count = 0;
+                        accum_loss = 0.0;
+                        continue;
                     }
+
+                    // Compute grads, clip the global L2 norm, then step.
+                    let mut grads = loss.backward()?;
+                    let grad_norm = if self.config.grad_clip > 0.0 {
+                        clip_grad_norm(&mut grads, &all_vars, self.config.grad_clip)?
+                    } else {
+                        global_grad_norm(&grads, &all_vars)?
+                    };
+
+                    if !grad_norm.is_finite() {
+                        warn!(
+                            "step={step} skipping update — non-finite grad norm ({grad_norm:.4})"
+                        );
+                        skipped_steps += 1;
+                        grad_accum_count = 0;
+                        accum_loss = 0.0;
+                        continue;
+                    }
+
+                    optimizer.step(&grads)?;
+
                     info!(
-                        "step={step} lr={lr:.2e} loss={:.4}",
-                        accum_loss / grad_accum_count as f64
+                        "step={step} lr={lr:.2e} loss={:.4} gnorm={:.3}",
+                        train_loss, grad_norm
                     );
-                    pb.set_message(format!("{:.4}", accum_loss / grad_accum_count as f64));
+                    pb.set_message(format!(
+                        "loss={:.4} gnorm={:.3}",
+                        train_loss, grad_norm
+                    ));
                     pb.inc(1);
                     grad_accum_count = 0;
                     accum_loss = 0.0;
@@ -181,6 +222,14 @@ impl Trainer {
                             timestamp: chrono::Utc::now().to_rfc3339(),
                         };
                         save_checkpoint(&varmap, &meta, &self.config.checkpoint_dir)?;
+                        // Prune so disk doesn't fill up on long runs.
+                        if let Err(e) = prune_checkpoints(
+                            &self.config.checkpoint_dir,
+                            CKPT_KEEP_BEST,
+                            CKPT_KEEP_RECENT,
+                        ) {
+                            warn!("checkpoint prune failed: {e}");
+                        }
                     }
                 }
             } else {
@@ -188,6 +237,9 @@ impl Trainer {
             }
         }
         pb.finish();
+        if skipped_steps > 0 {
+            warn!("training finished with {skipped_steps} skipped step(s) due to non-finite loss/grad");
+        }
         Ok(())
     }
 
@@ -223,4 +275,39 @@ impl Trainer {
             total / count as f64
         })
     }
+}
+
+const CKPT_KEEP_BEST: usize = 3;
+const CKPT_KEEP_RECENT: usize = 3;
+
+/// Compute the global L2 grad norm without modifying anything.
+fn global_grad_norm(grads: &GradStore, vars: &[Var]) -> anyhow::Result<f64> {
+    let mut sq_sum = 0.0f64;
+    for v in vars {
+        if let Some(g) = grads.get(v.as_tensor()) {
+            sq_sum += g.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+        }
+    }
+    Ok(sq_sum.sqrt())
+}
+
+/// Clip the gradient tensors in `grads` so the global L2 norm is at most
+/// `max_norm`. Returns the *original* (pre-clip) norm so the caller can log it
+/// — matches PyTorch's `torch.nn.utils.clip_grad_norm_` semantics.
+fn clip_grad_norm(
+    grads: &mut GradStore,
+    vars: &[Var],
+    max_norm: f64,
+) -> anyhow::Result<f64> {
+    let total_norm = global_grad_norm(grads, vars)?;
+    if total_norm.is_finite() && max_norm > 0.0 && total_norm > max_norm {
+        let scale = max_norm / (total_norm + 1e-6);
+        for v in vars {
+            if let Some(g) = grads.remove(v.as_tensor()) {
+                let clipped = (g * scale)?;
+                grads.insert(v.as_tensor(), clipped);
+            }
+        }
+    }
+    Ok(total_norm)
 }

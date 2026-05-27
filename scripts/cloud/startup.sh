@@ -19,6 +19,10 @@
 #   __SYNC_INTERVAL__       — seconds between checkpoint syncs (default 120)
 #   __HF_TOKEN__            — optional HF token, or empty
 #   __SCRIPT_VERSION__      — launcher version string
+#   __TRAIN_CONFIG__        — path to a checked-in train config (relative to
+#                              repo root, e.g. "configs/train-quality.toml")
+#                              or empty to fall back to the inline default
+#                              parameterized by __TRAIN_STEPS__.
 #   __ZONE__ / __MACHINE__ / __ACCELERATOR__ — informational, recorded in status.json
 
 set -Eeuo pipefail
@@ -46,6 +50,7 @@ KEEP_VM_ON_FAILURE="__KEEP_VM_ON_FAILURE__"
 SYNC_INTERVAL="__SYNC_INTERVAL__"
 HF_TOKEN_VAL="__HF_TOKEN__"
 SCRIPT_VERSION="__SCRIPT_VERSION__"
+TRAIN_CONFIG_OVERRIDE="__TRAIN_CONFIG__"
 ZONE_INFO="__ZONE__"
 MACHINE_INFO="__MACHINE__"
 ACCELERATOR_INFO="__ACCELERATOR__"
@@ -263,7 +268,13 @@ test -s data/val.bin
 
 # ---------- prepare_training_config ------------------------------------------
 log_stage prepare_training_config
-cat > configs/train-cloud.toml <<TOML
+if [ -n "$TRAIN_CONFIG_OVERRIDE" ] && [ -r "$TRAIN_CONFIG_OVERRIDE" ]; then
+  TRAIN_CONFIG_PATH="$TRAIN_CONFIG_OVERRIDE"
+  log "[info] using checked-in train config: $TRAIN_CONFIG_PATH"
+else
+  TRAIN_CONFIG_PATH="configs/train-cloud.toml"
+  log "[info] generating inline train config at $TRAIN_CONFIG_PATH (total_steps=$TRAIN_STEPS)"
+  cat > "$TRAIN_CONFIG_PATH" <<TOML
 train_data     = "data/train.bin"
 val_data       = "data/val.bin"
 checkpoint_dir = "checkpoints/"
@@ -281,6 +292,7 @@ eval_batches   = 5
 
 smoke_test_steps = 0
 TOML
+fi
 
 # ---------- start_training ----------------------------------------------------
 log_stage start_training
@@ -291,7 +303,7 @@ else
   setsid bash -c '
     RUST_LOG=tinybit_train=info,info ./target/release/tinybit train \
       --model-config "configs/'"$MODEL_SIZE"'.toml" \
-      --train-config "configs/train-cloud.toml" \
+      --train-config "'"$TRAIN_CONFIG_PATH"'" \
       --resume
   ' </dev/null >>"$TRAINING_LOG" 2>&1 &
   TRAIN_PID=$!

@@ -1,4 +1,3 @@
-use anyhow::Context;
 use candle_core::{DType, Tensor};
 
 /// Quantize a weight matrix to ternary {-1, 0, +1}.

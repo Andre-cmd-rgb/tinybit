@@ -25,6 +25,10 @@
 #   GCS_REPO_PREFIX      bucket prefix       (default: tinybit)
 #   SKIP_UPLOAD          1 to skip rsync     (default: 0)
 #   FORCE                1 to bypass guards  (default: 0)
+#   TRAIN_CONFIG         path inside the repo to a training config TOML
+#                        (e.g. configs/train-quality.toml). Empty falls back
+#                        to an inline generated config parameterized by
+#                        TRAIN_STEPS.
 #
 # Usage:
 #   ./scripts/gcp_launch.sh [nano|micro|small|base]
@@ -60,6 +64,16 @@ HF_TOKEN_VAL="${HF_TOKEN:-}"
 GCS_REPO_PREFIX="${GCS_REPO_PREFIX:-tinybit}"
 SKIP_UPLOAD="${SKIP_UPLOAD:-0}"
 FORCE="${FORCE:-0}"
+TRAIN_CONFIG="${TRAIN_CONFIG:-}"
+
+# If a train config path was given, verify it exists locally so we fail fast
+# before paying for a VM.
+if [ -n "$TRAIN_CONFIG" ]; then
+  if [ ! -r "$REPO_ROOT/$TRAIN_CONFIG" ]; then
+    echo "[FATAL] TRAIN_CONFIG=$TRAIN_CONFIG not found in repo" >&2
+    exit 1
+  fi
+fi
 
 # Default MIN_TOKENS = 75% of DATA_TOKENS
 if [ -z "${MIN_TOKENS:-}" ]; then
@@ -116,6 +130,7 @@ printf '%s\n' \
   " repo prefix   : $GCS_REPO_PREFIX" \
   " sync interval : ${SYNC_INTERVAL}s" \
   " HF token      : $([ -n "$HF_TOKEN_VAL" ] && echo set || echo unset)" \
+  " train config  : ${TRAIN_CONFIG:-<inline default>}" \
   " zones (count) : ${#ZONES[@]}" \
   "============================================================"
 
@@ -182,6 +197,7 @@ subs = {
     "__SYNC_INTERVAL__":      os.environ["SYNC_INTERVAL"],
     "__HF_TOKEN__":           os.environ.get("HF_TOKEN_VAL", ""),
     "__SCRIPT_VERSION__":     os.environ["SCRIPT_VERSION"],
+    "__TRAIN_CONFIG__":       os.environ.get("TRAIN_CONFIG", ""),
     "__ZONE__":               os.environ["ZONE_INFO"],
     "__MACHINE__":            os.environ["MACHINE_INFO"],
     "__ACCELERATOR__":        os.environ["ACCEL_INFO"],
@@ -219,7 +235,7 @@ for profile in "${PROFILE_LIST[@]}"; do
 
     export RUN_ID MODEL_SIZE GCP_BUCKET GCS_REPO_PREFIX DATA_TOKENS MIN_TOKENS \
            TRAIN_STEPS CUDA_VERSION CUDA_DIR KEEP_VM_ON_FAILURE SYNC_INTERVAL \
-           HF_TOKEN_VAL SCRIPT_VERSION
+           HF_TOKEN_VAL SCRIPT_VERSION TRAIN_CONFIG
     ZONE_INFO="$zone" MACHINE_INFO="$machine" ACCEL_INFO="$accel" \
     render_startup "$zone" "$machine" "$accel"
 
