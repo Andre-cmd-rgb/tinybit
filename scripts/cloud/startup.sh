@@ -117,6 +117,7 @@ log_stage() {
   STAGE_CURRENT="$1"
   log "[stage] $1"
   write_status "$1"
+  sync_logs
 }
 
 sync_logs() {
