@@ -43,8 +43,10 @@ struct ChatCompletionRequest {
     model: String,
     messages: Vec<OpenAiMessage>,
     #[serde(default = "default_temp")]
+    #[allow(dead_code)]
     temperature: f64,
     #[serde(default = "default_max")]
+    #[allow(dead_code)]
     max_tokens: usize,
 }
 
@@ -117,7 +119,7 @@ struct ModelInfo {
     object: &'static str,
 }
 
-async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse> {
+async fn list_models(State(_state): State<Arc<AppState>>) -> Json<ModelsResponse> {
     Json(ModelsResponse {
         object: "list",
         data: vec![ModelInfo { id: "tinybit-small".to_string(), object: "model" }],

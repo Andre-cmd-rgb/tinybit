@@ -18,7 +18,7 @@ pub struct Session {
     pub state:         InferenceState,
     pub history:       Vec<ChatMessage>,
     pub system_prompt: String,
-    created_at:        DateTime<Utc>,
+    pub created_at:    DateTime<Utc>,
 }
 
 impl Session {

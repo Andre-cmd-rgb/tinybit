@@ -48,6 +48,19 @@ cargo test --workspace
     via NVIDIA's apt repo and exports CUDA_ROOT/PATH=/usr/local/cuda-12.8 before
     `cargo build`. Do not assume the image's `/usr/local/cuda` symlink is right.
 
+13. prepare_data.sh streams tokens directly to disk with numpy uint32 (4 bytes/token).
+    Never store tokens in a Python list — at 1B tokens that is ~28 GB of RAM.
+    The script writes to a temp file, then copies the tail as val.bin and the head as
+    train.bin without ever loading the full dataset into memory.
+
+14. Gradient accumulation uses per-microbatch backward: each microbatch is forward-passed,
+    immediately backpropped (freeing its graph), and gradients are accumulated in a
+    GradStore. The full computation graph for only ONE microbatch is in VRAM at a time.
+    See trainer.rs for the merge-GradStore pattern.
+
+15. Startup script adds 32 GB swap early (before data prep and cargo build) so that
+    the L4 VM (16 GB RAM) cannot OOM during large downloads or compilation.
+
 ## Common mistakes to avoid
 
 - Do NOT use .unwrap() in library code — propagate with anyhow::Result + ?
@@ -58,3 +71,7 @@ cargo test --workspace
   during inference use state.time_shift (previous actual token embedding)
 - candle_nn::Linear::forward() requires `use candle_nn::Module;` in scope
 - Use candle_nn::Init::Const(val) not candle_nn::init::Const(val)
+- Do NOT store tokens in a Python list — use numpy arrays or stream-write to disk
+- Always pass DATA_TOKENS=1500000000 (not the default 20M) when training the 150M model
+- GradStore::new() is pub(crate) in candle — cannot be created externally.
+  Initialize from the first microbatch's backward() result, then merge subsequent ones.

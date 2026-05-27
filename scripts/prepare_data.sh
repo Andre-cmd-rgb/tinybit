@@ -12,11 +12,11 @@
 # Datasets (all opened in streaming mode):
 #   FineWeb-Edu, Wikipedia EN, OpenHermes-2.5, dolphin-r1 (nonreasoning), the-stack-smol (gated).
 #
-# Failure handling:
-#   - A dataset that errors does not abort the run; its remaining budget is
-#     redistributed proportionally to the surviving datasets.
-#   - If the final collected total is below MIN_TOKENS the script exits non-zero
-#     so the caller can avoid burning GPU time on a starved dataset.
+# Memory design:
+#   Tokens are written directly to disk with numpy (4 bytes/token).
+#   No in-memory token buffer — peak RAM is proportional to one document at a time.
+#   The DataLoader shuffles at training time, so no shuffle is needed here.
+#   Val split is taken from the tail of the stream; train is everything else.
 
 set -Eeuo pipefail
 
@@ -26,17 +26,18 @@ mkdir -p "$OUTPUT_DIR"
 echo "Preparing data in $OUTPUT_DIR ..."
 
 python3 - "$OUTPUT_DIR" <<'PYTHON'
-import os, sys, struct, random
+import os, sys, struct, shutil
 from pathlib import Path
 
 OUTPUT_DIR = sys.argv[1] if len(sys.argv) > 1 else "data"
 
 try:
+    import numpy as np
     from datasets import load_dataset
     from tokenizers import Tokenizer
     from tqdm import tqdm
 except ImportError:
-    print("ERROR: Install required packages: pip install datasets tokenizers tqdm")
+    print("ERROR: Install required packages: pip install datasets tokenizers tqdm numpy")
     sys.exit(1)
 
 SEQ_LEN       = int(os.environ.get("SEQ_LEN", "1024"))
@@ -44,6 +45,10 @@ TOTAL_TOKENS  = int(os.environ.get("TOTAL_TOKENS", "500000000"))
 MIN_TOKENS    = int(os.environ.get("MIN_TOKENS", str(int(TOTAL_TOKENS * 0.75))))
 HF_TOKEN      = os.environ.get("HF_TOKEN", "").strip() or None
 ENABLE_GATED  = os.environ.get("ENABLE_GATED", "1") == "1"
+
+# Write buffer: flush to disk every FLUSH_EVERY tokens to keep RAM usage bounded.
+# At ~4 bytes/token, 4M tokens = 16 MB peak RAM for the buffer.
+FLUSH_EVERY = 4_000_000
 
 print(f"TOTAL_TOKENS={TOTAL_TOKENS:,}  MIN_TOKENS={MIN_TOKENS:,}  HF_TOKEN={'set' if HF_TOKEN else 'unset'}")
 
@@ -109,47 +114,71 @@ if not active:
     print("ERROR: no datasets remain active.")
     sys.exit(2)
 
-# Token bookkeeping ----------------------------------------------------------
-token_buffer = []
+# Streaming write to disk ----------------------------------------------------
+# All tokens are written to a single temp file in stream order.
+# We never hold more than FLUSH_EVERY tokens in RAM at once (16 MB peak).
+# After collection, the file is split into val + train without loading it whole.
+
+tmp_path = Path(OUTPUT_DIR) / "_tokens_tmp.bin"
 collected = {}
+total_written = 0
+write_buf = []
+
+def flush_buf(f):
+    global total_written
+    if write_buf:
+        arr = np.array(write_buf, dtype=np.uint32)
+        arr.tofile(f)
+        total_written += len(write_buf)
+        write_buf.clear()
+
 remaining_budget = TOTAL_TOKENS
 remaining_active = list(active)
 
-while remaining_active:
-    weight_sum = sum(w for *_, w, _ in remaining_active)
-    name, cfg, split, field, weight, _gated = remaining_active.pop(0)
-    target = int(remaining_budget * (weight / weight_sum)) if weight_sum > 0 else 0
-    if target <= 0:
-        continue
-    print(f"  {name}: target {target:,} tokens (cfg={cfg})")
-    got = 0
-    try:
-        ds = load_stream(name, cfg, split)
-        for ex in tqdm(ds, desc=name, unit="ex", mininterval=2.0,
-                       total=max(target // 512, 100)):
-            text = text_from_example(ex, field)
-            if not text or not text.strip():
-                continue
-            try:
-                enc = tokenizer.encode(text)
-            except Exception:
-                continue
-            ids = enc.ids + [EOS_ID]
-            token_buffer.extend(ids)
-            got += len(ids)
-            if got >= target:
-                break
-        collected[name] = got
-        remaining_budget = max(0, remaining_budget - got)
-        print(f"    {name}: collected {got:,} tokens (remaining budget {remaining_budget:,})")
-    except Exception as e:
-        print(f"  WARNING: {name} failed: {e}")
-        collected[name] = 0
-        # Do not decrement remaining_budget — surviving datasets absorb the gap
-        # automatically via the proportional split on the next iteration.
-        continue
+with open(tmp_path, 'wb') as tmp_f:
+    while remaining_active:
+        weight_sum = sum(w for *_, w, _ in remaining_active)
+        name, cfg, split, field, weight, _gated = remaining_active.pop(0)
+        target = int(remaining_budget * (weight / weight_sum)) if weight_sum > 0 else 0
+        if target <= 0:
+            continue
+        print(f"  {name}: target {target:,} tokens (cfg={cfg})")
+        got = 0
+        try:
+            ds = load_stream(name, cfg, split)
+            for ex in tqdm(ds, desc=name, unit="ex", mininterval=2.0,
+                           total=max(target // 512, 100)):
+                text = text_from_example(ex, field)
+                if not text or not text.strip():
+                    continue
+                try:
+                    enc = tokenizer.encode(text)
+                except Exception:
+                    continue
+                ids = enc.ids + [EOS_ID]
+                write_buf.extend(ids)
+                got += len(ids)
+                # Flush buffer periodically to keep RAM bounded
+                if len(write_buf) >= FLUSH_EVERY:
+                    flush_buf(tmp_f)
+                if got >= target:
+                    break
+            # Flush any remaining tokens for this dataset
+            flush_buf(tmp_f)
+            collected[name] = got
+            remaining_budget = max(0, remaining_budget - got)
+            print(f"    {name}: collected {got:,} tokens (remaining budget {remaining_budget:,})")
+        except Exception as e:
+            print(f"  WARNING: {name} failed: {e}")
+            flush_buf(tmp_f)
+            collected[name] = 0
+            continue
 
-total_collected = sum(collected.values())
+# Final flush
+with open(tmp_path, 'ab') as tmp_f:
+    flush_buf(tmp_f)
+
+total_collected = total_written
 print()
 print("Per-dataset collection:")
 for n, t in collected.items():
@@ -157,28 +186,37 @@ for n, t in collected.items():
 print(f"Total collected: {total_collected:,}  (target {TOTAL_TOKENS:,})")
 
 if total_collected < MIN_TOKENS:
+    tmp_path.unlink(missing_ok=True)
     print(f"ERROR: only {total_collected:,} tokens collected; MIN_TOKENS={MIN_TOKENS:,}.")
     sys.exit(3)
 
-random.seed(0xB17B17)
-random.shuffle(token_buffer)
+# Split into val + train without loading entire dataset into RAM -------------
+# val = last val_size tokens (end of file), train = everything before.
+# Using the end ensures train gets the bulk of the data regardless of val_size.
+val_size = max(SEQ_LEN * 100, total_collected // 50)
+val_size = min(val_size, total_collected - SEQ_LEN)  # ensure train has at least seq_len tokens
+train_size = total_collected - val_size
 
-val_size = max(SEQ_LEN * 100, len(token_buffer) // 50)
-val_tokens   = token_buffer[:val_size]
-train_tokens = token_buffer[val_size:]
+COPY_CHUNK = 1 << 20  # copy 4 MB at a time
 
-def write_bin(tokens, path):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        CHUNK = 1 << 20  # write 1M u32s at a time to keep memory bounded
-        i = 0
-        while i < len(tokens):
-            j = min(i + CHUNK, len(tokens))
-            f.write(struct.pack(f"<{j-i}I", *tokens[i:j]))
-            i = j
-    print(f"  Wrote {len(tokens):,} tokens to {path}")
+def copy_range(src_path, dst_path, start_tok, count_tok):
+    """Copy [start_tok, start_tok+count_tok) u32 tokens from src to dst."""
+    Path(dst_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(src_path, 'rb') as src, open(dst_path, 'wb') as dst:
+        src.seek(start_tok * 4)
+        remaining = count_tok * 4  # bytes
+        while remaining > 0:
+            chunk = src.read(min(COPY_CHUNK * 4, remaining))
+            if not chunk:
+                break
+            dst.write(chunk)
+            remaining -= len(chunk)
+    print(f"  Wrote {count_tok:,} tokens to {dst_path}")
 
-write_bin(train_tokens, f"{OUTPUT_DIR}/train.bin")
-write_bin(val_tokens,   f"{OUTPUT_DIR}/val.bin")
+print(f"\nSplitting: train={train_size:,} tokens, val={val_size:,} tokens")
+copy_range(tmp_path, f"{OUTPUT_DIR}/train.bin", 0, train_size)
+copy_range(tmp_path, f"{OUTPUT_DIR}/val.bin", train_size, val_size)
+
+tmp_path.unlink(missing_ok=True)
 print("Done!")
 PYTHON

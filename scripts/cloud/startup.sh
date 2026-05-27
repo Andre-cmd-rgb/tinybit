@@ -181,13 +181,32 @@ log " bucket=$GCS_BUCKET  data_tokens=$DATA_TOKENS  steps=$TRAIN_STEPS"
 log " cuda=$CUDA_DIR (apt=$CUDA_VERSION)  sync_interval=${SYNC_INTERVAL}s"
 log "=============================================================="
 
+# ---------- swap_setup --------------------------------------------------------
+# Add swap early so that data-prep and cargo build cannot OOM the VM.
+# L4 VMs (g2-standard-4) ship with 16 GB RAM and zero swap.
+log_stage swap_setup
+SWAPFILE=/swapfile
+if ! swapon --show | grep -q "$SWAPFILE" 2>/dev/null; then
+  if [ ! -f "$SWAPFILE" ]; then
+    log "Allocating 32 GB swap at $SWAPFILE…"
+    fallocate -l 32G "$SWAPFILE" 2>/dev/null \
+      || dd if=/dev/zero of="$SWAPFILE" bs=1G count=32 status=progress
+    chmod 600 "$SWAPFILE"
+    mkswap "$SWAPFILE"
+  fi
+  swapon "$SWAPFILE"
+  log "Swap active: $(swapon --show --noheadings)"
+else
+  log "Swap already active — skipping"
+fi
+
 # ---------- install_deps ------------------------------------------------------
 log_stage install_deps
 apt-get update -q
 apt-get install -y --no-install-recommends \
   curl ca-certificates gnupg2 wget jq screen tmux \
   build-essential pkg-config libssl-dev \
-  git python3 python3-pip
+  git python3 python3-pip python3-numpy
 command -v pkg-config >/dev/null
 pkg-config --libs --cflags openssl >/dev/null
 dpkg -s libssl-dev >/dev/null
@@ -241,10 +260,10 @@ rustc --version
 log_stage copy_repo
 mkdir -p /workspace
 if [ ! -d "$WORKDIR/.git" ] && [ ! -f "$WORKDIR/Cargo.toml" ]; then
-  gsutil -m -q rsync -r "$GCS_BUCKET/$GCS_REPO_PREFIX" "$WORKDIR"
+  gs -m -q rsync -r "$GCS_BUCKET/$GCS_REPO_PREFIX" "$WORKDIR"
 else
   log "[info] repo already present at $WORKDIR — rsyncing updates"
-  gsutil -m -q rsync -r "$GCS_BUCKET/$GCS_REPO_PREFIX" "$WORKDIR" || true
+  gs -m -q rsync -r "$GCS_BUCKET/$GCS_REPO_PREFIX" "$WORKDIR" || true
 fi
 chmod +x "$WORKDIR"/scripts/*.sh 2>/dev/null || true
 chmod +x "$WORKDIR"/scripts/cloud/*.sh 2>/dev/null || true
