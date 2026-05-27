@@ -154,6 +154,15 @@ declare -A PROFILE_COST=(
   [a100-80]="~5.07"
   [h100]="~11.00"
 )
+# G4 requires hyperdisk-balanced; all other profiles use pd-ssd.
+declare -A PROFILE_DISK=(
+  [t4]=pd-ssd
+  [l4]=pd-ssd
+  [g4]=hyperdisk-balanced
+  [a100]=pd-ssd
+  [a100-80]=pd-ssd
+  [h100]=pd-ssd
+)
 
 # Image: deep-learning common image with CUDA 12.9 runtime + nvidia driver 580.
 # (We pin CUDA 12.8 toolkit inside startup.sh to match cudarc.)
@@ -323,6 +332,7 @@ for prov in "${PROVISIONING_LIST[@]}"; do
         INSTANCE_FLAGS+=(--provisioning-model=SPOT --instance-termination-action=STOP)
       fi
 
+      disk_type="${PROFILE_DISK[$profile]:-pd-ssd}"
       if gcloud compute instances create "$INSTANCE_NAME" \
            --project="$GCP_PROJECT" \
            --zone="$zone" \
@@ -330,7 +340,7 @@ for prov in "${PROVISIONING_LIST[@]}"; do
            --image-family="$IMAGE_FAMILY" \
            --image-project="$IMAGE_PROJECT" \
            --boot-disk-size="$BOOT_DISK_SIZE" \
-           --boot-disk-type=pd-ssd \
+           --boot-disk-type="$disk_type" \
            --scopes=storage-full \
            --metadata=run-id="$RUN_ID",tinybit-script-version="$SCRIPT_VERSION",tinybit-model="$MODEL_SIZE",tinybit-profile="$profile",tinybit-provisioning="$prov" \
            --metadata-from-file=startup-script="$STARTUP_RENDERED" \
