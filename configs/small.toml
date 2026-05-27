@@ -1,4 +1,4 @@
-vocab_size  = 32000
+vocab_size  = 32008
 num_layers  = 18
 d_model     = 768
 d_ffn       = 2048

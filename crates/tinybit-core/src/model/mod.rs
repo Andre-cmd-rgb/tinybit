@@ -80,12 +80,30 @@ impl TinyBit {
         Ok(logits)
     }
 
-    /// Load weights from safetensors file.
+    /// Load weights from a safetensors file.
+    ///
+    /// Before constructing the model we peek at the file to discover the
+    /// actual `embed.embed.weight` row count and, if it differs from the
+    /// supplied `config.vocab_size`, override the config so the embedding
+    /// shape matches what's on disk. This keeps older checkpoints (trained
+    /// with a smaller vocab) loadable against newer configs that reserve
+    /// extra slots for special tokens.
     pub fn load(
         path: &std::path::Path,
-        config: ModelConfig,
+        mut config: ModelConfig,
         device: &Device,
     ) -> anyhow::Result<Self> {
+        if let Some(actual) = inspect_embed_vocab(path) {
+            if actual != config.vocab_size {
+                tracing::warn!(
+                    checkpoint = %path.display(),
+                    cfg_vocab = config.vocab_size,
+                    ckpt_vocab = actual,
+                    "checkpoint embedding vocab differs from config — using checkpoint value"
+                );
+                config.vocab_size = actual;
+            }
+        }
         let vb = unsafe {
             candle_nn::VarBuilder::from_mmaped_safetensors(&[path], DType::F32, device)?
         };
@@ -101,4 +119,20 @@ impl TinyBit {
     pub fn set_quantized(&mut self, quantized: bool) {
         self.config.ternary_ffn = quantized;
     }
+}
+
+/// Peek at a safetensors file and return the embedding-table row count
+/// (`vocab_size`) if it can be determined. Returns `None` on any error so the
+/// caller can fall back to the supplied config.
+fn inspect_embed_vocab(path: &std::path::Path) -> Option<usize> {
+    let bytes = std::fs::read(path).ok()?;
+    let st = safetensors::SafeTensors::deserialize(&bytes).ok()?;
+    // Prefer the expected tinybit name; fall back to anything ending in
+    // ".weight" with two dims at the embedding head namespace.
+    for candidate in ["embed.embed.weight", "embed.weight"] {
+        if let Ok(t) = st.tensor(candidate) {
+            return t.shape().first().copied();
+        }
+    }
+    None
 }
