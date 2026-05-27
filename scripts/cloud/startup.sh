@@ -351,24 +351,102 @@ TOML
 fi
 
 # ---------- free_gpu_memory ---------------------------------------------------
-# GCP deep-learning images keep background CUDA processes alive (Jupyter,
-# Python ML services) that hold GPU memory and cause immediate OOM when
-# tinybit tries to allocate its model. Kill them before starting training.
+# GCP deep-learning images run CUDA MPS (Multi-Process Service) + Jupyter which
+# hold an exclusive CUDA context. Any process using CUDA after that gets OOM.
+# We must stop MPS, kill all GPU-using processes, and verify the GPU is free
+# before starting training.
 log_stage free_gpu_memory
+
+# 1. Stop CUDA MPS server (runs on DL images to share GPU between frameworks).
+#    If MPS holds the context and we don't stop it, cudarc gets CUDA_ERROR_OUT_OF_MEMORY.
+log "Stopping CUDA MPS if running..."
+echo quit | nvidia-cuda-mps-control 2>/dev/null && sleep 3 || true
+pkill -9 -f 'nvidia-cuda-mps' 2>/dev/null || true
+
+# 2. Kill all remaining GPU-using processes
+log "Killing remaining GPU/ML processes..."
 pkill -9 -f 'jupyter|tensorboard|python3 -m|/.local/lib' 2>/dev/null || true
 sleep 5
+
+# 3. Kill any process still holding GPU memory (shows in compute-apps)
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null \
     | while IFS=, read -r pid _mem; do
         pid="${pid// /}"
         [ -z "$pid" ] && continue
         comm="$(cat /proc/$pid/comm 2>/dev/null || echo unknown)"
-        log "[gpu-free] killing pid=$pid ($comm) still holding GPU memory"
+        log "[gpu-free] killing pid=$pid ($comm) holding GPU memory"
         kill -9 "$pid" 2>/dev/null || true
       done
-  sleep 3
-  nvidia-smi || true
+  sleep 5
 fi
+
+# 4. Explicitly set GPU visibility (overrides any CUDA_VISIBLE_DEVICES=-1 set by DL image)
+export CUDA_VISIBLE_DEVICES=0
+
+# 5. CUDA pre-flight: verify we can actually allocate on the GPU at the driver level.
+#    If this fails, we get a clear diagnostic instead of a mysterious OOM mid-init.
+log "Running CUDA pre-flight allocation test..."
+python3 - <<'CUTEST' || { log "[FATAL] CUDA pre-flight failed — see diagnostic above"; false; }
+import ctypes, sys
+
+def try_int(fn, *args):
+    rc = fn(*args)
+    return rc
+
+lib = None
+for name in ('libcuda.so.1', 'libcuda.so'):
+    try:
+        lib = ctypes.CDLL(name)
+        break
+    except OSError:
+        pass
+if lib is None:
+    print("[cuda-preflight] ERROR: cannot load libcuda.so.1")
+    sys.exit(1)
+
+rc = lib.cuInit(0)
+print(f"[cuda-preflight] cuInit(0) = {rc} ({'OK' if rc == 0 else 'FAIL'})")
+if rc != 0:
+    sys.exit(1)
+
+count = ctypes.c_int()
+lib.cuDeviceGetCount(ctypes.byref(count))
+print(f"[cuda-preflight] device count = {count.value}")
+if count.value == 0:
+    print("[cuda-preflight] ERROR: CUDA_VISIBLE_DEVICES hid all GPUs — check env")
+    sys.exit(1)
+
+dev = ctypes.c_int()
+rc = lib.cuDeviceGet(ctypes.byref(dev), 0)
+print(f"[cuda-preflight] cuDeviceGet(0) rc={rc} dev={dev.value}")
+
+ctx = ctypes.c_void_p()
+rc = lib.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), dev)
+print(f"[cuda-preflight] cuDevicePrimaryCtxRetain rc={rc} ctx={ctx.value}")
+if rc != 0:
+    sys.exit(1)
+
+rc = lib.cuCtxSetCurrent(ctx)
+print(f"[cuda-preflight] cuCtxSetCurrent rc={rc}")
+
+# Try a 256 MB allocation to confirm full VRAM access
+ptr = ctypes.c_void_p()
+size = 256 * 1024 * 1024
+rc = lib.cuMemAlloc_v2(ctypes.byref(ptr), size)
+print(f"[cuda-preflight] cuMemAlloc(256MB) rc={rc} ({'OK' if rc == 0 else 'FAIL - OOM'})")
+if rc == 0:
+    lib.cuMemFree_v2(ptr)
+    print("[cuda-preflight] PASS: GPU memory allocation works")
+else:
+    lib.cuDevicePrimaryCtxRelease_v2(dev)
+    sys.exit(1)
+
+lib.cuDevicePrimaryCtxRelease_v2(dev)
+CUTEST
+
+nvidia-smi --query-gpu=index,name,memory.free,memory.total,compute_mode --format=csv || true
+log "GPU free — proceeding to training"
 
 # ---------- start_training ----------------------------------------------------
 log_stage start_training
@@ -377,6 +455,7 @@ if pgrep -fa "target/release/tinybit train" >/dev/null 2>&1; then
 else
   : > "$TRAINING_LOG"
   setsid bash -c '
+    export CUDA_VISIBLE_DEVICES=0
     RUST_LOG=tinybit_train=info,info ./target/release/tinybit train \
       --model-config "configs/'"$MODEL_SIZE"'.toml" \
       --train-config "'"$TRAIN_CONFIG_PATH"'" \

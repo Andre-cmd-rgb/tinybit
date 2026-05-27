@@ -50,7 +50,15 @@ impl Trainer {
 
     fn auto_device() -> anyhow::Result<Device> {
         if candle_core::utils::cuda_is_available() {
-            return Ok(Device::new_cuda(0)?);
+            let dev = Device::new_cuda(0)?;
+            // Pre-flight: verify actual allocation works before committing.
+            // CUDA_ERROR_OUT_OF_MEMORY here means MPS/context issue, not real OOM.
+            candle_core::Tensor::zeros((1,), candle_core::DType::F32, &dev)
+                .map_err(|e| anyhow::anyhow!(
+                    "CUDA pre-flight failed on device 0 — \
+                     check CUDA_VISIBLE_DEVICES and that MPS is not running: {e}"
+                ))?;
+            return Ok(dev);
         }
         Ok(Device::Cpu)
     }
