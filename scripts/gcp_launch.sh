@@ -46,6 +46,9 @@
 
 set -Eeuo pipefail
 
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+[ -f "$REPO_ROOT/.tinybit.env" ] && source "$REPO_ROOT/.tinybit.env"
+
 # ---------- script version & git info -----------------------------------------
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/.." && pwd)"

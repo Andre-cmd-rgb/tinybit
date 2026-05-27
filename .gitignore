@@ -12,4 +12,5 @@
 *.safetensors
 *.gguf
 .env
+.tinybit.env
 /tokenizer.json

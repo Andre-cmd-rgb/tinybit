@@ -7,9 +7,12 @@
 
 set -Eeuo pipefail
 
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+[ -f "$REPO_ROOT/.tinybit.env" ] && source "$REPO_ROOT/.tinybit.env"
+
 VM="${1:?Usage: $0 <INSTANCE_NAME> <ZONE>}"
 ZONE="${2:?Usage: $0 <INSTANCE_NAME> <ZONE>}"
-: "${GCP_PROJECT:?Set GCP_PROJECT}"
+: "${GCP_PROJECT:?Set GCP_PROJECT or create .tinybit.env}"
 
 echo "About to DELETE instance: $VM in $ZONE  (project: $GCP_PROJECT)"
 echo "This will release the GPU and destroy the boot disk."

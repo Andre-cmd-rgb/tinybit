@@ -9,7 +9,10 @@
 
 set -uo pipefail
 
-: "${GCP_BUCKET:?Set GCP_BUCKET (gs://...)}"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+[ -f "$REPO_ROOT/.tinybit.env" ] && source "$REPO_ROOT/.tinybit.env"
+
+: "${GCP_BUCKET:?Set GCP_BUCKET (gs://...) or create .tinybit.env}"
 GCP_BUCKET="${GCP_BUCKET%/}"
 
 RUN_ID="${1:-}"
