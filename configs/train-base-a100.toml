@@ -1,15 +1,13 @@
-# 258M `small` model on a single NVIDIA L4 (24 GB VRAM).
-#
-# L4 can run the 258M model but it's slow — consider A100 for a faster run.
+# 501M `base` model on a single NVIDIA A100 40GB (a2-highgpu-1g).
 #
 # Per-step token budget:
-#   batch 2 × seq 2048 × grad_accum 16 = 65_536 tokens / step
+#   batch 4 × seq 2048 × grad_accum 8 = 65_536 tokens / step
 #
 # Total token budget:
 #   15_000 steps × 65_536 ≈ 0.98 B tokens
 #
-# Wall-clock estimate on L4 SPOT (~$0.22/hr):
-#   ~45-65 h, ~$10-15 total.
+# Wall-clock estimate on A100 SPOT (~$1.10/hr):
+#   ~25-35 h, ~$28-38 total.
 #
 # Pair with:
 #   DATA_TOKENS=2000000000
@@ -18,14 +16,14 @@ train_data     = "data/train.bin"
 val_data       = "data/val.bin"
 checkpoint_dir = "checkpoints/"
 
-batch_size     = 2
-grad_accum     = 16
+batch_size     = 4
+grad_accum     = 8
 total_steps    = 15000
-peak_lr        = 2e-4
+peak_lr        = 1e-4
 weight_decay   = 0.01
 grad_clip      = 1.0
 
-save_every     = 500
+save_every     = 1000
 eval_every     = 500
 eval_batches   = 20
 

@@ -41,43 +41,43 @@ impl ModelConfig {
         embed + self.num_layers * per_layer + ln_out + spec
     }
 
-    /// ~25M params — smallest useful model
+    /// ~25M params — smallest useful model (3.5× FFN)
     pub fn nano() -> Self {
         Self {
-            vocab_size: 32000, num_layers: 12, d_model: 320,
-            d_ffn: 640, num_heads: 5, head_dim: 64,
+            vocab_size: 32000, num_layers: 9, d_model: 320,
+            d_ffn: 1120, num_heads: 5, head_dim: 64,
             ternary_ffn: false, int8_time: false,
             max_seq_len: 1024, dropout: 0.05, spec_heads: 0,
         }
     }
 
-    /// ~50M params
+    /// ~50M params (3.5× FFN, 16 layers)
     pub fn micro() -> Self {
         Self {
-            vocab_size: 32000, num_layers: 12, d_model: 512,
-            d_ffn: 1024, num_heads: 8, head_dim: 64,
+            vocab_size: 32000, num_layers: 16, d_model: 384,
+            d_ffn: 1344, num_heads: 6, head_dim: 64,
             ternary_ffn: false, int8_time: false,
             max_seq_len: 1024, dropout: 0.05, spec_heads: 0,
         }
     }
 
-    /// ~150M params — default
+    /// ~258M params (3.5× FFN)
     pub fn small() -> Self {
         Self {
-            vocab_size: 32000, num_layers: 18, d_model: 768,
-            d_ffn: 2048, num_heads: 12, head_dim: 64,
+            vocab_size: 32000, num_layers: 13, d_model: 1024,
+            d_ffn: 3584, num_heads: 16, head_dim: 64,
             ternary_ffn: false, int8_time: false,
-            max_seq_len: 1024, dropout: 0.05, spec_heads: 3,
+            max_seq_len: 2048, dropout: 0.05, spec_heads: 0,
         }
     }
 
-    /// ~400M params
+    /// ~501M params (3.5× FFN)
     pub fn base() -> Self {
         Self {
-            vocab_size: 32000, num_layers: 32, d_model: 1024,
-            d_ffn: 2048, num_heads: 16, head_dim: 64,
+            vocab_size: 32000, num_layers: 17, d_model: 1280,
+            d_ffn: 4480, num_heads: 20, head_dim: 64,
             ternary_ffn: false, int8_time: false,
-            max_seq_len: 2048, dropout: 0.05, spec_heads: 3,
+            max_seq_len: 2048, dropout: 0.05, spec_heads: 0,
         }
     }
 

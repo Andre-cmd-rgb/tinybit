@@ -11,7 +11,7 @@ Apache 2.0 — all Rust, no C++ compiler required.
 - **RWKV-7 architecture** — recurrent transformer with O(1) memory at inference (no KV cache)
 - **BitLinear quantization** — ternary weights `{-1, 0, +1}` via BitNet b1.58 STE
 - **Built-in tools** — calculator, time, todos, notes, calendar (SQLite-backed, user-extensible)
-- **Four size presets** — nano (25M), micro (50M), small (150M), base (400M)
+- **Four size presets** — nano (25M), micro (50M), small (258M), base (501M)
 - **Muon + AdamW optimizer** — Newton-Schulz gradient orthogonalization for weight matrices
 - **OpenAI-compatible HTTP server** — drop-in for local inference
 - **Speculative decoding heads** — optional extra heads on small/base for faster sampling
@@ -43,10 +43,14 @@ tinybit download --out data/tokenizer.json
 
 | Preset | Params | Layers | d_model | Notes |
 |--------|--------|--------|---------|-------|
-| nano   | ~25M   | 12     | 320     | Smallest coherent model, fast iteration |
-| micro  | ~50M   | 12     | 512     | Laptop inference |
-| small  | ~150M  | 18     | 768     | Default training target |
-| base   | ~400M  | 32     | 1024    | Best quality |
+All models use 3.5× FFN expansion (d_ffn = 3.5 × d_model) matching the RWKV-7 paper.
+
+| Preset | Params  | Layers | d_model | d_ffn | Notes |
+|--------|---------|--------|---------|-------|-------|
+| nano   | ~25M    | 9      | 320     | 1120  | Fast iteration, L4 ~5–7 h |
+| micro  | ~50M    | 16     | 384     | 1344  | Laptop inference, L4 ~15–22 h |
+| small  | ~258M   | 13     | 1024    | 3584  | Good quality, A100 recommended |
+| base   | ~501M   | 17     | 1280    | 4480  | Best quality, H100 recommended |
 
 Config files live in `configs/`. Override any field:
 

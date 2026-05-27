@@ -1,19 +1,13 @@
-# 150M `small` model on a single NVIDIA A100 40GB (a2-highgpu-1g).
-#
-# 40 GB gives us plenty of headroom for batch_size 16 at seq_len 1024 even
-# with full F32 activations. We keep effective batch at 32 (× 1024 tokens =
-# 32_768 tokens / step) to match the L4 / H100 configs, so the only
-# variable across hardware is wall time and how many tokens you can afford.
+# 258M `small` model on a single NVIDIA A100 40GB (a2-highgpu-1g).
 #
 # Per-step token budget:
-#   batch 16 × seq 1024 × grad_accum 2 = 32_768 tokens / step
+#   batch 8 × seq 2048 × grad_accum 4 = 65_536 tokens / step
 #
 # Total token budget:
-#   60_000 steps × 32_768 ≈ 1.97 B tokens (~Chinchilla-optimal for 150M)
+#   20_000 steps × 65_536 ≈ 1.31 B tokens
 #
 # Wall-clock estimate on A100 SPOT (~$1.10/hr):
-#   ~15-20 h, ~$17-22 total. SPOT eviction usually means losing ~10 min;
-#   the next launch resumes from the latest checkpoint in GCS.
+#   ~15-20 h, ~$17-22 total.
 #
 # Pair with:
 #   DATA_TOKENS=2000000000
@@ -22,10 +16,10 @@ train_data     = "data/train.bin"
 val_data       = "data/val.bin"
 checkpoint_dir = "checkpoints/"
 
-batch_size     = 16
-grad_accum     = 2
-total_steps    = 60000
-peak_lr        = 3e-4
+batch_size     = 8
+grad_accum     = 4
+total_steps    = 20000
+peak_lr        = 2e-4
 weight_decay   = 0.01
 grad_clip      = 1.0
 

@@ -7,7 +7,7 @@
 #   15_000 steps × 65_536 ≈ 0.98 B tokens
 #
 # Wall-clock estimate on L4 SPOT (~$0.22/hr):
-#   ~4-6 h, ~$1-2 total.
+#   ~5-7 h, ~$1-2 total.
 #
 # Pair with:
 #   DATA_TOKENS=1500000000

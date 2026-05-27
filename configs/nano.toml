@@ -1,7 +1,7 @@
 vocab_size  = 32008
-num_layers  = 12
+num_layers  = 9
 d_model     = 320
-d_ffn       = 640
+d_ffn       = 1120
 num_heads   = 5
 head_dim    = 64
 max_seq_len = 1024

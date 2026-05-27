@@ -16,28 +16,28 @@ export GCP_BUCKET=gs://your-bucket
 
 Then pick your model size:
 
-**25M nano (~4–6 h, ~$1–2 SPOT):**
+**25M nano — L4 (~5–7 h, ~$1–2 SPOT):**
 ```bash
-DATA_TOKENS=1500000000 \
-TRAIN_CONFIG=configs/train-nano-l4.toml \
-PROVISIONING_MODEL=STANDARD,SPOT \
-  ./scripts/gcp_launch.sh nano
+DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-nano-l4.toml \
+PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh nano
 ```
 
-**50M micro (~12–18 h, ~$3–5 SPOT):**
+**50M micro — L4 (~15–22 h, ~$4–6 SPOT):**
 ```bash
-DATA_TOKENS=1500000000 \
-TRAIN_CONFIG=configs/train-micro-l4.toml \
-PROVISIONING_MODEL=STANDARD,SPOT \
-  ./scripts/gcp_launch.sh micro
+DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-micro-l4.toml \
+PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh micro
 ```
 
-**150M small (~30–40 h, ~$7–9 SPOT):**
+**258M small — A100 recommended (~15–20 h, ~$17–22 SPOT):**
 ```bash
-DATA_TOKENS=1500000000 \
-TRAIN_CONFIG=configs/train-small-l4.toml \
-PROVISIONING_MODEL=STANDARD,SPOT \
-  ./scripts/gcp_launch.sh small
+DATA_TOKENS=2000000000 TRAIN_CONFIG=configs/train-small-a100.toml \
+PROFILE=a100 PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh small
+```
+
+**501M base — H100 recommended (~12–18 h, ~$40–60 SPOT):**
+```bash
+DATA_TOKENS=2000000000 TRAIN_CONFIG=configs/train-base-h100.toml \
+PROFILE=h100 PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh base
 ```
 
 The launcher finds the first available zone with an L4, uploads the repo,
@@ -67,12 +67,16 @@ the 150 M model with `batch_size=8`, and the 200 GB SSD boot disk keeps data pre
 
 ## Model sizes
 
-| Name  | Params | Layers | d_model | d_ffn | Recommended GPU |
-|-------|--------|--------|---------|-------|-----------------|
-| nano  | ~25 M  | 12     | 320     | 640   | T4 or L4        |
-| micro | ~50 M  | 12     | 512     | 1024  | T4 or L4        |
-| small | ~150 M | 18     | 768     | 2048  | **L4** (this guide) |
-| base  | ~400 M | 32     | 1024    | 2048  | A100 or H100    |
+All models use a **3.5× FFN expansion ratio** (d_ffn = 3.5 × d_model), matching
+the original RWKV-7 paper. This gives significantly more knowledge capacity per
+parameter compared to the 2× ratio commonly used in smaller implementations.
+
+| Name  | Params  | Layers | d_model | d_ffn | FFN ratio | Recommended GPU |
+|-------|---------|--------|---------|-------|-----------|-----------------|
+| nano  | ~25 M   | 9      | 320     | 1120  | 3.5×      | L4              |
+| micro | ~50 M   | 16     | 384     | 1344  | 3.5×      | L4              |
+| small | ~258 M  | 13     | 1024    | 3584  | 3.5×      | **A100** (or L4, slow) |
+| base  | ~501 M  | 17     | 1280    | 4480  | 3.5×      | A100 or H100    |
 
 ---
 
