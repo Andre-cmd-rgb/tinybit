@@ -14,6 +14,7 @@
 #                        Known profiles (cheapest first):
 #                          t4       n1-standard-4   + nvidia-tesla-t4   (16 GB)
 #                          l4       g2-standard-4   + nvidia-l4         (24 GB)
+#                          g4       g4-standard-48  + nvidia-rtx-pro-6000 (96 GB, 48 vCPU, 180 GB RAM)
 #                          a100     a2-highgpu-1g   + nvidia-tesla-a100 (40 GB)
 #                          a100-80  a2-ultragpu-1g  + nvidia-a100-80gb  (80 GB)
 #                          h100     a3-highgpu-1g   + nvidia-h100-80gb  (80 GB)
@@ -104,13 +105,20 @@ DEFAULT_ZONES=(
   europe-west4-a europe-west4-b europe-west4-c
   europe-west1-b europe-west1-c
   europe-west3-a europe-west3-b
-  europe-west2-a europe-west2-b
+  europe-west2-a europe-west2-b europe-west2-c
+  europe-west8-b europe-west8-c
+  europe-west10-b
+  europe-north1-a europe-north1-b europe-north1-c
   us-central1-a us-central1-b us-central1-c us-central1-f
-  us-west1-a us-west1-b us-west4-a us-west4-c
+  us-west1-a us-west1-b us-west1-c us-west3-a us-west4-a us-west4-c
   us-east1-b us-east1-c us-east1-d
   us-east4-a us-east4-b us-east4-c
   us-east5-a us-east5-b us-east5-c
-  asia-southeast1-b asia-southeast1-c
+  us-south1-a us-south1-b
+  asia-east1-a asia-east1-b
+  asia-south1-c asia-south2-a asia-south2-c
+  asia-southeast1-a asia-southeast1-b asia-southeast1-c
+  asia-southeast2-b asia-southeast2-c
 )
 if [ -n "${GCP_ZONES:-}" ]; then
   read -r -a ZONES <<< "$GCP_ZONES"
@@ -123,6 +131,7 @@ fi
 declare -A PROFILE_MACHINE=(
   [t4]=n1-standard-4
   [l4]=g2-standard-4
+  [g4]=g4-standard-48
   [a100]=a2-highgpu-1g
   [a100-80]=a2-ultragpu-1g
   [h100]=a3-highgpu-1g
@@ -130,6 +139,7 @@ declare -A PROFILE_MACHINE=(
 declare -A PROFILE_ACCEL=(
   [t4]=nvidia-tesla-t4
   [l4]=nvidia-l4
+  [g4]=nvidia-rtx-pro-6000
   [a100]=nvidia-tesla-a100
   [a100-80]=nvidia-a100-80gb
   [h100]=nvidia-h100-80gb
@@ -139,6 +149,7 @@ declare -A PROFILE_ACCEL=(
 declare -A PROFILE_COST=(
   [t4]="~0.35"
   [l4]="~0.71"
+  [g4]="~4.97"
   [a100]="~3.67"
   [a100-80]="~5.07"
   [h100]="~11.00"
