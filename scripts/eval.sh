@@ -3,7 +3,7 @@
 # Usage: ./scripts/eval.sh [model_path] [config_path]
 set -euo pipefail
 
-MODEL="${1:-models/tiny-bit-small.safetensors}"
+MODEL="${1:-models/tinybit-small.safetensors}"
 CONFIG="${2:-configs/small.toml}"
 
 echo "Running cargo tests..."

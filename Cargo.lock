@@ -2911,7 +2911,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tiny-bit-cli"
+name = "tinybit-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2923,10 +2923,10 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
- "tiny-bit-core",
- "tiny-bit-infer",
- "tiny-bit-tools",
- "tiny-bit-train",
+ "tinybit-core",
+ "tinybit-infer",
+ "tinybit-tools",
+ "tinybit-train",
  "tokio",
  "toml",
  "tower 0.4.13",
@@ -2936,7 +2936,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tiny-bit-core"
+name = "tinybit-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2955,7 +2955,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tiny-bit-infer"
+name = "tinybit-infer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2966,27 +2966,27 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "tiny-bit-core",
- "tiny-bit-tools",
+ "tinybit-core",
+ "tinybit-tools",
  "tokio",
  "tracing",
 ]
 
 [[package]]
-name = "tiny-bit-tests"
+name = "tinybit-tests"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
  "candle-nn",
  "rand 0.8.6",
- "tiny-bit-core",
- "tiny-bit-tools",
- "tiny-bit-train",
+ "tinybit-core",
+ "tinybit-tools",
+ "tinybit-train",
 ]
 
 [[package]]
-name = "tiny-bit-tools"
+name = "tinybit-tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2999,7 +2999,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tiny-bit-train"
+name = "tinybit-train"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3014,7 +3014,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "tiny-bit-core",
+ "tinybit-core",
  "toml",
  "tracing",
  "tracing-subscriber",

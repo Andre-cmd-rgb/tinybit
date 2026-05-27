@@ -1,7 +1,7 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
-use tiny_bit_core::{config::ModelConfig, model::TinyBit};
-use tiny_bit_train::loss::cross_entropy_loss;
+use tinybit_core::{config::ModelConfig, model::TinyBit};
+use tinybit_train::loss::cross_entropy_loss;
 
 fn make_synthetic_data(
     n_chunks: usize,
@@ -70,7 +70,7 @@ fn smoke_train_nano_100_steps() -> anyhow::Result<()> {
     }
 
     // Verify state is fixed size (O(1) memory)
-    let state = tiny_bit_core::state::InferenceState::zeros(&config, &device)?;
+    let state = tinybit_core::state::InferenceState::zeros(&config, &device)?;
     let shapes: Vec<Vec<usize>> = state.layers.iter()
         .map(|l| l.wkv_state.dims().to_vec())
         .collect();

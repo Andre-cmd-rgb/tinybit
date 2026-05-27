@@ -1,4 +1,4 @@
-use tiny_bit_tools::{
+use tinybit_tools::{
     builtin::{
         calc_tool::CalcTool, time_tool::TimeTool, todos_tool::TodosTool,
     },
@@ -79,7 +79,7 @@ fn test_time_tool_returns_date() {
 }
 
 fn tempdir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("tiny-bit-test-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("tinybit-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

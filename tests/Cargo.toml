@@ -1,13 +1,13 @@
 [package]
-name    = "tiny-bit-tests"
+name    = "tinybit-tests"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
 [dev-dependencies]
-tiny-bit-core  = { path = "../crates/tiny-bit-core" }
-tiny-bit-tools = { path = "../crates/tiny-bit-tools" }
-tiny-bit-train = { path = "../crates/tiny-bit-train" }
+tinybit-core  = { path = "../crates/tinybit-core" }
+tinybit-tools = { path = "../crates/tinybit-tools" }
+tinybit-train = { path = "../crates/tinybit-train" }
 candle-core    = { workspace = true }
 candle-nn      = { workspace = true }
 anyhow         = { workspace = true }

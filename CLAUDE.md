@@ -1,4 +1,4 @@
-# tiny-bit — notes for Claude Code
+# tinybit — notes for Claude Code
 
 ## Build
 cargo build --release --workspace
@@ -38,6 +38,15 @@ cargo test --workspace
 
 10. tokenizers crate uses fancy-regex (pure Rust) instead of onig (needs C++).
     This avoids a C++ compiler dependency on Linux.
+
+11. GCP training is launched only via `scripts/gcp_launch.sh`. It uploads the
+    repo, generates a RUN_ID, and tries (zone × profile) combinations until one
+    VM is created — then stops. Stage failures upload FAILED.json and shut the
+    VM down (unless KEEP_VM_ON_FAILURE=1).
+
+12. cudarc 0.13 needs CUDA <= 12.8. The startup script installs cuda-toolkit-12-8
+    via NVIDIA's apt repo and exports CUDA_ROOT/PATH=/usr/local/cuda-12.8 before
+    `cargo build`. Do not assume the image's `/usr/local/cuda` symlink is right.
 
 ## Common mistakes to avoid
 

@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/tiny-bit-core",
-    "crates/tiny-bit-tools",
-    "crates/tiny-bit-infer",
-    "crates/tiny-bit-train",
-    "crates/tiny-bit-cli",
+    "crates/tinybit-core",
+    "crates/tinybit-tools",
+    "crates/tinybit-infer",
+    "crates/tinybit-train",
+    "crates/tinybit-cli",
     "tests",
 ]
 
@@ -13,7 +13,7 @@ members = [
 version    = "0.1.0"
 edition    = "2021"
 license    = "Apache-2.0"
-repository = "https://github.com/Andre-cmd-rgb/tiny-bit"
+repository = "https://github.com/Andre-cmd-rgb/tinybit"
 authors    = ["Andre"]
 
 [workspace.dependencies]

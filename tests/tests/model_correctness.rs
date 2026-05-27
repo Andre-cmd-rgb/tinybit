@@ -1,6 +1,6 @@
 use candle_core::{Device, DType, Tensor};
 use candle_nn::{VarBuilder, VarMap};
-use tiny_bit_core::{config::ModelConfig, model::TinyBit, state::InferenceState};
+use tinybit_core::{config::ModelConfig, model::TinyBit, state::InferenceState};
 
 fn nano_model() -> anyhow::Result<(TinyBit, ModelConfig)> {
     let config = ModelConfig::nano();

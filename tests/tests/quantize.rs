@@ -1,4 +1,4 @@
-use tiny_bit_core::quantize::{pack_ternary, quantize_int8, quantize_ternary, unpack_ternary};
+use tinybit_core::quantize::{pack_ternary, quantize_int8, quantize_ternary, unpack_ternary};
 use candle_core::{DType, Device, Tensor};
 
 #[test]

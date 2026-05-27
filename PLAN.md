@@ -1,4 +1,4 @@
-# tiny-bit v0 — Full Implementation Plan for Claude Code
+# tinybit v0 — Full Implementation Plan for Claude Code
 
 > Apache 2.0 | Rust | RWKV-7 + BitLinear | Configurable sizes (10M → 400M)
 > Train on Google Cloud (free credits) | Run on Linux, macOS (M-series), Windows
@@ -7,13 +7,13 @@
 
 ## 0. What you are building
 
-A Rust workspace called `tiny-bit` that produces:
+A Rust workspace called `tinybit` that produces:
 
 1. A **local AI assistant** model (RWKV-7 + ternary BitLinear, configurable size)
 2. A **tool system** (time, calculator, todos, notes, calendar — user-extensible)
 3. A **training pipeline** that runs on Google Cloud with zero external API cost
-4. A **CLI** (`tiny-bit`) that works on Linux, macOS (native ARM/Metal), Windows (AVX2/AVX-512)
-5. An **HTTP inference server** (`tiny-bit serve`) for Oracle Cloud / local hosting
+4. A **CLI** (`tinybit`) that works on Linux, macOS (native ARM/Metal), Windows (AVX2/AVX-512)
+5. An **HTTP inference server** (`tinybit serve`) for Oracle Cloud / local hosting
 6. Full tests for every module before any training run
 
 The model is a personal assistant that knows about science, maths, economics, history, and general knowledge — trained on free open datasets (FineWeb-Edu, Wikipedia, The Stack Smol).
@@ -23,7 +23,7 @@ The model is a personal assistant that knows about science, maths, economics, hi
 ## 1. Repository layout (create every file listed)
 
 ```
-tiny-bit/
+tinybit/
 ├── Cargo.toml                        # workspace root
 ├── CLAUDE.md                         # notes for Claude Code
 ├── README.md                         # user guide (write last)
@@ -32,7 +32,7 @@ tiny-bit/
 ├── rust-toolchain.toml               # pin to stable 1.82
 │
 ├── crates/
-│   ├── tiny-bit-core/
+│   ├── tinybit-core/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -48,7 +48,7 @@ tiny-bit/
 │   │           ├── block.rs          # RWKV7Block = time_mix + channel_mix
 │   │           └── embedding.rs      # token embedding + tied LM head
 │   │
-│   ├── tiny-bit-tools/
+│   ├── tinybit-tools/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -63,7 +63,7 @@ tiny-bit/
 │   │           ├── notes_tool.rs     # save/search notes (SQLite)
 │   │           └── calendar_tool.rs  # events (SQLite)
 │   │
-│   ├── tiny-bit-infer/
+│   ├── tinybit-infer/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -72,7 +72,7 @@ tiny-bit/
 │   │       ├── session.rs            # Session (conversation history + state)
 │   │       └── processor.rs         # detect tool calls, execute, inject result
 │   │
-│   ├── tiny-bit-train/
+│   ├── tinybit-train/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -90,7 +90,7 @@ tiny-bit/
 │   │           ├── dataset.rs        # Dataset trait + TokenizedDataset
 │   │           └── pack.rs           # bin-pack tokens into fixed-length chunks
 │   │
-│   └── tiny-bit-cli/
+│   └── tinybit-cli/
 │       ├── Cargo.toml
 │       └── src/
 │           ├── main.rs               # clap root
@@ -133,18 +133,18 @@ tiny-bit/
 [workspace]
 resolver = "2"
 members = [
-    "crates/tiny-bit-core",
-    "crates/tiny-bit-tools",
-    "crates/tiny-bit-infer",
-    "crates/tiny-bit-train",
-    "crates/tiny-bit-cli",
+    "crates/tinybit-core",
+    "crates/tinybit-tools",
+    "crates/tinybit-infer",
+    "crates/tinybit-train",
+    "crates/tinybit-cli",
 ]
 
 [workspace.package]
 version    = "0.1.0"
 edition    = "2021"
 license    = "Apache-2.0"
-repository = "https://github.com/Andre-cmd-rgb/tiny-bit"
+repository = "https://github.com/Andre-cmd-rgb/tinybit"
 authors    = ["Andre"]
 
 [workspace.dependencies]
@@ -214,7 +214,7 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-app
 
 ---
 
-## 4. tiny-bit-core
+## 4. tinybit-core
 
 ### 4.1 `config.rs` — ModelConfig + presets
 
@@ -607,7 +607,7 @@ impl EmbeddingHead {
 ### 4.9 `model/mod.rs` — TinyBit (top-level model)
 
 ```rust
-/// The complete tiny-bit model.
+/// The complete tinybit model.
 pub struct TinyBit {
     pub config:    ModelConfig,
     embed:         EmbeddingHead,
@@ -694,7 +694,7 @@ impl Tokenizer {
 
 ---
 
-## 5. tiny-bit-tools
+## 5. tinybit-tools
 
 ### 5.1 `tool.rs` — The Tool trait
 
@@ -833,7 +833,7 @@ pub struct CalendarTool { db_path: std::path::PathBuf }
 
 ---
 
-## 6. tiny-bit-infer
+## 6. tinybit-infer
 
 ### 6.1 `sampler.rs`
 
@@ -958,7 +958,7 @@ impl<'a> ToolProcessor<'a> {
 
 ---
 
-## 7. tiny-bit-train
+## 7. tinybit-train
 
 ### 7.1 `data/pack.rs` — token packing
 
@@ -1196,13 +1196,13 @@ impl Trainer {
 
 ---
 
-## 8. tiny-bit-cli
+## 8. tinybit-cli
 
 ### 8.1 `main.rs` — clap root
 
 ```rust
 #[derive(clap::Parser)]
-#[command(name = "tiny-bit", version = "0.1.0", about = "Your local AI assistant")]
+#[command(name = "tinybit", version = "0.1.0", about = "Your local AI assistant")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -1233,7 +1233,7 @@ pub struct ChatArgs {
     #[arg(long, default_value = "configs/small.toml")]
     pub config: std::path::PathBuf,
 
-    #[arg(long, default_value = "models/tiny-bit-small.safetensors")]
+    #[arg(long, default_value = "models/tinybit-small.safetensors")]
     pub model: std::path::PathBuf,
 
     #[arg(long, default_value = "data/")]
@@ -1277,7 +1277,7 @@ pub struct ServeArgs {
     #[arg(long, default_value = "configs/small.toml")]
     pub config: std::path::PathBuf,
 
-    #[arg(long, default_value = "models/tiny-bit-small.safetensors")]
+    #[arg(long, default_value = "models/tinybit-small.safetensors")]
     pub model: std::path::PathBuf,
 }
 
@@ -1492,8 +1492,8 @@ MODEL_SIZE="${1:-small}"
 PROJECT="your-gcp-project-id"      # EDIT THIS
 REGION="us-central1"
 ZONE="${REGION}-a"
-INSTANCE_NAME="tiny-bit-train-$(date +%s)"
-BUCKET="gs://your-bucket-tiny-bit"  # EDIT THIS
+INSTANCE_NAME="tinybit-train-$(date +%s)"
+BUCKET="gs://your-bucket-tinybit"  # EDIT THIS
 
 # Create preemptible L4 GPU instance
 gcloud compute instances create "$INSTANCE_NAME" \
@@ -1516,21 +1516,21 @@ apt-get update -q && apt-get install -y cargo rustup screen
 rustup default stable
 
 # Copy code from GCS bucket (or git clone)
-gsutil -m cp -r ${BUCKET}/tiny-bit/ /home/user/
-cd /home/user/tiny-bit
+gsutil -m cp -r ${BUCKET}/tinybit/ /home/user/
+cd /home/user/tinybit
 
 # Build release binary
-cargo build --release -p tiny-bit-cli
+cargo build --release -p tinybit-cli
 
 # Prepare data (if not already done)
 ./scripts/prepare_data.sh data/
 
 # Run smoke test first!
-./target/release/tiny-bit train --model-config configs/${MODEL_SIZE}.toml --smoke-test
+./target/release/tinybit train --model-config configs/${MODEL_SIZE}.toml --smoke-test
 echo 'Smoke test passed, starting full training...'
 
 # Start training in screen (survives SSH disconnect)
-screen -dm -S train ./target/release/tiny-bit train \
+screen -dm -S train ./target/release/tinybit train \
   --model-config configs/${MODEL_SIZE}.toml \
   --train-config configs/train.toml \
   --resume
@@ -1678,7 +1678,7 @@ fn smoke_train_nano_100_steps() {
 Build this into the default system prompt (injected by the Session struct):
 
 ```
-You are tiny-bit, a helpful personal AI assistant. You are knowledgeable about 
+You are tinybit, a helpful personal AI assistant. You are knowledgeable about 
 science, mathematics, economics, history, philosophy, and everyday tasks.
 
 You have access to the following tools:
@@ -1703,25 +1703,25 @@ Guidelines:
 Follow this exact order. Do not skip ahead.
 
 1. **Workspace + Cargo.toml** — get it compiling with all deps
-2. **tiny-bit-core: config.rs** — ModelConfig, presets, TOML load/save
-3. **tiny-bit-core: state.rs** — InferenceState, zeros, save/load
-4. **tiny-bit-core: quantize.rs** — ternary quant, INT8 quant, pack/unpack
-5. **tiny-bit-core: model/bitlinear.rs + model/embedding.rs** — leaf layers
-6. **tiny-bit-core: model/channel_mix.rs** — channel-mix block
-7. **tiny-bit-core: model/time_mix.rs** — time-mix block (hardest)
-8. **tiny-bit-core: model/block.rs** — assemble Rwkv7Block
-9. **tiny-bit-core: model/mod.rs** — TinyBit top-level
-10. **tiny-bit-core: tokenizer.rs** — tokenizer wrapper
+2. **tinybit-core: config.rs** — ModelConfig, presets, TOML load/save
+3. **tinybit-core: state.rs** — InferenceState, zeros, save/load
+4. **tinybit-core: quantize.rs** — ternary quant, INT8 quant, pack/unpack
+5. **tinybit-core: model/bitlinear.rs + model/embedding.rs** — leaf layers
+6. **tinybit-core: model/channel_mix.rs** — channel-mix block
+7. **tinybit-core: model/time_mix.rs** — time-mix block (hardest)
+8. **tinybit-core: model/block.rs** — assemble Rwkv7Block
+9. **tinybit-core: model/mod.rs** — TinyBit top-level
+10. **tinybit-core: tokenizer.rs** — tokenizer wrapper
 11. **→ RUN TEST: test_forward_shapes_nano** — must pass before continuing
 12. **→ RUN TEST: test_inference_step_matches_train** — must pass
-13. **tiny-bit-tools** — all tools + registry + parser
+13. **tinybit-tools** — all tools + registry + parser
 14. **→ RUN TEST: tests/tool_system.rs** — all tool tests must pass
-15. **tiny-bit-infer** — engine, sampler, session, processor
-16. **tiny-bit-train: data** — loader, dataset, pack
-17. **tiny-bit-train: optimizer** — Muon, AdamW
-18. **tiny-bit-train: trainer, scheduler, loss, checkpoint**
+15. **tinybit-infer** — engine, sampler, session, processor
+16. **tinybit-train: data** — loader, dataset, pack
+17. **tinybit-train: optimizer** — Muon, AdamW
+18. **tinybit-train: trainer, scheduler, loss, checkpoint**
 19. **→ RUN TEST: tests/training_smoke.rs** — GATE: loss must drop before GCP
-20. **tiny-bit-cli** — all commands
+20. **tinybit-cli** — all commands
 21. **scripts/** — prepare_data.sh, gcp_train.sh
 22. **README.md** — the user guide (see section 14 below)
 
@@ -1734,25 +1734,25 @@ The README must cover these sections:
 ### Installation
 ```bash
 # Prerequisites: Rust 1.82+, Git
-git clone https://github.com/Andre-cmd-rgb/tiny-bit
-cd tiny-bit
+git clone https://github.com/Andre-cmd-rgb/tinybit
+cd tinybit
 cargo build --release
 ```
 
 ### Quick start (local inference with pretrained weights)
 ```bash
 # Download tokenizer and small pretrained weights
-./target/release/tiny-bit download --model small
+./target/release/tinybit download --model small
 
 # Chat
-./target/release/tiny-bit chat
+./target/release/tinybit chat
 ```
 
 ### Training on Google Cloud (step by step)
 1. Set up GCP project + billing alerts
 2. Create GCS bucket for data + checkpoints
 3. Run `prepare_data.sh` (can run locally or on a cheap CPU VM)
-4. Run smoke test locally: `tiny-bit train --smoke-test`
+4. Run smoke test locally: `tinybit train --smoke-test`
 5. Launch training: `./scripts/gcp_train.sh small`
 6. Monitor: `gcloud compute instances get-serial-port-output ...`
 7. Download checkpoint: `gsutil cp gs://your-bucket/checkpoints/best/ ./checkpoints/`
@@ -1771,7 +1771,7 @@ cargo build --release
 ```rust
 // Implement the Tool trait
 struct WeatherTool;
-impl tiny_bit_tools::Tool for WeatherTool {
+impl tinybit_tools::Tool for WeatherTool {
     fn name(&self) -> &str { "weather" }
     fn description(&self) -> &str { "Get current weather for a city" }
     fn args_schema(&self) -> &str { r#"{"city": "string"}"# }
@@ -1787,12 +1787,12 @@ registry.register(Box::new(WeatherTool));
 ### HTTP API (OpenAI-compatible)
 ```bash
 # Start server
-tiny-bit serve --port 8080
+tinybit serve --port 8080
 
 # Use with any OpenAI client
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"tiny-bit-small","messages":[{"role":"user","content":"Hello!"}]}'
+  -d '{"model":"tinybit-small","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
 ---
@@ -1800,7 +1800,7 @@ curl http://localhost:8080/v1/chat/completions \
 ## 15. CLAUDE.md (file for Claude Code to read first)
 
 ```markdown
-# tiny-bit — notes for Claude Code
+# tinybit — notes for Claude Code
 
 ## Build
 cargo build --release --workspace

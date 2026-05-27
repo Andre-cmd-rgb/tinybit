@@ -1,12 +1,12 @@
 // Tokenizer tests require a real tokenizer.json to be present.
 // These tests are skipped if no tokenizer is found.
 
-use tiny_bit_core::tokenizer::Tokenizer;
+use tinybit_core::tokenizer::Tokenizer;
 
 fn load_tokenizer() -> Option<Tokenizer> {
     let path = std::path::Path::new("tokenizer.json");
     if !path.exists() {
-        eprintln!("SKIP: tokenizer.json not found — run `tiny-bit download` first");
+        eprintln!("SKIP: tokenizer.json not found — run `tinybit download` first");
         return None;
     }
     Tokenizer::from_file(path).ok()

@@ -1,4 +1,4 @@
-# tiny-bit
+# tinybit
 
 A local AI assistant built on **RWKV-7** with **ternary BitLinear** quantization. Configurable from 10M to 400M parameters. Train on Google Cloud free credits; run on Linux, macOS (M-series), or Windows.
 
@@ -22,19 +22,19 @@ Apache 2.0 — all Rust, no C++ compiler required.
 
 ```bash
 # Prerequisites: Rust stable ≥ 1.82 (see rust-toolchain.toml)
-git clone <this-repo> && cd tiny-bit
+git clone <this-repo> && cd tinybit
 
 # Build everything
 cargo build --release
 
 # Interactive chat (loads a model checkpoint)
-tiny-bit chat --model checkpoints/nano/latest.safetensors --config configs/nano.toml
+tinybit chat --model checkpoints/nano/latest.safetensors --config configs/nano.toml
 
 # HTTP server (OpenAI-compatible)
-tiny-bit serve --model checkpoints/small/latest.safetensors --config configs/small.toml --port 8080
+tinybit serve --model checkpoints/small/latest.safetensors --config configs/small.toml --port 8080
 
 # Download tokenizer
-tiny-bit download --out data/tokenizer.json
+tinybit download --out data/tokenizer.json
 ```
 
 ---
@@ -77,14 +77,44 @@ bash scripts/prepare_data.sh data/
 
 ```bash
 # Local (CPU, slow — good for smoke testing)
-tiny-bit train --config configs/nano.toml --data data/ --out checkpoints/nano/
+tinybit train --model-config configs/nano.toml --train-config configs/train.toml
 
-# GCP on-demand
-bash scripts/gcp_train.sh --config configs/small.toml
+# GCP — unified launcher
+export GCP_PROJECT="your-project-id"
+export GCP_BUCKET="gs://your-bucket"
 
-# GCP spot/preemptible (cheapest — auto-resumes from checkpoint)
-bash scripts/gcp_spot_train.sh --config configs/small.toml
+# Sanity check the environment before paying for a GPU
+./scripts/preflight.sh nano
+
+# Launch: tries L4 first, then T4; tries all common US/EU zones; stops as
+# soon as one VM is created. Run id, version, machine, zone are printed.
+DATA_TOKENS=20000000 TRAIN_STEPS=2000 \
+  ./scripts/gcp_launch.sh nano
+
+# Use SPOT pricing
+PROVISIONING_MODEL=SPOT ./scripts/gcp_launch.sh nano
+
+# Watch the run
+./scripts/gcp_status.sh                        # uses latest_run.txt
+./scripts/gcp_tail_logs.sh <RUN_ID> bootstrap  # while the VM sets itself up
+./scripts/gcp_tail_logs.sh <RUN_ID> training   # once training starts
 ```
+
+Output layout in the bucket:
+
+```
+gs://$GCP_BUCKET/runs/<RUN_ID>/
+  launch.json                # what was provisioned
+  status.json                # latest stage, step, checkpoint
+  DONE.json | FAILED.json    # terminal marker
+  logs/bootstrap.log
+  logs/training.log
+  checkpoints/step_000NNNN.safetensors  (+ .json meta)
+gs://$GCP_BUCKET/latest_run.txt
+```
+
+Failure handling: any error before training starts uploads `FAILED.json` and
+shuts the VM down (set `KEEP_VM_ON_FAILURE=1` to keep it for debugging).
 
 Training config (`configs/train.toml`):
 
@@ -137,10 +167,10 @@ Results are injected as:
 
 ### Adding custom tools
 
-Implement the `Tool` trait in `tiny-bit-tools`:
+Implement the `Tool` trait in `tinybit-tools`:
 
 ```rust
-use tiny_bit_tools::tool::{Tool, ToolOutput};
+use tinybit_tools::tool::{Tool, ToolOutput};
 
 struct MyTool;
 
@@ -162,7 +192,7 @@ registry.register(Box::new(MyTool));
 ## HTTP server (OpenAI-compatible)
 
 ```bash
-tiny-bit serve --port 8080
+tinybit serve --port 8080
 ```
 
 Endpoints:
@@ -176,7 +206,7 @@ Example:
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "tiny-bit",
+    "model": "tinybit",
     "messages": [{"role": "user", "content": "What is 12^2?"}]
   }'
 ```
@@ -187,10 +217,10 @@ curl http://localhost:8080/v1/chat/completions \
 
 ```bash
 # Export to safetensors
-tiny-bit convert --model checkpoints/small/latest.safetensors --out model.safetensors --format safetensors
+tinybit convert --model checkpoints/small/latest.safetensors --out model.safetensors --format safetensors
 
 # Export to GGUF (for llama.cpp compatibility)
-tiny-bit convert --model checkpoints/small/latest.safetensors --out model.gguf --format gguf
+tinybit convert --model checkpoints/small/latest.safetensors --out model.gguf --format gguf
 ```
 
 ---
@@ -202,10 +232,10 @@ tiny-bit convert --model checkpoints/small/latest.safetensors --out model.gguf -
 cargo test
 
 # Specific suites
-cargo test -p tiny-bit-tests --test model_correctness
-cargo test -p tiny-bit-tests --test tool_system
-cargo test -p tiny-bit-tests --test training_smoke
-cargo test -p tiny-bit-tests --test quantize
+cargo test -p tinybit-tests --test model_correctness
+cargo test -p tinybit-tests --test tool_system
+cargo test -p tinybit-tests --test training_smoke
+cargo test -p tinybit-tests --test quantize
 ```
 
 Gate tests that must pass before any real training run:
@@ -259,11 +289,11 @@ Logits (B, T, vocab_size)
 
 ```
 crates/
-  tiny-bit-core/    — model, config, tokenizer, state, quantize
-  tiny-bit-tools/   — tool trait, registry, built-in tools
-  tiny-bit-infer/   — inference engine, sampler, session, tool processor
-  tiny-bit-train/   — trainer, optimizer, scheduler, loss, checkpoint, data
-  tiny-bit-cli/     — CLI (chat, serve, train, convert, download)
+  tinybit-core/    — model, config, tokenizer, state, quantize
+  tinybit-tools/   — tool trait, registry, built-in tools
+  tinybit-infer/   — inference engine, sampler, session, tool processor
+  tinybit-train/   — trainer, optimizer, scheduler, loss, checkpoint, data
+  tinybit-cli/     — CLI (chat, serve, train, convert, download)
 tests/              — integration tests (workspace member)
 configs/            — TOML config files for each model size
 scripts/            — GCP provisioning and data preparation

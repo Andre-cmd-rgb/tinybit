@@ -1,6 +1,9 @@
 /target/
 /data/*.bin
+/data/*.db
 /checkpoints/
+/checkpoints-*/
+/checkpoints-overnight_*.safetensors
 /models/
 /sessions/
 .agents/
@@ -9,3 +12,4 @@
 *.safetensors
 *.gguf
 .env
+/tokenizer.json
