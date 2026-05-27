@@ -122,8 +122,8 @@ shuts the VM down (set `KEEP_VM_ON_FAILURE=1` to keep it for debugging).
 Key training config fields (`configs/train-micro-l4.toml`):
 
 ```toml
-batch_size     = 2       # sequences per microbatch (L4-tuned)
-grad_accum     = 32      # microbatches per optimizer step
+batch_size     = 4       # sequences per microbatch (L4-tuned)
+grad_accum     = 16      # microbatches per optimizer step
 total_steps    = 25000   # optimizer steps
 peak_lr        = 3e-4
 grad_clip      = 1.0

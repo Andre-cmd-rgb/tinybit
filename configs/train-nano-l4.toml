@@ -1,7 +1,7 @@
 # 25M `nano` model on a single NVIDIA L4 (24 GB VRAM).
 #
 # Per-step token budget:
-#   batch 4 × seq 512 × grad_accum 32 = 65_536 tokens / step
+#   batch 8 × seq 512 × grad_accum 16 = 65_536 tokens / step
 #
 # Total token budget:
 #   15_000 steps × 65_536 ≈ 0.98 B tokens
@@ -16,8 +16,8 @@ train_data     = "data/train.bin"
 val_data       = "data/val.bin"
 checkpoint_dir = "checkpoints/"
 
-batch_size     = 4
-grad_accum     = 32
+batch_size     = 8
+grad_accum     = 16
 total_steps    = 15000
 peak_lr        = 3e-4
 weight_decay   = 0.01

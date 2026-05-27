@@ -96,8 +96,8 @@ Watch it:
 ## What `configs/train-micro-l4.toml` does
 
 ```
-batch_size     = 2       # × max_seq_len 512 (from configs/micro.toml)
-grad_accum     = 32      # → effective batch 64  →  64 * 512 = 32_768 tokens / step
+batch_size     = 4       # × max_seq_len 512 (from configs/micro.toml)
+grad_accum     = 16      # → effective batch 64  →  64 * 512 = 32_768 tokens / step
 total_steps    = 25000   # → 25000 * 32_768 ≈ 819M token-passes
 peak_lr        = 3e-4    # WSD: 2% warmup, 78% stable, 20% cosine decay to 3e-5
 weight_decay   = 0.01
@@ -113,12 +113,13 @@ optimal (16 toks/param) — enough for genuinely coherent English, simple
 question following, and recognizable knowledge from the FineWeb-Edu /
 Wikipedia / OpenHermes mix.
 
-Why the small `batch_size`: candle's sequential WKV scan in
+Why the moderate `batch_size`: candle's sequential WKV scan in
 `crates/tinybit-core/src/model/time_mix.rs` retains every intermediate
 state in the autograd graph for backward, so peak training VRAM scales
 linearly with `batch_size × max_seq_len × num_layers`. On a 24 GB L4 with
-the 16-layer 50M micro, `batch_size = 2` at `max_seq_len = 512` is the
-largest microbatch that reliably fits.
+the 16-layer 50M micro, `batch_size = 4` at `max_seq_len = 512` is roughly
+the largest microbatch that reliably fits with headroom for optimizer
+state and the logits projection.
 
 If you're tighter on time:
 
