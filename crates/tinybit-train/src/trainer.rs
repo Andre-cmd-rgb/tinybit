@@ -183,6 +183,20 @@ impl Trainer {
                 continue;
             }
 
+            // If the dataset ended mid-accumulation, each microbatch loss was
+            // scaled by 1/grad_accum, but only actual_microbatches contributed.
+            // Rescale so the effective divisor is actual_microbatches, not grad_accum.
+            if actual_microbatches < self.config.grad_accum {
+                let rescale = self.config.grad_accum as f64 / actual_microbatches as f64;
+                if let Some(ref mut merged) = merged_grads {
+                    for v in &all_vars {
+                        if let Some(g) = merged.remove(v.as_tensor()) {
+                            merged.insert(v.as_tensor(), (g * rescale)?);
+                        }
+                    }
+                }
+            }
+
             let train_loss = accum_loss / actual_microbatches as f64;
 
             // ---- guard: skip non-finite loss ---------------------------------

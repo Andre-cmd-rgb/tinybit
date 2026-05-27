@@ -302,6 +302,25 @@ fi
 test -s data/train.bin
 test -s data/val.bin
 
+# ---------- restore_checkpoints -----------------------------------------------
+# If this is a fresh VM (e.g., relaunching after preemption on a new instance),
+# download any existing checkpoints from GCS so the trainer can resume from the
+# last saved step rather than starting from scratch.
+log_stage restore_checkpoints
+mkdir -p "$WORKDIR/checkpoints"
+if [ -z "$(ls -A "$WORKDIR/checkpoints/" 2>/dev/null)" ]; then
+  if gs ls "$GCS_RUN_PREFIX/checkpoints/" >/dev/null 2>&1; then
+    log "Downloading existing checkpoints from GCS..."
+    gs -m -q rsync -r "$GCS_RUN_PREFIX/checkpoints/" "$WORKDIR/checkpoints/" \
+      && log "Checkpoints restored from GCS" \
+      || log "[warn] checkpoint restore failed — training will start from scratch"
+  else
+    log "[info] No existing checkpoints in GCS for this run — starting fresh"
+  fi
+else
+  log "[info] Local checkpoints already present — skipping GCS restore"
+fi
+
 # ---------- prepare_training_config ------------------------------------------
 log_stage prepare_training_config
 if [ -n "$TRAIN_CONFIG_OVERRIDE" ] && [ -r "$TRAIN_CONFIG_OVERRIDE" ]; then

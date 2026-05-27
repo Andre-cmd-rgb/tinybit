@@ -16,7 +16,7 @@
 #   Tokens are written directly to disk with numpy (4 bytes/token).
 #   No in-memory token buffer — peak RAM is proportional to one document at a time.
 #   The DataLoader shuffles at training time, so no shuffle is needed here.
-#   Val split is taken from the tail of the stream; train is everything else.
+#   Val split is taken from the head of the stream (FineWeb-Edu); train is everything after.
 
 set -Eeuo pipefail
 
@@ -26,7 +26,7 @@ mkdir -p "$OUTPUT_DIR"
 echo "Preparing data in $OUTPUT_DIR ..."
 
 python3 - "$OUTPUT_DIR" <<'PYTHON'
-import os, sys, struct, shutil
+import os, sys
 from pathlib import Path
 
 OUTPUT_DIR = sys.argv[1] if len(sys.argv) > 1 else "data"
@@ -174,10 +174,6 @@ with open(tmp_path, 'wb') as tmp_f:
             collected[name] = 0
             continue
 
-# Final flush
-with open(tmp_path, 'ab') as tmp_f:
-    flush_buf(tmp_f)
-
 total_collected = total_written
 print()
 print("Per-dataset collection:")
@@ -191,8 +187,9 @@ if total_collected < MIN_TOKENS:
     sys.exit(3)
 
 # Split into val + train without loading entire dataset into RAM -------------
-# val = last val_size tokens (end of file), train = everything before.
-# Using the end ensures train gets the bulk of the data regardless of val_size.
+# val = first val_size tokens (head of stream = FineWeb-Edu, highest quality).
+# train = everything after val. This ensures val loss reflects the primary
+# distribution, not the last/smallest dataset streamed.
 val_size = max(SEQ_LEN * 100, total_collected // 50)
 val_size = min(val_size, total_collected - SEQ_LEN)  # ensure train has at least seq_len tokens
 train_size = total_collected - val_size
@@ -213,9 +210,9 @@ def copy_range(src_path, dst_path, start_tok, count_tok):
             remaining -= len(chunk)
     print(f"  Wrote {count_tok:,} tokens to {dst_path}")
 
-print(f"\nSplitting: train={train_size:,} tokens, val={val_size:,} tokens")
-copy_range(tmp_path, f"{OUTPUT_DIR}/train.bin", 0, train_size)
-copy_range(tmp_path, f"{OUTPUT_DIR}/val.bin", train_size, val_size)
+print(f"\nSplitting: val={val_size:,} tokens (head), train={train_size:,} tokens (rest)")
+copy_range(tmp_path, f"{OUTPUT_DIR}/val.bin",   0,        val_size)
+copy_range(tmp_path, f"{OUTPUT_DIR}/train.bin", val_size, train_size)
 
 tmp_path.unlink(missing_ok=True)
 print("Done!")

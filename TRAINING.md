@@ -157,25 +157,34 @@ Expected loss trajectory for a 150M model trained on 1 B tokens:
 
 ## Resuming after preemption
 
-The VM shuts down on SPOT preemption. Relaunch with the same `RUN_ID` and add `--resume`:
+SPOT VMs use `--instance-termination-action=STOP`, so the disk is preserved on
+preemption. To resume, simply restart the same instance:
+
+```bash
+gcloud compute instances start tinybit-l4-YYYYMMDD-HHMMSS \
+  --zone=us-central1-a --project=my-project
+```
+
+The startup script re-runs on every boot. It skips data prep and cargo build if
+the outputs are already on disk, downloads any GCS checkpoints missing locally,
+and restarts training with `--resume` from the last checkpoint.
+
+**If the VM was deleted** (e.g., after hitting the maximum preemption count or
+a manual restart via `gcp_launch.sh` with the same `RUN_ID`):
 
 ```bash
 RUN_ID=20260527-091332-small \
-SKIP_UPLOAD=0 \
 DATA_TOKENS=1500000000 \
 TRAIN_CONFIG=configs/train-small-l4.toml \
   ./scripts/gcp_launch.sh small
 ```
 
-The startup script checks for existing `data/train.bin` and `checkpoints/` and skips
-data prep / rebuilds if they are already present on the new VM. To force a fresh start,
-set `FORCE_DATA=1` or `FORCE_REBUILD=1`.
+The `restore_checkpoints` stage downloads existing checkpoints from
+`gs://bucket/runs/<run_id>/checkpoints/` onto the new VM before training
+starts. Training resumes automatically from the latest saved step.
 
-Note: checkpoints sync every `SYNC_INTERVAL` seconds to GCS. On a clean VM, the startup
-script downloads the repo from GCS which does NOT include checkpoints (they are in
-`gs://bucket/runs/<run_id>/checkpoints/`). You need to manually copy them down before
-restarting training, or pass `--resume` so the trainer starts from scratch if no local
-checkpoint is found.
+To force a clean restart from step 0, set `FORCE_DATA=1` or `FORCE_REBUILD=1`,
+or use a different `RUN_ID`.
 
 ---
 
