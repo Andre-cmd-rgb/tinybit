@@ -5,19 +5,42 @@ everything from data preparation to launching a run and monitoring it.
 
 ---
 
-## Quick start — 150M model on L4
+## Quick start
+
+Set your project and bucket once:
 
 ```bash
 export GCP_PROJECT=your-project-id
 export GCP_BUCKET=gs://your-bucket
+```
 
+Then pick your model size:
+
+**25M nano (~4–6 h, ~$1–2 SPOT):**
+```bash
+DATA_TOKENS=1500000000 \
+TRAIN_CONFIG=configs/train-nano-l4.toml \
+PROVISIONING_MODEL=STANDARD,SPOT \
+  ./scripts/gcp_launch.sh nano
+```
+
+**50M micro (~12–18 h, ~$3–5 SPOT):**
+```bash
+DATA_TOKENS=1500000000 \
+TRAIN_CONFIG=configs/train-micro-l4.toml \
+PROVISIONING_MODEL=STANDARD,SPOT \
+  ./scripts/gcp_launch.sh micro
+```
+
+**150M small (~30–40 h, ~$7–9 SPOT):**
+```bash
 DATA_TOKENS=1500000000 \
 TRAIN_CONFIG=configs/train-small-l4.toml \
 PROVISIONING_MODEL=STANDARD,SPOT \
   ./scripts/gcp_launch.sh small
 ```
 
-That's it. The launcher finds the first available zone with an L4, uploads the repo,
+The launcher finds the first available zone with an L4, uploads the repo,
 installs CUDA 12.8, prepares ~1 B tokens of training data, compiles the binary, and starts
 training — all unattended. Checkpoints sync to `$GCP_BUCKET/runs/<run_id>/checkpoints/`
 every 120 s.
@@ -46,7 +69,7 @@ the 150 M model with `batch_size=8`, and the 200 GB SSD boot disk keeps data pre
 
 | Name  | Params | Layers | d_model | d_ffn | Recommended GPU |
 |-------|--------|--------|---------|-------|-----------------|
-| nano  | ~10 M  | 6      | 256     | 512   | T4 or CPU       |
+| nano  | ~25 M  | 12     | 320     | 640   | T4 or L4        |
 | micro | ~50 M  | 12     | 512     | 1024  | T4 or L4        |
 | small | ~150 M | 18     | 768     | 2048  | **L4** (this guide) |
 | base  | ~400 M | 32     | 1024    | 2048  | A100 or H100    |
@@ -224,7 +247,7 @@ cargo build --release -p tinybit-cli
   --smoke-test
 ```
 
-The smoke test should complete in under 5 minutes on CPU, ending at loss < 8.
+The smoke test should complete in under 15 minutes on CPU, ending at loss < 8.
 
 ---
 

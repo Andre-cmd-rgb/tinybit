@@ -41,13 +41,13 @@ impl ModelConfig {
         embed + self.num_layers * per_layer + ln_out + spec
     }
 
-    /// ~10M params — fastest, edge devices
+    /// ~25M params — smallest useful model
     pub fn nano() -> Self {
         Self {
-            vocab_size: 32000, num_layers: 6, d_model: 256,
-            d_ffn: 512, num_heads: 4, head_dim: 64,
+            vocab_size: 32000, num_layers: 12, d_model: 320,
+            d_ffn: 640, num_heads: 5, head_dim: 64,
             ternary_ffn: false, int8_time: false,
-            max_seq_len: 512, dropout: 0.05, spec_heads: 0,
+            max_seq_len: 1024, dropout: 0.05, spec_heads: 0,
         }
     }
 
