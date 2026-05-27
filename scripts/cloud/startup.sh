@@ -30,10 +30,15 @@ set -Eeuo pipefail
 # ---------- environment hardening ----------------------------------------------
 # GCP startup scripts run as root with no shell init: HOME is unset, PATH is
 # minimal. Set everything explicitly.
+#
+# /snap/bin is critical — on the GCP deep-learning image, gsutil and gcloud are
+# installed as snap apps, so without /snap/bin every `gsutil cp` in this script
+# silently no-ops because of the `command -v gsutil` guard, and *nothing* makes
+# it back to the bucket.
 export HOME=/root
 export USER=root
 export DEBIAN_FRONTEND=noninteractive
-export PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="/root/.cargo/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 cd /root
 
 # ---------- run parameters (filled by launcher) -------------------------------
@@ -70,6 +75,24 @@ exec > >(tee -a "$BOOTSTRAP_LOG") 2>&1
 ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log() { printf '[%s] %s\n' "$(ts)" "$*"; }
 
+# Resolve gsutil even when PATH is wrong. On the GCP deep-learning image it's
+# at /snap/bin/gsutil; on other images it may be /usr/bin/gsutil or installed
+# via the Google Cloud SDK to /opt/google-cloud-sdk/bin/gsutil.
+GSUTIL_BIN=""
+for _cand in gsutil /snap/bin/gsutil /usr/bin/gsutil /opt/google-cloud-sdk/bin/gsutil /usr/lib/google-cloud-sdk/bin/gsutil; do
+  if [ "$_cand" = "gsutil" ]; then
+    if command -v gsutil >/dev/null 2>&1; then GSUTIL_BIN="$(command -v gsutil)"; break; fi
+  elif [ -x "$_cand" ]; then
+    GSUTIL_BIN="$_cand"; break
+  fi
+done
+if [ -z "$GSUTIL_BIN" ]; then
+  echo "[boot-warn] gsutil not found on PATH or common install locations — bucket sync will be disabled"
+fi
+gs() {
+  if [ -n "$GSUTIL_BIN" ]; then "$GSUTIL_BIN" "$@"; else return 1; fi
+}
+
 write_status() {
   local stage="$1"; local extra="${2:-}"
   local step="${LAST_STEP:-0}"; local ckpt="${LAST_CKPT:-}"
@@ -87,9 +110,7 @@ write_status() {
   "updated_at": "$(ts)"$extra
 }
 JSON
-  if command -v gsutil >/dev/null 2>&1; then
-    gsutil -q cp "$STATUS_PATH" "$GCS_RUN_PREFIX/status.json" || true
-  fi
+  gs -q cp "$STATUS_PATH" "$GCS_RUN_PREFIX/status.json" || true
 }
 
 log_stage() {
@@ -99,17 +120,15 @@ log_stage() {
 }
 
 sync_logs() {
-  if command -v gsutil >/dev/null 2>&1; then
-    gsutil -q cp "$BOOTSTRAP_LOG" "$GCS_RUN_PREFIX/logs/bootstrap.log" || true
-    if [ -f "$TRAINING_LOG" ]; then
-      gsutil -q cp "$TRAINING_LOG" "$GCS_RUN_PREFIX/logs/training.log" || true
-    fi
+  gs -q cp "$BOOTSTRAP_LOG" "$GCS_RUN_PREFIX/logs/bootstrap.log" || true
+  if [ -f "$TRAINING_LOG" ]; then
+    gs -q cp "$TRAINING_LOG" "$GCS_RUN_PREFIX/logs/training.log" || true
   fi
 }
 
 sync_checkpoints() {
-  if command -v gsutil >/dev/null 2>&1 && [ -d "$WORKDIR/checkpoints" ]; then
-    gsutil -m -q rsync -r "$WORKDIR/checkpoints/" "$GCS_RUN_PREFIX/checkpoints/" || true
+  if [ -d "$WORKDIR/checkpoints" ]; then
+    gs -m -q rsync -r "$WORKDIR/checkpoints/" "$GCS_RUN_PREFIX/checkpoints/" || true
   fi
 }
 
@@ -126,9 +145,7 @@ write_marker() {
   "at": "$(ts)"
 }
 JSON
-  if command -v gsutil >/dev/null 2>&1; then
-    gsutil -q cp "$marker" "$GCS_RUN_PREFIX/$name.json" || true
-  fi
+  gs -q cp "$marker" "$GCS_RUN_PREFIX/$name.json" || true
 }
 
 maybe_shutdown() {
