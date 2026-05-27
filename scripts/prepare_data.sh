@@ -147,7 +147,7 @@ with open(tmp_path, 'wb') as tmp_f:
         try:
             ds = load_stream(name, cfg, split)
             for ex in tqdm(ds, desc=name, unit="ex", mininterval=2.0,
-                           total=max(target // 512, 100)):
+                           total=max(target // 1024, 100)):
                 text = text_from_example(ex, field)
                 if not text or not text.strip():
                     continue
