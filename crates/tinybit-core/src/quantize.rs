@@ -52,7 +52,7 @@ pub fn dequantize(
 /// Pack two ternary values into one byte.
 /// Maps: -1→0, 0→1, +1→2; packs two into a byte: high=val[2i], low=val[2i+1]
 pub fn pack_ternary(weights: &[i8]) -> Vec<u8> {
-    let mut packed = Vec::with_capacity((weights.len() + 1) / 2);
+    let mut packed = Vec::with_capacity(weights.len().div_ceil(2));
     let mut i = 0;
     while i < weights.len() {
         let hi = encode_ternary(weights[i]);

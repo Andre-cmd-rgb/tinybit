@@ -33,7 +33,7 @@ pub fn load_checkpoint(
     // Find latest checkpoint by step number
     let mut entries: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |x| x == "json"))
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         .collect();
     entries.sort_by_key(|e| e.path());
     let meta_path = entries
@@ -54,7 +54,7 @@ pub fn load_checkpoint(
 pub fn prune_checkpoints(dir: &Path, keep_best: usize, keep_recent: usize) -> anyhow::Result<()> {
     let mut metas: Vec<(std::path::PathBuf, CheckpointMeta)> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |x| x == "json"))
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         .filter_map(|e| {
             let p = e.path();
             let meta: CheckpointMeta = serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()?;

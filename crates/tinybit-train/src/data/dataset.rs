@@ -3,6 +3,8 @@ use rand::seq::SliceRandom;
 use std::fs::File;
 use std::path::Path;
 
+type Batch = (Vec<Vec<u32>>, Vec<Vec<u32>>);
+
 /// Memory-mapped token dataset. Binary file of u32 token IDs, little-endian.
 pub struct TokenDataset {
     mmap:       Mmap,
@@ -60,7 +62,7 @@ impl DataLoader {
     }
 
     /// Returns (input_ids, target_ids) both (B, T-1) as Vec<Vec<u32>>.
-    pub fn next_batch(&mut self) -> anyhow::Result<Option<(Vec<Vec<u32>>, Vec<Vec<u32>>)>> {
+    pub fn next_batch(&mut self) -> anyhow::Result<Option<Batch>> {
         if self.current + self.batch_size > self.indices.len() {
             return Ok(None);
         }

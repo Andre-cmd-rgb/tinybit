@@ -55,7 +55,7 @@ impl<'a> ToolProcessor<'a> {
                 prev_id = next_id;
 
                 // Decode periodically to look for completion conditions.
-                if round_tokens.len() % 4 == 0 || round_tokens.len() < 8 {
+                if round_tokens.len().is_multiple_of(4) || round_tokens.len() < 8 {
                     let partial =
                         eng.tokenizer.decode(&round_tokens, false).unwrap_or_default();
 

@@ -76,7 +76,7 @@ impl InferenceEngine {
             prev_id = next_id;
 
             // Decode the tail every few tokens to look for a stop string.
-            if generated.len() % 4 == 0 {
+            if generated.len().is_multiple_of(4) {
                 let tail = self.tokenizer.decode(&generated, false).unwrap_or_default();
                 if tail.contains(STOP_STRING_USER_TURN) {
                     break;
