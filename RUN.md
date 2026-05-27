@@ -15,29 +15,76 @@ This file is the recipe that fixes all three.
 
 ## TL;DR
 
+Pick the training config that matches the GPU you're using. Each one is
+sized so the GPU is well-utilized but won't OOM.
+
+| Model preset | GPU profile | Train config                     | Time / Cost (SPOT)  |
+|--------------|-------------|----------------------------------|---------------------|
+| `nano`       | any         | `configs/train.toml`             | for smoke tests     |
+| `micro`      | l4 / a100   | `configs/train-quality.toml`     | ~14h L4 / ~4h A100  |
+| `small`      | l4          | `configs/train-small-l4.toml`    | ~30-40h, ~$10-15    |
+| `small`      | a100 (40GB) | `configs/train-small-a100.toml`  | ~15-20h, ~$17-22    |
+| `small`      | h100 / a100-80 | `configs/train-small-h100.toml` | ~6-10h H100, ~14-18h A100-80 |
+
 ```bash
 export GCP_PROJECT=tinybit-run-0
 export GCP_BUCKET=gs://tinybit-run-0-tinybit       # your bucket
 export HF_TOKEN=hf_xxx                              # optional — see below
 
-# Cheap / slow (single L4, ~$0.71/hr):
-DATA_TOKENS=1000000000 \
-TRAIN_CONFIG=configs/train-quality.toml \
-  ./scripts/gcp_launch.sh micro
-
-# Faster — prefer A100, fall back to L4/T4 — retry on spot if on-demand is full:
-DATA_TOKENS=1000000000 \
-TRAIN_CONFIG=configs/train-quality.toml \
-PROFILE=a100,a100-80,l4,t4 \
-PROVISIONING_MODEL=STANDARD,SPOT \
-  ./scripts/gcp_launch.sh micro
-
-# Fastest plausible (H100 if you can get one):
-DATA_TOKENS=1000000000 \
-TRAIN_CONFIG=configs/train-quality.toml \
-PROFILE=h100,a100-80,a100,l4 \
-PROVISIONING_MODEL=STANDARD,SPOT \
+# 150M model, L4 SPOT only (works without quota requests):
+DATA_TOKENS=1500000000 \
+TRAIN_CONFIG=configs/train-small-l4.toml \
+PROFILE=l4 \
+PROVISIONING_MODEL=SPOT \
   ./scripts/gcp_launch.sh small
+
+# 150M model, A100 SPOT (requires A100 quota — see "Quota requests" below):
+DATA_TOKENS=2000000000 \
+TRAIN_CONFIG=configs/train-small-a100.toml \
+PROFILE=a100,a100-80 \
+PROVISIONING_MODEL=SPOT \
+  ./scripts/gcp_launch.sh small
+
+# 150M model, H100/A100-80 SPOT:
+DATA_TOKENS=2000000000 \
+TRAIN_CONFIG=configs/train-small-h100.toml \
+PROFILE=h100,a100-80 \
+PROVISIONING_MODEL=SPOT \
+  ./scripts/gcp_launch.sh small
+```
+
+## Quota requests
+
+New GCP projects start with **zero quota** for A100 / A100-80 / H100 (this
+is GCP's default, not specific to this project). L4 and T4 work out of the
+box; everything bigger needs a quota request first.
+
+Direct quota console (filter the page for the GPU you want):
+
+```
+https://console.cloud.google.com/iam-admin/quotas?project=$GCP_PROJECT
+```
+
+Search for the exact metric name from the table below, tick its checkbox,
+"Edit Quotas", request limit `1` in a US region. First requests are
+usually auto-approved within minutes for spot quota, hours for on-demand.
+
+| GPU                | On-demand metric                  | SPOT metric                              |
+|--------------------|-----------------------------------|-------------------------------------------|
+| A100 40GB          | `NVIDIA A100 GPUs`                | `Preemptible NVIDIA A100 GPUs`            |
+| A100 80GB          | `NVIDIA A100 80GB GPUs`           | `Preemptible NVIDIA A100 80GB GPUs`       |
+| H100 80GB          | `NVIDIA H100 GPUs`                | `Preemptible NVIDIA H100 GPUs`            |
+
+Inspect what you currently have from the CLI:
+
+```bash
+for r in us-central1 us-east1 us-east4 us-east5 us-west1 us-west4; do
+  echo "=== $r ==="
+  gcloud compute regions describe "$r" --project="$GCP_PROJECT" \
+    --format='value(quotas)' 2>/dev/null | tr ';' '\n' \
+    | grep -E "A100|H100|NVIDIA_L4_GPUS|NVIDIA_T4_GPUS" \
+    | grep -v "limit=0.0$"
+done
 ```
 
 ### Hardware profiles

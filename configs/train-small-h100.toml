@@ -1,0 +1,36 @@
+# 150M `small` model on a single NVIDIA H100 80GB (a3-highgpu-1g) or
+# A100 80GB (a2-ultragpu-1g). Both have 80 GB VRAM, so the same config
+# fits on either with comfortable headroom.
+#
+# Per-step token budget:
+#   batch 32 × seq 1024 × grad_accum 1 = 32_768 tokens / step
+#
+# Total token budget:
+#   60_000 steps × 32_768 ≈ 1.97 B tokens (~Chinchilla-optimal for 150M)
+#
+# Wall-clock estimate:
+#   H100 SPOT  (~$3.30/hr):  ~6-10 h,  ~$25-35 total
+#   A100-80 SPOT (~$1.50/hr): ~14-18 h, ~$22-28 total
+#
+# The H100 is faster but more eviction-prone (tighter spot pool). A100-80
+# is the right "let it run overnight, walk away" choice.
+#
+# Pair with:
+#   DATA_TOKENS=2000000000
+
+train_data     = "data/train.bin"
+val_data       = "data/val.bin"
+checkpoint_dir = "checkpoints/"
+
+batch_size     = 32
+grad_accum     = 1
+total_steps    = 60000
+peak_lr        = 3e-4
+weight_decay   = 0.01
+grad_clip      = 1.0
+
+save_every     = 1000
+eval_every     = 500
+eval_batches   = 20
+
+smoke_test_steps = 0
