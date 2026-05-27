@@ -1,5 +1,5 @@
 use tinybit_core::quantize::{pack_ternary, quantize_int8, quantize_ternary, unpack_ternary};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{Device, Tensor};
 
 #[test]
 fn test_quantize_ternary_values() -> anyhow::Result<()> {
@@ -27,7 +27,7 @@ fn test_quantize_int8_range() -> anyhow::Result<()> {
     assert!(scale > 0.0);
     let q_vals = q.to_vec1::<f32>()?;
     for &v in &q_vals {
-        assert!(v >= -127.0 && v <= 127.0, "int8 value out of range: {v}");
+        assert!((-127.0..=127.0).contains(&v), "int8 value out of range: {v}");
     }
     Ok(())
 }

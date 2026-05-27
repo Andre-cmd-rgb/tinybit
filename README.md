@@ -1,6 +1,6 @@
 # tinybit
 
-A local AI assistant built on **RWKV-7** with **ternary BitLinear** quantization. Configurable from 25M to 400M parameters. Train on Google Cloud free credits; run on Linux, macOS (M-series), or Windows.
+A local AI assistant built on **RWKV-7** with **ternary BitLinear** quantization. Configurable from 25M to 500M parameters. Train on Google Cloud L4 free credits; run on Linux, macOS (M-series), or Windows.
 
 Apache 2.0 — all Rust, no C++ compiler required.
 
@@ -31,7 +31,7 @@ cargo build --release
 tinybit chat --model checkpoints/nano/latest.safetensors --config configs/nano.toml
 
 # HTTP server (OpenAI-compatible)
-tinybit serve --model checkpoints/small/latest.safetensors --config configs/small.toml --port 8080
+tinybit serve --model checkpoints/micro/latest.safetensors --config configs/micro.toml --port 8080
 
 # Download tokenizer
 tinybit download --out data/tokenizer.json
@@ -41,27 +41,26 @@ tinybit download --out data/tokenizer.json
 
 ## Model presets
 
-| Preset | Params | Layers | d_model | Notes |
-|--------|--------|--------|---------|-------|
 All models use 3.5× FFN expansion (d_ffn = 3.5 × d_model) matching the RWKV-7 paper.
 
 | Preset | Params  | Layers | d_model | d_ffn | Notes |
 |--------|---------|--------|---------|-------|-------|
 | nano   | ~25M    | 9      | 320     | 1120  | Fast iteration, L4 ~5–7 h |
-| micro  | ~50M    | 16     | 384     | 1344  | Laptop inference, L4 ~15–22 h |
-| small  | ~258M   | 13     | 1024    | 3584  | Good quality, A100 recommended |
-| base   | ~501M   | 17     | 1280    | 4480  | Best quality, H100 recommended |
+| micro  | ~50M    | 16     | 384     | 1344  | Main L4 target, ~15–22 h |
+| small  | ~258M   | 13     | 1024    | 3584  | Architecture only — too big to train on L4 |
+| base   | ~501M   | 17     | 1280    | 4480  | Architecture only — too big to train on L4 |
 
 Config files live in `configs/`. Override any field:
 
 ```toml
 # configs/nano.toml
 vocab_size  = 32008
-num_layers  = 12
+num_layers  = 9
 d_model     = 320
-d_ffn       = 640
+d_ffn       = 1120
 num_heads   = 5
 head_dim    = 64
+max_seq_len = 512
 ```
 
 ---
@@ -84,24 +83,20 @@ bash scripts/prepare_data.sh data/
 cargo build --release -p tinybit-cli
 ./target/release/tinybit train \
   --model-config configs/nano.toml \
-  --train-config configs/train.toml \
+  --train-config configs/train-nano-l4.toml \
   --smoke-test
 
-# GCP — unified launcher
+# GCP — L4-only launcher
 export GCP_PROJECT="your-project-id"
 export GCP_BUCKET="gs://your-bucket"
 
-# 25M nano (~4-6 h, ~$1-2 SPOT)
+# 25M nano (~5-7 h, ~$1-2 SPOT)
 DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-nano-l4.toml \
 PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh nano
 
-# 50M micro (~12-18 h, ~$3-5 SPOT)
+# 50M micro (~15-22 h, ~$4-6 SPOT)
 DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-micro-l4.toml \
 PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh micro
-
-# 150M small (~30-40 h, ~$7-9 SPOT)
-DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-small-l4.toml \
-PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh small
 
 # Watch the run
 ./scripts/gcp_status.sh <RUN_ID>           # stage, step, last checkpoint
@@ -124,12 +119,12 @@ gs://$GCP_BUCKET/latest_run.txt
 Failure handling: any error before training starts uploads `FAILED.json` and
 shuts the VM down (set `KEEP_VM_ON_FAILURE=1` to keep it for debugging).
 
-Key training config fields (`configs/train-nano-l4.toml` etc.):
+Key training config fields (`configs/train-micro-l4.toml`):
 
 ```toml
-batch_size     = 16      # sequences per microbatch
-grad_accum     = 4       # microbatches per optimizer step
-total_steps    = 15000   # optimizer steps
+batch_size     = 2       # sequences per microbatch (L4-tuned)
+grad_accum     = 32      # microbatches per optimizer step
+total_steps    = 25000   # optimizer steps
 peak_lr        = 3e-4
 grad_clip      = 1.0
 save_every     = 500
@@ -225,10 +220,10 @@ curl http://localhost:8080/v1/chat/completions \
 
 ```bash
 # Export to safetensors
-tinybit convert --model checkpoints/small/latest.safetensors --out model.safetensors --format safetensors
+tinybit convert --model checkpoints/micro/latest.safetensors --out model.safetensors --format safetensors
 
 # Export to GGUF (for llama.cpp compatibility)
-tinybit convert --model checkpoints/small/latest.safetensors --out model.gguf --format gguf
+tinybit convert --model checkpoints/micro/latest.safetensors --out model.gguf --format gguf
 ```
 
 ---

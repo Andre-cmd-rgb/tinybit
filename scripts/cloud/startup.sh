@@ -20,7 +20,7 @@
 #   __HF_TOKEN__            — optional HF token, or empty
 #   __SCRIPT_VERSION__      — launcher version string
 #   __TRAIN_CONFIG__        — path to a checked-in train config (relative to
-#                              repo root, e.g. "configs/train-quality.toml")
+#                              repo root, e.g. "configs/train-micro-l4.toml")
 #                              or empty to fall back to the inline default
 #                              parameterized by __TRAIN_STEPS__.
 #   __ZONE__ / __MACHINE__ / __ACCELERATOR__ — informational, recorded in status.json
@@ -335,8 +335,8 @@ train_data     = "data/train.bin"
 val_data       = "data/val.bin"
 checkpoint_dir = "checkpoints/"
 
-batch_size     = 4
-grad_accum     = 4
+batch_size     = 2
+grad_accum     = 16
 total_steps    = $TRAIN_STEPS
 peak_lr        = 3e-4
 weight_decay   = 0.01

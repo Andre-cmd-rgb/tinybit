@@ -1,7 +1,7 @@
 #!/bin/bash
-# tinybit unified GCP launcher.
+# tinybit GCP launcher — L4 only.
 #
-# Tries multiple zones × hardware profiles until ONE VM is created, then stops.
+# Tries every zone in order until ONE L4 VM is created, then stops.
 # Generates a per-run RUN_ID, uploads the local repo to gs://$GCP_BUCKET/$GCS_REPO_PREFIX,
 # renders cloud/startup.sh with substitutions, and attaches it as VM metadata.
 #
@@ -10,16 +10,6 @@
 #   GCP_BUCKET      gs://your-bucket   (no trailing slash)
 #
 # Optional env (all have defaults):
-#   PROFILE              comma-separated priority list of hardware profiles.
-#                        Known profiles (cheapest first):
-#                          t4       n1-standard-4   + nvidia-tesla-t4   (16 GB)
-#                          l4       g2-standard-4   + nvidia-l4         (24 GB)
-#                          g4       g4-standard-48  + nvidia-rtx-pro-6000 (96 GB, 48 vCPU, 180 GB RAM)
-#                          a100     a2-highgpu-1g   + nvidia-tesla-a100 (40 GB)
-#                          a100-80  a2-ultragpu-1g  + nvidia-a100-80gb  (80 GB)
-#                          h100     a3-highgpu-1g   + nvidia-h100-80gb  (80 GB)
-#                        Default: "l4,t4". For "fast and not sold out":
-#                        "a100,l4,t4". For "fastest available": "h100,a100-80,a100,l4,t4".
 #   PROVISIONING_MODEL   STANDARD | SPOT | comma list (e.g. "STANDARD,SPOT").
 #                        With a list, the launcher tries each mode in order so
 #                        you can prefer on-demand and fall back to spot when
@@ -38,12 +28,12 @@
 #   SKIP_UPLOAD          1 to skip rsync     (default: 0)
 #   FORCE                1 to bypass guards  (default: 0)
 #   TRAIN_CONFIG         path inside the repo to a training config TOML
-#                        (e.g. configs/train-quality.toml). Empty falls back
+#                        (e.g. configs/train-micro-l4.toml). Empty falls back
 #                        to an inline generated config parameterized by
 #                        TRAIN_STEPS.
 #
 # Usage:
-#   ./scripts/gcp_launch.sh [nano|micro|small|base]
+#   ./scripts/gcp_launch.sh [nano|micro]
 
 set -Eeuo pipefail
 
@@ -60,14 +50,13 @@ if (cd "$REPO_ROOT" && ! git diff --quiet HEAD 2>/dev/null); then
   GIT_DIRTY=" (dirty)"
 fi
 
-MODEL_SIZE="${1:-nano}"
+MODEL_SIZE="${1:-micro}"
 : "${GCP_PROJECT:?Set GCP_PROJECT}"
 : "${GCP_BUCKET:?Set GCP_BUCKET (gs://...)}"
 
 # strip trailing slash if any
 GCP_BUCKET="${GCP_BUCKET%/}"
 
-PROFILE="${PROFILE:-l4,t4}"
 PROVISIONING_MODEL="${PROVISIONING_MODEL:-STANDARD}"
 DATA_TOKENS="${DATA_TOKENS:-20000000}"
 TRAIN_STEPS="${TRAIN_STEPS:-2000}"
@@ -97,28 +86,22 @@ fi
 
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)-${MODEL_SIZE}}"
 
-# Default zone list — EU first, then US, then Asia.
-# A100 / H100 capacity is much tighter than L4/T4; the launcher will still
-# try every zone in order. If you know which zone has the GPU you want,
-# pass GCP_ZONES="zone1 zone2 ..." to skip the others.
+# Default zone list — EU first, then US, then Asia. L4 is broadly available;
+# listing many zones helps work around regional capacity exhaustion.
 DEFAULT_ZONES=(
   europe-west4-a europe-west4-b europe-west4-c
   europe-west1-b europe-west1-c
   europe-west3-a europe-west3-b
   europe-west2-a europe-west2-b europe-west2-c
-  europe-west8-b europe-west8-c
-  europe-west10-b
   europe-north1-a europe-north1-b europe-north1-c
   us-central1-a us-central1-b us-central1-c us-central1-f
-  us-west1-a us-west1-b us-west1-c us-west3-a us-west4-a us-west4-c
+  us-west1-a us-west1-b us-west1-c us-west4-a us-west4-c
   us-east1-b us-east1-c us-east1-d
   us-east4-a us-east4-b us-east4-c
   us-east5-a us-east5-b us-east5-c
   us-south1-a us-south1-b
   asia-east1-a asia-east1-b
-  asia-south1-c asia-south2-a asia-south2-c
   asia-southeast1-a asia-southeast1-b asia-southeast1-c
-  asia-southeast2-b asia-southeast2-c
 )
 if [ -n "${GCP_ZONES:-}" ]; then
   read -r -a ZONES <<< "$GCP_ZONES"
@@ -126,43 +109,12 @@ else
   ZONES=("${DEFAULT_ZONES[@]}")
 fi
 
-# Hardware profile table: profile_id -> (machine, accelerator)
-# Profiles are ordered roughly from cheapest to fastest.
-declare -A PROFILE_MACHINE=(
-  [t4]=n1-standard-4
-  [l4]=g2-standard-4
-  [g4]=g4-standard-48
-  [a100]=a2-highgpu-1g
-  [a100-80]=a2-ultragpu-1g
-  [h100]=a3-highgpu-1g
-)
-declare -A PROFILE_ACCEL=(
-  [t4]=nvidia-tesla-t4
-  [l4]=nvidia-l4
-  [g4]=nvidia-rtx-pro-6000
-  [a100]=nvidia-tesla-a100
-  [a100-80]=nvidia-a100-80gb
-  [h100]=nvidia-h100-80gb
-)
-# Approximate hourly cost (USD) for on-demand single-GPU, US zones — for
-# the banner only. SPOT is typically 30% of this.
-declare -A PROFILE_COST=(
-  [t4]="~0.35"
-  [l4]="~0.71"
-  [g4]="~4.97"
-  [a100]="~3.67"
-  [a100-80]="~5.07"
-  [h100]="~11.00"
-)
-# G4 requires hyperdisk-balanced; all other profiles use pd-ssd.
-declare -A PROFILE_DISK=(
-  [t4]=pd-ssd
-  [l4]=pd-ssd
-  [g4]=hyperdisk-balanced
-  [a100]=pd-ssd
-  [a100-80]=pd-ssd
-  [h100]=pd-ssd
-)
+# Hardware: L4 only.
+PROFILE_ID="l4"
+MACHINE_TYPE="g2-standard-4"
+ACCELERATOR_TYPE="nvidia-l4"
+DISK_TYPE="pd-ssd"
+COST_HINT="~0.71"
 
 # Image: deep-learning common image with CUDA 12.9 runtime + nvidia driver 580.
 # (We pin CUDA 12.8 toolkit inside startup.sh to match cudarc.)
@@ -176,7 +128,7 @@ printf '%s\n' \
   " tinybit GCP launcher  v$SCRIPT_VERSION  commit=$GIT_COMMIT$GIT_DIRTY" \
   " run_id        : $RUN_ID" \
   " model         : $MODEL_SIZE" \
-  " profiles      : $PROFILE" \
+  " hardware      : L4 ($MACHINE_TYPE + $ACCELERATOR_TYPE, ~$COST_HINT/hr on-demand)" \
   " provisioning  : $PROVISIONING_MODEL" \
   " data tokens   : $DATA_TOKENS  (min $MIN_TOKENS)" \
   " train steps   : $TRAIN_STEPS" \
@@ -196,17 +148,8 @@ if [ -n "$GIT_DIRTY" ] && [ "$FORCE" != "1" ]; then
   exit 1
 fi
 
-# Validate PROFILE and PROVISIONING_MODEL up-front so typos fail before any
-# remote calls.
-IFS=',' read -r -a _PROFILE_CHECK      <<< "$PROFILE"
+# Validate PROVISIONING_MODEL up-front so typos fail before any remote calls.
 IFS=',' read -r -a _PROVISIONING_CHECK <<< "$PROVISIONING_MODEL"
-for p in "${_PROFILE_CHECK[@]}"; do
-  if [ -z "${PROFILE_MACHINE[$p]:-}" ]; then
-    echo "[FATAL] PROFILE contains unknown entry '$p'" >&2
-    echo "        Known profiles: ${!PROFILE_MACHINE[*]}" >&2
-    exit 1
-  fi
-done
 for p in "${_PROVISIONING_CHECK[@]}"; do
   case "$p" in
     STANDARD|SPOT) ;;
@@ -255,7 +198,7 @@ STARTUP_RENDERED="$(mktemp /tmp/tinybit-startup.XXXXXX.sh)"
 trap 'rm -f "$STARTUP_RENDERED"' EXIT
 
 render_startup() {
-  local zone="$1" machine="$2" accel="$3"
+  local zone="$1"
   # Use python to do safe placeholder substitution — sed risks corrupting HF token / special chars.
   python3 - "$TEMPLATE" "$STARTUP_RENDERED" <<PY
 import os, sys
@@ -286,89 +229,73 @@ with open(dst, "w") as f: f.write(text)
 PY
 }
 
-# ---------- try (provisioning × profile × zone) combinations ----------------
+# ---------- try (provisioning × zone) combinations ----------------------------
 SUCCESS=0
 INSTANCE_NAME=""
 SELECTED_ZONE=""
-SELECTED_PROFILE=""
 SELECTED_PROVISIONING=""
 
-IFS=',' read -r -a PROFILE_LIST      <<< "$PROFILE"
 IFS=',' read -r -a PROVISIONING_LIST <<< "$PROVISIONING_MODEL"
 
-# Outer loop: provisioning. Inner: profile × zone. So with
-# PROVISIONING_MODEL="STANDARD,SPOT" we first try every (profile, zone) on
-# on-demand, then retry the whole grid on spot — which is usually what you
-# want when on-demand A100s are sold out everywhere.
+# Outer loop: provisioning. Inner: zone. With PROVISIONING_MODEL="STANDARD,SPOT"
+# we first try every zone on-demand, then retry the whole grid on spot.
 for prov in "${PROVISIONING_LIST[@]}"; do
-  for profile in "${PROFILE_LIST[@]}"; do
-    machine="${PROFILE_MACHINE[$profile]:-}"
-    accel="${PROFILE_ACCEL[$profile]:-}"
-    cost_hint="${PROFILE_COST[$profile]:-?}"
-    if [ -z "$machine" ]; then
-      echo "[warn] unknown profile '$profile' — skipping"; continue
+  for zone in "${ZONES[@]}"; do
+    INSTANCE_NAME="tinybit-${PROFILE_ID}-$(date -u +%Y%m%d-%H%M%S)"
+    echo
+    echo "------------------------------------------------------------"
+    echo " attempt: prov=$prov zone=$zone"
+    echo "          machine=$MACHINE_TYPE accel=$ACCELERATOR_TYPE  on-demand $COST_HINT/hr"
+    echo " instance: $INSTANCE_NAME"
+    echo "------------------------------------------------------------"
+
+    export RUN_ID MODEL_SIZE GCP_BUCKET GCS_REPO_PREFIX DATA_TOKENS MIN_TOKENS \
+           TRAIN_STEPS CUDA_VERSION CUDA_DIR KEEP_VM_ON_FAILURE SYNC_INTERVAL \
+           HF_TOKEN_VAL SCRIPT_VERSION TRAIN_CONFIG
+    ZONE_INFO="$zone" MACHINE_INFO="$MACHINE_TYPE" ACCEL_INFO="$ACCELERATOR_TYPE" \
+    render_startup "$zone"
+
+    INSTANCE_FLAGS=(
+      --maintenance-policy=TERMINATE
+      --accelerator="type=$ACCELERATOR_TYPE,count=1"
+    )
+    if [ "$prov" = "SPOT" ]; then
+      INSTANCE_FLAGS+=(--provisioning-model=SPOT --instance-termination-action=STOP)
     fi
 
-    for zone in "${ZONES[@]}"; do
-      INSTANCE_NAME="tinybit-${profile}-$(date -u +%Y%m%d-%H%M%S)"
-      echo
-      echo "------------------------------------------------------------"
-      echo " attempt: profile=$profile prov=$prov zone=$zone"
-      echo "          machine=$machine accel=$accel  on-demand $cost_hint/hr"
-      echo " instance: $INSTANCE_NAME"
-      echo "------------------------------------------------------------"
-
-      export RUN_ID MODEL_SIZE GCP_BUCKET GCS_REPO_PREFIX DATA_TOKENS MIN_TOKENS \
-             TRAIN_STEPS CUDA_VERSION CUDA_DIR KEEP_VM_ON_FAILURE SYNC_INTERVAL \
-             HF_TOKEN_VAL SCRIPT_VERSION TRAIN_CONFIG
-      ZONE_INFO="$zone" MACHINE_INFO="$machine" ACCEL_INFO="$accel" \
-      render_startup "$zone" "$machine" "$accel"
-
-      INSTANCE_FLAGS=(
-        --maintenance-policy=TERMINATE
-        --accelerator="type=$accel,count=1"
-      )
-      if [ "$prov" = "SPOT" ]; then
-        INSTANCE_FLAGS+=(--provisioning-model=SPOT --instance-termination-action=STOP)
-      fi
-
-      disk_type="${PROFILE_DISK[$profile]:-pd-ssd}"
-      if gcloud compute instances create "$INSTANCE_NAME" \
-           --project="$GCP_PROJECT" \
-           --zone="$zone" \
-           --machine-type="$machine" \
-           --image-family="$IMAGE_FAMILY" \
-           --image-project="$IMAGE_PROJECT" \
-           --boot-disk-size="$BOOT_DISK_SIZE" \
-           --boot-disk-type="$disk_type" \
-           --scopes=storage-full \
-           --metadata=run-id="$RUN_ID",tinybit-script-version="$SCRIPT_VERSION",tinybit-model="$MODEL_SIZE",tinybit-profile="$profile",tinybit-provisioning="$prov" \
-           --metadata-from-file=startup-script="$STARTUP_RENDERED" \
-           "${INSTANCE_FLAGS[@]}" 2>&1
-      then
-        SUCCESS=1
-        SELECTED_ZONE="$zone"
-        SELECTED_PROFILE="$profile"
-        SELECTED_PROVISIONING="$prov"
-        break 3
-      else
-        echo "[miss] $zone/$profile/$prov unavailable — trying next"
-        sleep 3
-      fi
-    done
+    if gcloud compute instances create "$INSTANCE_NAME" \
+         --project="$GCP_PROJECT" \
+         --zone="$zone" \
+         --machine-type="$MACHINE_TYPE" \
+         --image-family="$IMAGE_FAMILY" \
+         --image-project="$IMAGE_PROJECT" \
+         --boot-disk-size="$BOOT_DISK_SIZE" \
+         --boot-disk-type="$DISK_TYPE" \
+         --scopes=storage-full \
+         --metadata=run-id="$RUN_ID",tinybit-script-version="$SCRIPT_VERSION",tinybit-model="$MODEL_SIZE",tinybit-profile="$PROFILE_ID",tinybit-provisioning="$prov" \
+         --metadata-from-file=startup-script="$STARTUP_RENDERED" \
+         "${INSTANCE_FLAGS[@]}" 2>&1
+    then
+      SUCCESS=1
+      SELECTED_ZONE="$zone"
+      SELECTED_PROVISIONING="$prov"
+      break 2
+    else
+      echo "[miss] $zone/$prov unavailable — trying next"
+      sleep 3
+    fi
   done
 done
 
 if [ "$SUCCESS" != "1" ]; then
   echo
-  echo "[FATAL] no (provisioning × profile × zone) combination accepted the VM create request."
-  echo "        Tried profiles      : ${PROFILE_LIST[*]}"
+  echo "[FATAL] no (provisioning × zone) combination accepted the VM create request."
   echo "        Tried provisioning  : ${PROVISIONING_LIST[*]}"
   echo "        Tried ${#ZONES[@]} zones. Request a reservation or retry later."
   exit 1
 fi
 
-# ---------- record run metadata ----------------------------------------------
+# ---------- record run metadata -----------------------------------------------
 RUN_META="$(mktemp)"
 trap 'rm -f "$STARTUP_RENDERED" "$RUN_META"' EXIT
 cat > "$RUN_META" <<JSON
@@ -377,9 +304,9 @@ cat > "$RUN_META" <<JSON
   "model_size": "$MODEL_SIZE",
   "instance_name": "$INSTANCE_NAME",
   "zone": "$SELECTED_ZONE",
-  "profile": "$SELECTED_PROFILE",
-  "machine_type": "${PROFILE_MACHINE[$SELECTED_PROFILE]}",
-  "accelerator": "${PROFILE_ACCEL[$SELECTED_PROFILE]}",
+  "profile": "$PROFILE_ID",
+  "machine_type": "$MACHINE_TYPE",
+  "accelerator": "$ACCELERATOR_TYPE",
   "provisioning_model": "$SELECTED_PROVISIONING",
   "data_tokens": $DATA_TOKENS,
   "min_tokens": $MIN_TOKENS,
@@ -401,7 +328,7 @@ cat <<EOF
  LAUNCHED
    instance:     $INSTANCE_NAME
    zone:         $SELECTED_ZONE
-   profile:      $SELECTED_PROFILE  (${PROFILE_MACHINE[$SELECTED_PROFILE]} + ${PROFILE_ACCEL[$SELECTED_PROFILE]})
+   hardware:     L4 ($MACHINE_TYPE + $ACCELERATOR_TYPE)
    provisioning: $SELECTED_PROVISIONING
    run_id:       $RUN_ID
    bucket:       $GCP_BUCKET/runs/$RUN_ID/

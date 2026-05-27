@@ -14,15 +14,18 @@ cargo test --workspace
 2. BitLinear uses STE (straight-through estimator) — during training, gradients
    flow through as if no quantization happened. Quantize only for export.
 
-3. Muon optimizer ONLY for 2D weight matrices. AdamW for everything else.
-   See optimizer/muon.rs for the Newton-Schulz implementation.
+3. The Muon optimizer module exists at `crates/tinybit-train/src/optimizer/muon.rs`
+   for the Newton-Schulz orthogonalization but is NOT currently wired into the
+   trainer — `Trainer::run` uses candle's `AdamW` for all parameters. Wiring
+   Muon back in (for 2D weight matrices, AdamW for everything else) is a
+   future optimization, not a current invariant.
 
 4. Tool calls use special tokens, not a separate classifier.
    The model is trained to output <|tool_call|>JSON<|end_tool_call|>.
    See tools/parser.rs for detection logic.
 
-5. Tokenizer is LLaMA format (32k vocab, SentencePiece BPE).
-   Special tokens are added on top. IDs are deterministic — do not change.
+5. Tokenizer is LLaMA format (32k vocab + 8 special tokens = 32008).
+   The 8 extras are tool-call markers. IDs are deterministic — do not change.
 
 6. All configs are in configs/*.toml. No magic numbers in model code.
    Everything reads from ModelConfig.
@@ -39,10 +42,11 @@ cargo test --workspace
 10. tokenizers crate uses fancy-regex (pure Rust) instead of onig (needs C++).
     This avoids a C++ compiler dependency on Linux.
 
-11. GCP training is launched only via `scripts/gcp_launch.sh`. It uploads the
-    repo, generates a RUN_ID, and tries (zone × profile) combinations until one
-    VM is created — then stops. Stage failures upload FAILED.json and shut the
-    VM down (unless KEEP_VM_ON_FAILURE=1).
+11. GCP training is launched only via `scripts/gcp_launch.sh`. L4 is the
+    ONLY supported hardware — no T4/G4/A100/H100 fallbacks. The launcher
+    uploads the repo, generates a RUN_ID, and tries each zone in order
+    until an L4 VM is created. Stage failures upload FAILED.json and shut
+    the VM down (unless KEEP_VM_ON_FAILURE=1).
 
 12. cudarc 0.13 needs CUDA <= 12.8. The startup script installs cuda-toolkit-12-8
     via NVIDIA's apt repo and exports CUDA_ROOT/PATH=/usr/local/cuda-12.8 before
@@ -61,6 +65,16 @@ cargo test --workspace
 15. Startup script adds 32 GB swap early (before data prep and cargo build) so that
     the L4 VM (16 GB RAM) cannot OOM during large downloads or compilation.
 
+16. The RWKV-7 WKV scan in `crates/tinybit-core/src/model/time_mix.rs` is a
+    sequential candle loop, NOT a fused CUDA kernel. Each timestep allocates
+    a fresh state/outer tensor that the autograd graph keeps for backward,
+    so peak training VRAM scales linearly with
+    `batch_size × max_seq_len × num_layers`. On the L4's 22.5 GB free VRAM,
+    the 16-layer micro model fits at `batch_size = 2, max_seq_len = 512`;
+    larger combinations OOM. Both `configs/micro.toml` and the L4 train
+    configs are tuned to this budget — don't bump them without changing
+    the scan implementation.
+
 ## Common mistakes to avoid
 
 - Do NOT use .unwrap() in library code — propagate with anyhow::Result + ?
@@ -72,6 +86,8 @@ cargo test --workspace
 - candle_nn::Linear::forward() requires `use candle_nn::Module;` in scope
 - Use candle_nn::Init::Const(val) not candle_nn::init::Const(val)
 - Do NOT store tokens in a Python list — use numpy arrays or stream-write to disk
-- Always pass DATA_TOKENS=1500000000 (not the default 20M) when training the 150M model
+- Always pass DATA_TOKENS=1500000000 (not the default 20M) when training micro on L4
 - GradStore::new() is pub(crate) in candle — cannot be created externally.
   Initialize from the first microbatch's backward() result, then merge subsequent ones.
+- Do NOT raise `max_seq_len` or `batch_size` in the L4 configs without first
+  verifying the WKV scan still fits in VRAM. See design decision 16.

@@ -20,10 +20,10 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 8080)]
     pub port: u16,
 
-    #[arg(long, default_value = "configs/small.toml")]
+    #[arg(long, default_value = "configs/micro.toml")]
     pub config: std::path::PathBuf,
 
-    #[arg(long, default_value = "models/tinybit-small.safetensors")]
+    #[arg(long, default_value = "models/tinybit-micro.safetensors")]
     pub model: std::path::PathBuf,
 
     #[arg(long, default_value = "tokenizer.json")]

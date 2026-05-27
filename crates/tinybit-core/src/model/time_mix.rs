@@ -121,6 +121,9 @@ impl TimeMix {
         let g = silu(&self.w_g1.forward(&x_x)?)?.broadcast_mul(&self.w_g2.forward(&x_x)?)?;
 
         let w = self.compute_decay()?; // (H, dh)
+        // decay broadcast tensor: w (H, dh) → (1, H, dh, 1). Loop-invariant —
+        // hoisted out of the per-timestep loop to avoid rebuilding it T× per layer.
+        let w_b = w.unsqueeze(0)?.unsqueeze(candle_core::D::Minus1)?.contiguous()?;
 
         // Reshape to (B, T, H, dh) then permute to (B, T, H, dh)
         let r = r.reshape((b, t, self.num_heads, self.head_dim))?;
@@ -149,8 +152,6 @@ impl TimeMix {
             let v_unsq = v_f.unsqueeze(candle_core::D::Minus2)?.contiguous()?;
             let outer = k_unsq.broadcast_mul(&v_unsq)?;
 
-            // decay: w (H, dh) → (1, H, dh, 1)
-            let w_b = w.unsqueeze(0)?.unsqueeze(candle_core::D::Minus1)?.contiguous()?;
             state = state.broadcast_mul(&w_b)?.add(&outer)?;
 
             // readout: r_t → (B, H, 1, dh)

@@ -5,10 +5,10 @@ use tinybit_infer::{engine::InferenceEngine, session::Session};
 
 #[derive(Args)]
 pub struct ChatArgs {
-    #[arg(long, default_value = "configs/small.toml")]
+    #[arg(long, default_value = "configs/micro.toml")]
     pub config: std::path::PathBuf,
 
-    #[arg(long, default_value = "models/tinybit-small.safetensors")]
+    #[arg(long, default_value = "models/tinybit-micro.safetensors")]
     pub model: std::path::PathBuf,
 
     #[arg(long, default_value = "tokenizer.json")]

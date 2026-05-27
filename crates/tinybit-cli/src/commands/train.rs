@@ -4,10 +4,10 @@ use tinybit_train::trainer::{Trainer, TrainingConfig};
 
 #[derive(Args)]
 pub struct TrainArgs {
-    #[arg(long, default_value = "configs/small.toml")]
+    #[arg(long, default_value = "configs/micro.toml")]
     pub model_config: std::path::PathBuf,
 
-    #[arg(long, default_value = "configs/train.toml")]
+    #[arg(long, default_value = "configs/train-micro-l4.toml")]
     pub train_config: std::path::PathBuf,
 
     /// Run only smoke_test_steps steps

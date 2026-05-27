@@ -12,11 +12,11 @@
 #   * tokenizer.json or HF reachable
 #   * datasets package importable (data prep precheck — non-fatal)
 #
-# Usage: ./scripts/preflight.sh [nano|micro|small|base]
+# Usage: ./scripts/preflight.sh [nano|micro]
 
 set -uo pipefail
 
-MODEL_SIZE="${1:-nano}"
+MODEL_SIZE="${1:-micro}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 

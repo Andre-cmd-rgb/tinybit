@@ -6,7 +6,6 @@ use tinybit_train::loss::cross_entropy_loss;
 fn make_synthetic_data(
     n_chunks: usize,
     seq_len: usize,
-    vocab_size: usize,
 ) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
     // Repeating "1 2 3 4 5" pattern — trivially learnable
     let mut inputs = Vec::new();
@@ -48,7 +47,7 @@ fn smoke_train_nano_100_steps() -> anyhow::Result<()> {
 
     let seq_len = 8usize;
     let batch_size = 2usize;
-    let (inputs, targets) = make_synthetic_data(batch_size, seq_len, config.vocab_size);
+    let (inputs, targets) = make_synthetic_data(batch_size, seq_len);
 
     // Measure initial loss
     let initial_loss = forward_and_loss(&model, &inputs, &targets, &device)?;
@@ -94,7 +93,7 @@ fn test_loss_decreases_on_trivial_data() -> anyhow::Result<()> {
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = TinyBit::new(config.clone(), vb)?;
 
-    let (inputs, targets) = make_synthetic_data(4, 16, config.vocab_size);
+    let (inputs, targets) = make_synthetic_data(4, 16);
     let loss = forward_and_loss(&model, &inputs, &targets, &device)?;
 
     // Loss should be finite and roughly ln(vocab_size)
