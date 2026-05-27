@@ -20,11 +20,58 @@ export GCP_PROJECT=tinybit-run-0
 export GCP_BUCKET=gs://tinybit-run-0-tinybit       # your bucket
 export HF_TOKEN=hf_xxx                              # optional — see below
 
-# Single command:
+# Cheap / slow (single L4, ~$0.71/hr):
 DATA_TOKENS=1000000000 \
 TRAIN_CONFIG=configs/train-quality.toml \
   ./scripts/gcp_launch.sh micro
+
+# Faster — prefer A100, fall back to L4/T4 — retry on spot if on-demand is full:
+DATA_TOKENS=1000000000 \
+TRAIN_CONFIG=configs/train-quality.toml \
+PROFILE=a100,a100-80,l4,t4 \
+PROVISIONING_MODEL=STANDARD,SPOT \
+  ./scripts/gcp_launch.sh micro
+
+# Fastest plausible (H100 if you can get one):
+DATA_TOKENS=1000000000 \
+TRAIN_CONFIG=configs/train-quality.toml \
+PROFILE=h100,a100-80,a100,l4 \
+PROVISIONING_MODEL=STANDARD,SPOT \
+  ./scripts/gcp_launch.sh small
 ```
+
+### Hardware profiles
+
+| Profile   | Machine          | GPU                | Mem  | On-demand* | Spot* | Relative speed (vs L4) |
+|-----------|------------------|--------------------|------|------------|-------|------------------------|
+| `t4`      | n1-standard-4    | nvidia-tesla-t4    | 16GB | ~$0.35/hr  | ~$0.11| 0.5×                    |
+| `l4`      | g2-standard-4    | nvidia-l4          | 24GB | ~$0.71/hr  | ~$0.22| 1× (baseline)           |
+| `a100`    | a2-highgpu-1g    | nvidia-tesla-a100  | 40GB | ~$3.67/hr  | ~$1.10| 3-4×                    |
+| `a100-80` | a2-ultragpu-1g   | nvidia-a100-80gb   | 80GB | ~$5.07/hr  | ~$1.50| 3-4× (more headroom)    |
+| `h100`    | a3-highgpu-1g    | nvidia-h100-80gb   | 80GB | ~$11.00/hr | ~$3.30| 6-8×                    |
+
+\* approximate, US zones, varies by region; the launcher logs the per-attempt cost hint.
+
+`PROFILE` is a comma-separated priority list. The launcher tries each
+profile across every candidate zone, then moves to the next profile.
+A100/H100 capacity is much tighter than L4, so listing fallbacks is
+recommended.
+
+### Provisioning fallback
+
+`PROVISIONING_MODEL` is also a comma-separated list. Common pattern:
+
+```
+PROVISIONING_MODEL=STANDARD,SPOT
+```
+
+The launcher runs the whole (profile × zone) grid on on-demand first;
+if everything is sold out it retries the same grid on spot. Spot can
+be evicted at any time — your checkpoints continue uploading to GCS,
+so re-launching after eviction resumes from where you left off.
+
+You can also flip the order to prefer cheap-spot first:
+`PROVISIONING_MODEL=SPOT,STANDARD`.
 
 Watch it:
 
@@ -55,12 +102,15 @@ Wikipedia / OpenHermes mix.
 
 If you're tighter on time:
 
-| Budget    | Model  | DATA_TOKENS | total_steps | Expected output                      |
-|-----------|--------|-------------|-------------|--------------------------------------|
-| ~3-4h L4  | nano   | 200M        | 6000        | Coherent words, no real reasoning    |
-| ~5-7h L4  | micro  | 500M        | 15000       | Sentences, weak QA, some facts       |
-| ~10-14h L4| micro  | 1B          | 30000       | Paragraphs, QA, basic instructions   |
-| ~24h L4   | small  | 3B          | 60000       | Better-than-nano "useful" output     |
+| Budget       | Hardware | Model  | DATA_TOKENS | total_steps | Expected output                      |
+|--------------|----------|--------|-------------|-------------|--------------------------------------|
+| ~3-4h L4     | l4       | nano   | 200M        | 6000        | Coherent words, no real reasoning    |
+| ~5-7h L4     | l4       | micro  | 500M        | 15000       | Sentences, weak QA, some facts       |
+| ~10-14h L4   | l4       | micro  | 1B          | 30000       | Paragraphs, QA, basic instructions   |
+| ~3-4h A100   | a100     | micro  | 1B          | 30000       | Same as 14h L4 above, ~4× faster     |
+| ~6-8h A100   | a100-80  | small  | 2B          | 45000       | Genuinely useful output for a 150M   |
+| ~24h L4      | l4       | small  | 3B          | 60000       | Better-than-nano "useful" output     |
+| ~6h H100     | h100     | small  | 3B          | 60000       | Same as 24h L4, ~4× faster           |
 
 Override per-run with env vars:
 
