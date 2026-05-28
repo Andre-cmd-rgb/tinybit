@@ -93,7 +93,8 @@ impl TinyBit {
         mut config: ModelConfig,
         device: &Device,
     ) -> anyhow::Result<Self> {
-        if let Some(actual) = inspect_embed_vocab(path) {
+        let (vocab_override, is_quantized) = inspect_file(path);
+        if let Some(actual) = vocab_override {
             if actual != config.vocab_size {
                 tracing::warn!(
                     checkpoint = %path.display(),
@@ -104,6 +105,16 @@ impl TinyBit {
                 config.vocab_size = actual;
             }
         }
+
+        if is_quantized {
+            // Quantized export: rebuild full-precision tensors in memory and run
+            // the normal f32 path. The win is on-disk size (~16x smaller for the
+            // quantized matrices); a true ternary-matmul runtime is future work.
+            let tensors = load_quantized_tensors(path, device)?;
+            let vb = candle_nn::VarBuilder::from_tensors(tensors, DType::F32, device);
+            return Self::new(config, vb);
+        }
+
         let vb = unsafe {
             candle_nn::VarBuilder::from_mmaped_safetensors(&[path], DType::F32, device)?
         };
@@ -121,18 +132,78 @@ impl TinyBit {
     }
 }
 
-/// Peek at a safetensors file and return the embedding-table row count
-/// (`vocab_size`) if it can be determined. Returns `None` on any error so the
-/// caller can fall back to the supplied config.
-fn inspect_embed_vocab(path: &std::path::Path) -> Option<usize> {
-    let bytes = std::fs::read(path).ok()?;
-    let st = safetensors::SafeTensors::deserialize(&bytes).ok()?;
-    // Prefer the expected tinybit name; fall back to anything ending in
-    // ".weight" with two dims at the embedding head namespace.
+/// Peek at a safetensors file's header once. Returns the embedding-table row
+/// count (`vocab_size`) if determinable, and whether the file is a tinybit
+/// quantized export (carries the [`crate::quantize::QUANT_MARKER`] tensor).
+/// Returns conservative defaults on any error so the caller falls back to its
+/// config and the standard (non-quantized) load path.
+fn inspect_file(path: &std::path::Path) -> (Option<usize>, bool) {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return (None, false),
+    };
+    let st = match safetensors::SafeTensors::deserialize(&bytes) {
+        Ok(s) => s,
+        Err(_) => return (None, false),
+    };
+    let is_quant = st.tensor(crate::quantize::QUANT_MARKER).is_ok();
+    // The embedding stays full precision (under its original name) in both the
+    // plain and quantized formats, so this lookup works for either.
+    let mut vocab = None;
     for candidate in ["embed.embed.weight", "embed.weight"] {
         if let Ok(t) = st.tensor(candidate) {
-            return t.shape().first().copied();
+            vocab = t.shape().first().copied();
+            break;
         }
     }
-    None
+    (vocab, is_quant)
+}
+
+/// Load a tinybit quantized export and reconstruct a full-precision tensor map.
+/// Each `<name>.qweight` (packed ternary) is unpacked and rescaled back to an
+/// f32 `[rows, cols]` matrix; non-quantized tensors pass through unchanged.
+fn load_quantized_tensors(
+    path: &std::path::Path,
+    device: &Device,
+) -> anyhow::Result<std::collections::HashMap<String, Tensor>> {
+    use std::collections::HashMap;
+    let raw = candle_core::safetensors::load(path, device)?;
+    let mut out: HashMap<String, Tensor> = HashMap::new();
+    for (name, t) in &raw {
+        if name.as_str() == crate::quantize::QUANT_MARKER {
+            continue;
+        }
+        if let Some(base) = name.strip_suffix(".qweight") {
+            let scale = scalar_f32(&raw, &format!("{base}.qscale"))?;
+            let rows = scalar_i64(&raw, &format!("{base}.qrows"))? as usize;
+            let cols = scalar_i64(&raw, &format!("{base}.qcols"))? as usize;
+            let packed: Vec<u8> = t.flatten_all()?.to_vec1::<u8>()?;
+            let w = crate::quantize::dequantize_unpack_2d(&packed, scale, rows, cols, device)?;
+            out.insert(base.to_string(), w);
+        } else if name.ends_with(".qscale")
+            || name.ends_with(".qrows")
+            || name.ends_with(".qcols")
+        {
+            // sidecar metadata — consumed with its `.qweight` above
+        } else {
+            out.insert(name.clone(), t.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn scalar_f32(
+    raw: &std::collections::HashMap<String, Tensor>,
+    name: &str,
+) -> anyhow::Result<f32> {
+    let t = raw.get(name).ok_or_else(|| anyhow::anyhow!("quantized file missing {name}"))?;
+    Ok(t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?[0])
+}
+
+fn scalar_i64(
+    raw: &std::collections::HashMap<String, Tensor>,
+    name: &str,
+) -> anyhow::Result<i64> {
+    let t = raw.get(name).ok_or_else(|| anyhow::anyhow!("quantized file missing {name}"))?;
+    Ok(t.flatten_all()?.to_dtype(DType::I64)?.to_vec1::<i64>()?[0])
 }

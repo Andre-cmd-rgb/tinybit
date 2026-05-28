@@ -12,6 +12,35 @@ pub struct InferenceEngine {
     pub params:    SamplingParams,
 }
 
+/// Timing and token counts for a single generation, surfaced to the CLI.
+#[derive(Debug, Clone, Default)]
+pub struct GenStats {
+    /// Tokens fed during prefill (the encoded prompt).
+    pub prompt_tokens: usize,
+    /// Tokens sampled during the decode loop (one per model forward step).
+    pub gen_tokens:    usize,
+    /// Wall time spent prefilling the prompt.
+    pub prefill_secs:  f64,
+    /// Wall time spent in the decode loop (sampling + any tool execution).
+    pub decode_secs:   f64,
+}
+
+impl GenStats {
+    /// Decode throughput in tokens/second.
+    pub fn tokens_per_sec(&self) -> f64 {
+        if self.decode_secs > 0.0 {
+            self.gen_tokens as f64 / self.decode_secs
+        } else {
+            0.0
+        }
+    }
+
+    /// Total wall time for the turn (prefill + decode).
+    pub fn total_secs(&self) -> f64 {
+        self.prefill_secs + self.decode_secs
+    }
+}
+
 impl InferenceEngine {
     pub fn new(
         model_path: &std::path::Path,
@@ -97,14 +126,14 @@ impl InferenceEngine {
         user_message: &str,
         session: &mut Session,
         on_token: Option<&mut dyn FnMut(&str)>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, GenStats)> {
         use crate::processor::ToolProcessor;
         let prompt = self.tokenizer.apply_chat_template(
             Some(&session.system_prompt),
             user_message,
         )?;
         let processor = ToolProcessor::new(self);
-        let response = processor.run(&prompt, &mut session.state, on_token)?;
+        let (response, stats) = processor.run(&prompt, &mut session.state, on_token)?;
         session.history.push(crate::session::ChatMessage {
             role: crate::session::Role::User,
             content: user_message.to_string(),
@@ -113,6 +142,6 @@ impl InferenceEngine {
             role: crate::session::Role::Assistant,
             content: response.clone(),
         });
-        Ok(response)
+        Ok((response, stats))
     }
 }

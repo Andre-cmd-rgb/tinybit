@@ -81,8 +81,41 @@ pub fn run(args: ChatArgs) -> anyhow::Result<()> {
             _ => {}
         }
 
-        let response = engine.chat_turn(input, &mut session, None)?;
-        println!("{response}");
+        let mut sink = |chunk: &str| {
+            print!("{chunk}");
+            let _ = io::stdout().flush();
+        };
+        let (_response, stats) = engine.chat_turn(input, &mut session, Some(&mut sink))?;
+        println!(); // end the streamed line
+        print_stats(&stats, &device);
     }
     Ok(())
+}
+
+/// Print a one-line generation summary (tokens, throughput, timing) below the
+/// model's answer. Dimmed when stdout is a terminal so it reads as metadata.
+fn print_stats(stats: &tinybit_infer::engine::GenStats, device: &candle_core::Device) {
+    use std::io::IsTerminal;
+    let dev = if device.is_cuda() {
+        "cuda"
+    } else if device.is_metal() {
+        "metal"
+    } else {
+        "cpu"
+    };
+    let line = format!(
+        "{} tok · {:.1} tok/s · {} prompt · {:.2}s ({:.2}s prefill + {:.2}s gen) · {}",
+        stats.gen_tokens,
+        stats.tokens_per_sec(),
+        stats.prompt_tokens,
+        stats.total_secs(),
+        stats.prefill_secs,
+        stats.decode_secs,
+        dev,
+    );
+    if std::io::stdout().is_terminal() {
+        println!("\x1b[2m{line}\x1b[0m");
+    } else {
+        println!("{line}");
+    }
 }

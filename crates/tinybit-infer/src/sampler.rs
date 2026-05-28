@@ -82,11 +82,20 @@ pub fn sample(
         if sum > 0.0 {
             let mut sorted_idx: Vec<usize> = (0..probs.len()).collect();
             sorted_idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
+            // Keep the smallest set of tokens whose cumulative probability
+            // reaches top_p — including the token that crosses the threshold —
+            // and zero everything after it. (Zeroing the crossing token too
+            // would over-truncate the nucleus.)
             let mut cumsum = 0.0f32;
+            let mut reached = false;
             for &idx in &sorted_idx {
-                cumsum += probs[idx] / sum;
-                if cumsum > params.top_p as f32 {
+                if reached {
                     probs[idx] = 0.0;
+                    continue;
+                }
+                cumsum += probs[idx] / sum;
+                if cumsum >= params.top_p as f32 {
+                    reached = true;
                 }
             }
         }

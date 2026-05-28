@@ -2,6 +2,7 @@ use crate::{
     checkpoint::{load_checkpoint, prune_checkpoints, save_checkpoint, CheckpointMeta},
     data::{DataLoader, TokenDataset},
     loss::cross_entropy_loss,
+    optimizer::Muon,
     scheduler::WsdScheduler,
 };
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
@@ -9,6 +10,17 @@ use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use indicatif::{ProgressBar, ProgressStyle};
 use tinybit_core::{config::ModelConfig, model::TinyBit};
 use tracing::{info, warn};
+
+/// Which optimizer the trainer drives. Defaults to AdamW for everything;
+/// `muon` uses Muon for 2D hidden weight matrices and AdamW for the rest
+/// (embeddings, norms, biases).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OptimizerKind {
+    #[default]
+    Adamw,
+    Muon,
+}
 
 #[derive(Debug, serde::Deserialize)]
 pub struct TrainingConfig {
@@ -28,6 +40,19 @@ pub struct TrainingConfig {
     pub eval_batches: usize,
 
     pub smoke_test_steps: usize,
+
+    /// Optimizer selection. Absent in older configs → AdamW (unchanged behavior).
+    #[serde(default)]
+    pub optimizer: OptimizerKind,
+    /// Peak LR for Muon-updated matrices (orthogonalized updates need a larger
+    /// LR than AdamW). Follows the same WSD shape as `peak_lr`. Ignored unless
+    /// `optimizer = "muon"`.
+    #[serde(default = "default_muon_lr")]
+    pub muon_lr: f64,
+}
+
+fn default_muon_lr() -> f64 {
+    0.02
 }
 
 impl TrainingConfig {
@@ -111,7 +136,42 @@ impl Trainer {
             weight_decay: self.config.weight_decay,
         };
         let all_vars = varmap.all_vars();
-        let mut optimizer = AdamW::new(all_vars.clone(), params)?;
+
+        // Optimizer split. For Muon mode, 2D hidden weight matrices are driven
+        // by Muon; the tied embedding/LM-head table, norms, and biases stay on
+        // AdamW. For AdamW mode, everything is on AdamW (unchanged behavior).
+        let use_muon = self.config.optimizer == OptimizerKind::Muon;
+        let mut muon_params: Vec<(String, Var)> = Vec::new();
+        let adamw_vars: Vec<Var> = if use_muon {
+            let mut adamw = Vec::new();
+            let data = varmap.data().lock().expect("varmap mutex poisoned");
+            for (name, var) in data.iter() {
+                let is_matrix = var.as_tensor().dims().len() == 2;
+                let is_embed = name.contains("embed.embed");
+                if is_matrix && !is_embed {
+                    muon_params.push((name.clone(), var.clone()));
+                } else {
+                    adamw.push(var.clone());
+                }
+            }
+            adamw
+        } else {
+            all_vars.clone()
+        };
+
+        let mut optimizer = AdamW::new(adamw_vars, params)?;
+        let mut muon = if use_muon {
+            info!(
+                "optimizer=muon: {} matrices on Muon (lr={}), {} tensors on AdamW",
+                muon_params.len(),
+                self.config.muon_lr,
+                all_vars.len() - muon_params.len()
+            );
+            Some(Muon::new(self.config.muon_lr, 0.95))
+        } else {
+            None
+        };
+        let muon_scheduler = WsdScheduler::new(self.config.muon_lr, self.config.total_steps);
         let mut skipped_steps = 0usize;
 
         let total_steps = if self.config.smoke_test_steps > 0 {
@@ -242,6 +302,10 @@ impl Trainer {
             }
 
             optimizer.step(&grads)?;
+            if let Some(ref mut muon) = muon {
+                muon.lr = muon_scheduler.get_lr(step);
+                apply_muon(muon, &muon_params, &grads)?;
+            }
 
             info!(
                 "step={step} lr={lr:.2e} loss={:.4} gnorm={:.3}",
@@ -319,6 +383,29 @@ impl Trainer {
 
 const CKPT_KEEP_BEST: usize = 3;
 const CKPT_KEEP_RECENT: usize = 3;
+
+/// Apply a Muon update to each 2D matrix var using its gradient from `grads`.
+/// Reads the current weight, runs Muon's Newton-Schulz orthogonalized update,
+/// and writes the result back into the `Var` (which carries interior
+/// mutability, so this updates the live model weights).
+fn apply_muon(
+    muon: &mut Muon,
+    params: &[(String, Var)],
+    grads: &GradStore,
+) -> anyhow::Result<()> {
+    for (name, var) in params {
+        if let Some(g) = grads.get(var.as_tensor()) {
+            let mut w = var.as_tensor().clone();
+            let g = g.clone();
+            {
+                let mut slice: [(&str, &mut Tensor, &Tensor); 1] = [(name.as_str(), &mut w, &g)];
+                muon.step(&mut slice)?;
+            }
+            var.set(&w)?;
+        }
+    }
+    Ok(())
+}
 
 fn global_grad_norm(grads: &GradStore, vars: &[Var]) -> anyhow::Result<f64> {
     let mut sq_sum = 0.0f64;

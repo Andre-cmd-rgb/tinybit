@@ -91,7 +91,7 @@ async fn chat_completions(
         .unwrap_or_default();
 
     let response = match state.engine.chat_turn(&user_msg, &mut session, None) {
-        Ok(r) => r,
+        Ok((r, _stats)) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 

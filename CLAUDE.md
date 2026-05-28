@@ -14,11 +14,16 @@ cargo test --workspace
 2. BitLinear uses STE (straight-through estimator) — during training, gradients
    flow through as if no quantization happened. Quantize only for export.
 
-3. The Muon optimizer module exists at `crates/tinybit-train/src/optimizer/muon.rs`
-   for the Newton-Schulz orthogonalization but is NOT currently wired into the
-   trainer — `Trainer::run` uses candle's `AdamW` for all parameters. Wiring
-   Muon back in (for 2D weight matrices, AdamW for everything else) is a
-   future optimization, not a current invariant.
+3. The Muon optimizer (`crates/tinybit-train/src/optimizer/muon.rs`) is wired
+   into the trainer as an OPT-IN. Set `optimizer = "muon"` in the train TOML to
+   drive the 2D hidden weight matrices with Muon (Newton-Schulz orthogonalized
+   updates, LR = `muon_lr`, default 0.02) while candle's `AdamW` handles the
+   tied embedding/LM-head, norms, and biases. The DEFAULT (field absent) is
+   AdamW for ALL parameters — the documented L4 runs and their loss targets in
+   RUN.md assume AdamW, so do NOT change the default without re-validating a
+   full run. Muon's quality benefit is unverified at scale; only its mechanical
+   correctness (runs, no NaNs, loss decreases) has been smoke-tested. See
+   `apply_muon` and the param split in `Trainer::run`.
 
 4. Tool calls use special tokens, not a separate classifier.
    The model is trained to output <|tool_call|>JSON<|end_tool_call|>.
