@@ -121,50 +121,53 @@ impl TimeMix {
         let g = silu(&self.w_g1.forward(&x_x)?)?.broadcast_mul(&self.w_g2.forward(&x_x)?)?;
 
         let w = self.compute_decay()?; // (H, dh)
-        // decay broadcast tensor: w (H, dh) → (1, H, dh, 1). Loop-invariant —
-        // hoisted out of the per-timestep loop to avoid rebuilding it T× per layer.
-        let w_b = w.unsqueeze(0)?.unsqueeze(candle_core::D::Minus1)?.contiguous()?;
 
-        // Reshape to (B, T, H, dh) then permute to (B, T, H, dh)
+        // Reshape to (B, T, H, dh).
         let r = r.reshape((b, t, self.num_heads, self.head_dim))?;
         let k = k.reshape((b, t, self.num_heads, self.head_dim))?;
         let v = v.reshape((b, t, self.num_heads, self.head_dim))?;
 
-        // Sequential state scan
-        let mut state = Tensor::zeros(
-            (b, self.num_heads, self.head_dim, self.head_dim),
-            DType::F32,
-            x.device(),
-        )?;
+        let y = if crate::model::wkv::fused_wkv_enabled() {
+            // Fused scan: a single autograd node, so candle retains O(T·dh)
+            // instead of O(T·dh²) per layer. Numerically equal to the loop below.
+            crate::model::wkv::fused_wkv(&r, &k, &v, &w)?.reshape((b, t, d))?
+        } else {
+            // Sequential candle scan (default). decay broadcast (1,H,dh,1),
+            // hoisted out of the per-timestep loop.
+            let w_b = w.unsqueeze(0)?.unsqueeze(candle_core::D::Minus1)?.contiguous()?;
+            let mut state = Tensor::zeros(
+                (b, self.num_heads, self.head_dim, self.head_dim),
+                DType::F32,
+                x.device(),
+            )?;
+            let mut outputs: Vec<Tensor> = Vec::with_capacity(t);
+            for ti in 0..t {
+                let k_t = k.narrow(1, ti, 1)?.squeeze(1)?; // (B, H, dh)
+                let v_t = v.narrow(1, ti, 1)?.squeeze(1)?;
+                let r_t = r.narrow(1, ti, 1)?.squeeze(1)?;
 
-        let mut outputs: Vec<Tensor> = Vec::with_capacity(t);
+                let k_f = k_t.to_dtype(DType::F32)?;
+                let v_f = v_t.to_dtype(DType::F32)?;
 
-        for ti in 0..t {
-            let k_t = k.narrow(1, ti, 1)?.squeeze(1)?; // (B, H, dh)
-            let v_t = v.narrow(1, ti, 1)?.squeeze(1)?;
-            let r_t = r.narrow(1, ti, 1)?.squeeze(1)?;
+                // outer product: (B, H, dh, 1) × (B, H, 1, dh) → (B, H, dh, dh)
+                let k_unsq = k_f.unsqueeze(candle_core::D::Minus1)?.contiguous()?;
+                let v_unsq = v_f.unsqueeze(candle_core::D::Minus2)?.contiguous()?;
+                let outer = k_unsq.broadcast_mul(&v_unsq)?;
 
-            let k_f = k_t.to_dtype(DType::F32)?;
-            let v_f = v_t.to_dtype(DType::F32)?;
+                state = state.broadcast_mul(&w_b)?.add(&outer)?;
 
-            // outer product: (B, H, dh, 1) × (B, H, 1, dh) → (B, H, dh, dh)
-            let k_unsq = k_f.unsqueeze(candle_core::D::Minus1)?.contiguous()?;
-            let v_unsq = v_f.unsqueeze(candle_core::D::Minus2)?.contiguous()?;
-            let outer = k_unsq.broadcast_mul(&v_unsq)?;
+                // readout: r_t → (B, H, 1, dh)
+                let r_unsq = r_t.to_dtype(DType::F32)?
+                    .unsqueeze(candle_core::D::Minus2)?
+                    .contiguous()?;
+                let y_t = r_unsq.matmul(&state.contiguous()?)?; // (B, H, 1, dh)
+                let y_t = y_t.squeeze(candle_core::D::Minus2)?;  // (B, H, dh)
+                let y_t = y_t.reshape((b, d))?;
+                outputs.push(y_t.unsqueeze(1)?); // (B, 1, D)
+            }
+            Tensor::cat(&outputs, 1)? // (B, T, D)
+        };
 
-            state = state.broadcast_mul(&w_b)?.add(&outer)?;
-
-            // readout: r_t → (B, H, 1, dh)
-            let r_unsq = r_t.to_dtype(DType::F32)?
-                .unsqueeze(candle_core::D::Minus2)?
-                .contiguous()?;
-            let y_t = r_unsq.matmul(&state.contiguous()?)?; // (B, H, 1, dh)
-            let y_t = y_t.squeeze(candle_core::D::Minus2)?;  // (B, H, dh)
-            let y_t = y_t.reshape((b, d))?;
-            outputs.push(y_t.unsqueeze(1)?); // (B, 1, D)
-        }
-
-        let y = Tensor::cat(&outputs, 1)?; // (B, T, D)
         let y = self.group_norm(&y.to_dtype(x.dtype())?)?;
         let out = y.broadcast_mul(&g)?;
         Ok(self.w_o.forward(&out)?)

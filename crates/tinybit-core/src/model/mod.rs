@@ -3,6 +3,7 @@ pub mod block;
 pub mod channel_mix;
 pub mod embedding;
 pub mod time_mix;
+pub mod wkv;
 
 use crate::config::ModelConfig;
 use crate::state::InferenceState;

@@ -80,6 +80,16 @@ cargo test --workspace
     configs are tuned to this budget — don't bump them without changing
     the scan implementation.
 
+    IN PROGRESS: a fused scan exists in `crates/tinybit-core/src/model/wkv.rs`
+    as a candle `CustomOp2` (`WkvScan`), wired into `time_mix::forward_train`
+    behind the env flag `TINYBIT_FUSED_WKV=1` (DEFAULT OFF). It collapses the
+    autograd graph to O(T·dh) retained memory and is numerically identical to
+    the loop (parity test: max diff 4.5e-8 → checkpoints stay compatible). The
+    CPU path + forward/backward math are gradient-checked; the CUDA kernel
+    (`WKV_CUDA_SRC`) is written but NOT yet wired (`cuda_fwd`) or GPU-validated.
+    Until the fused path is validated and made default, the budget warning
+    above still governs the default (unfused) scan.
+
 ## Common mistakes to avoid
 
 - Do NOT use .unwrap() in library code — propagate with anyhow::Result + ?
