@@ -1,6 +1,7 @@
 use crate::config::ModelConfig;
+use crate::model::bitlinear::LayerNorm;
 use candle_core::{DType, Tensor};
-use candle_nn::{Embedding, LayerNorm, Module, VarBuilder};
+use candle_nn::{Embedding, Module, VarBuilder};
 
 /// Token embedding table + final LayerNorm + LM head (tied weights).
 pub struct EmbeddingHead {
@@ -14,7 +15,7 @@ pub struct EmbeddingHead {
 impl EmbeddingHead {
     pub fn new(config: &ModelConfig, vb: VarBuilder) -> anyhow::Result<Self> {
         let embed = candle_nn::embedding(config.vocab_size, config.d_model, vb.pp("embed"))?;
-        let ln_out = candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("ln_out"))?;
+        let ln_out = LayerNorm::new(config.d_model, 1e-5, vb.pp("ln_out"))?;
         Ok(Self {
             embed,
             ln_out,

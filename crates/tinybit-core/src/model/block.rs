@@ -1,9 +1,10 @@
 use crate::config::ModelConfig;
+use crate::model::bitlinear::LayerNorm;
 use crate::model::channel_mix::ChannelMix;
 use crate::model::time_mix::TimeMix;
 use crate::state::LayerState;
 use candle_core::Tensor;
-use candle_nn::{LayerNorm, Module, VarBuilder};
+use candle_nn::VarBuilder;
 
 /// One complete RWKV-7 layer = LN(x) → TimeMix → residual → LN(x) → ChannelMix → residual
 pub struct Rwkv7Block {
@@ -15,8 +16,8 @@ pub struct Rwkv7Block {
 
 impl Rwkv7Block {
     pub fn new(config: &ModelConfig, _layer_idx: usize, vb: VarBuilder) -> anyhow::Result<Self> {
-        let ln1 = candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("ln1"))?;
-        let ln2 = candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("ln2"))?;
+        let ln1 = LayerNorm::new(config.d_model, 1e-5, vb.pp("ln1"))?;
+        let ln2 = LayerNorm::new(config.d_model, 1e-5, vb.pp("ln2"))?;
         let time_mix = TimeMix::new(config, vb.pp("time_mix"))?;
         let channel_mix = ChannelMix::new(config, vb.pp("channel_mix"))?;
         Ok(Self { ln1, ln2, time_mix, channel_mix })

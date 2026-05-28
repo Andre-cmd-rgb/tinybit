@@ -10,6 +10,14 @@ pub const ROLE_ASSISTANT_PREFIX: &str = "\nassistant:\n";
 /// model emits it.
 pub const STOP_STRING_USER_TURN: &str = "\nuser:";
 
+/// Default identity/system prompt. Gives the model its name and persona when no
+/// explicit `--system` prompt is set, so it knows it is "tinybit". A base-
+/// pretrained model only follows this loosely; reliable persona adherence needs
+/// instruction fine-tuning.
+pub const DEFAULT_SYSTEM_PROMPT: &str =
+    "You are tinybit, a small and efficient AI assistant built on the RWKV-7 architecture. \
+You are helpful, concise, and honest.";
+
 /// Tool-call markers. These are *only* installed as actual special tokens when
 /// the model's vocabulary has room for them (vocab_size > base LLaMA vocab).
 /// When that's not the case, the same markers can still be emitted/parsed as

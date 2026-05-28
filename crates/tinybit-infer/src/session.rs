@@ -27,7 +27,7 @@ impl Session {
             id:            uuid(),
             state:         InferenceState::zeros(config, device)?,
             history:       Vec::new(),
-            system_prompt: String::new(),
+            system_prompt: tinybit_core::tokenizer::DEFAULT_SYSTEM_PROMPT.to_string(),
             created_at:    Utc::now(),
         })
     }

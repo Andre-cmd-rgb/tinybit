@@ -39,16 +39,27 @@ impl TimeMix {
         let w_g2 = candle_nn::linear_no_bias(d, d, vb.pp("w_g2"))?;
         let w_o  = candle_nn::linear_no_bias(d, d, vb.pp("w_o"))?;
 
-        let time_decay =
-            vb.get_with_hints((h, dh), "time_decay", candle_nn::Init::Const(-0.5))?;
+        // Spread the per-(head,channel) log-decay across a wide range so the
+        // recurrence learns diverse timescales: with w = exp(-exp(td)) (see
+        // `compute_decay`), td ∈ [-4, 1] maps to retention w ∈ (~0.066, ~0.982),
+        // i.e. half-lives from <1 to ~38 tokens. A single constant would force
+        // every channel to the same (short) memory horizon.
+        let time_decay = vb.get_with_hints(
+            (h, dh),
+            "time_decay",
+            candle_nn::Init::Uniform { lo: -4.0, up: 1.0 },
+        )?;
         let group_norm_weight =
             vb.get_with_hints(d, "gn_weight", candle_nn::Init::Const(1.0))?;
         let group_norm_bias =
             vb.get_with_hints(d, "gn_bias", candle_nn::Init::Const(0.0))?;
-        let time_maa_x = vb.get_with_hints(d, "time_maa_x", candle_nn::Init::Const(0.0))?;
-        let time_maa_r = vb.get_with_hints(d, "time_maa_r", candle_nn::Init::Const(0.0))?;
-        let time_maa_k = vb.get_with_hints(d, "time_maa_k", candle_nn::Init::Const(0.0))?;
-        let time_maa_v = vb.get_with_hints(d, "time_maa_v", candle_nn::Init::Const(0.0))?;
+        // Token-shift mix: x_* = prev + maa*(x - prev). 0.5 = balanced blend of
+        // the current and previous token; 0.0 (the old init) degenerately fed the
+        // projections the previous token only.
+        let time_maa_x = vb.get_with_hints(d, "time_maa_x", candle_nn::Init::Const(0.5))?;
+        let time_maa_r = vb.get_with_hints(d, "time_maa_r", candle_nn::Init::Const(0.5))?;
+        let time_maa_k = vb.get_with_hints(d, "time_maa_k", candle_nn::Init::Const(0.5))?;
+        let time_maa_v = vb.get_with_hints(d, "time_maa_v", candle_nn::Init::Const(0.5))?;
 
         Ok(Self {
             w_r, w_k, w_v, w_g1, w_g2, w_o,
@@ -83,10 +94,11 @@ impl TimeMix {
 
     fn compute_decay(&self) -> anyhow::Result<Tensor> {
         let td = self.time_decay.to_dtype(DType::F32)?;
-        // softplus(-exp(td)) ≈ small negative decay
-        let neg_exp = td.exp()?.neg()?;
-        let sp = (neg_exp.exp()? + 1.0_f64)?.log()?;
-        Ok(sp)
+        // Canonical RWKV per-channel decay: w = exp(-exp(td)) ∈ (0, 1). This can
+        // approach 1 for long-range memory. (The earlier softplus(-exp(td)) form
+        // capped w at ln(2) ≈ 0.693, limiting the state half-life to ~2 tokens.)
+        let w = td.exp()?.neg()?.exp()?;
+        Ok(w)
     }
 
     fn token_shift(x: &Tensor, d_model: usize) -> anyhow::Result<Tensor> {

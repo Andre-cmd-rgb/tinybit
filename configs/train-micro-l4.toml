@@ -4,10 +4,14 @@
 #   batch 6 × seq 512 × grad_accum 11 = 33_792 tokens / step
 #
 # Total token budget:
-#   25_000 steps × 33_792 ≈ 0.84 B tokens
+#   25_000 steps × 33_792 ≈ 0.84 B tokens (~17x params; near Chinchilla-optimal)
 #
-# Wall-clock estimate on L4 SPOT (~$0.22/hr):
-#   ~10-15 h, ~$3-5 total.
+# batch_size is HELD at 6 for now. A previous note here proposed batch 12 based
+# on a "~7 of 22.5 GB at batch 6" VRAM reading — but that reading was taken while
+# the LayerNorm gradient bug was silently pruning the backward graph, so it
+# *under*-counted backward activations. With gradients now flowing through the
+# full stack, real peak VRAM is higher; re-measure on a live L4 (watch
+# `nvidia-smi` for the first ~50 steps) before raising batch_size again.
 #
 # Pair with:
 #   DATA_TOKENS=1500000000

@@ -19,15 +19,17 @@ impl ChannelMix {
         let w_k = BitLinear::new(config.d_model, config.d_ffn, vb.pp("w_k"))?;
         let w_v = BitLinear::new(config.d_ffn, config.d_model, vb.pp("w_v"))?;
         let w_r = BitLinear::new(config.d_model, config.d_model, vb.pp("w_r"))?;
+        // Token-shift mix (see TimeMix): 0.5 = balanced blend of current/previous
+        // token. 0.0 degenerately fed the projections the previous token only.
         let time_maa_k = vb.get_with_hints(
             config.d_model,
             "time_maa_k",
-            candle_nn::Init::Const(0.0),
+            candle_nn::Init::Const(0.5),
         )?;
         let time_maa_r = vb.get_with_hints(
             config.d_model,
             "time_maa_r",
-            candle_nn::Init::Const(0.0),
+            candle_nn::Init::Const(0.5),
         )?;
         Ok(Self { w_k, w_v, w_r, time_maa_k, time_maa_r, d_model: config.d_model })
     }
