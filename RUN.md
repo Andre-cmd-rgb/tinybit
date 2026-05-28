@@ -2,18 +2,27 @@
 
 `tinybit` trains on **NVIDIA L4 only** (`g2-standard-4` on GCP). L4 has 24 GB
 VRAM, broad zone availability, and ~$0.22/hr SPOT — the cheapest GPU that
-fits the 50M `micro` model with sequence length 512 and the RWKV-7 sequential
-WKV scan in candle.
+fits the 50M `micro` model with sequence length 512 and the RWKV-7 WKV scan.
+On CUDA the scan uses the fused kernel by default (see CLAUDE.md design
+decision 16); the unfused candle loop is the CPU / `TINYBIT_FUSED_WKV=off` path.
 
 ## TL;DR
 
 Pick the training config that matches the model preset. Each is sized so the
 L4 is well-utilized but won't OOM.
 
-| Model preset | Train config                  | Time / Cost (SPOT) |
-|--------------|-------------------------------|--------------------|
-| `nano`       | `configs/train-nano-l4.toml`  | ~5-7 h, ~$1-2      |
-| `micro`      | `configs/train-micro-l4.toml` | ~15-22 h, ~$4-6    |
+| Model preset | Train config                  | Time / Cost                          |
+|--------------|-------------------------------|--------------------------------------|
+| `nano`       | `configs/train-nano-l4.toml`  | unverified post-fix (faster than micro) |
+| `micro`      | `configs/train-micro-l4.toml` | ~6.5-7 days, ~$115-125 on-demand (measured) |
+
+> **Throughput note (measured 2026-05-28, post LayerNorm fix):** the `micro`
+> run holds **~23 s/step** on L4 (~1,440 tok/s) with the fused WKV kernel, so
+> 25k steps takes ~6.7 days. Earlier docs quoted ~15-22 h — that was the
+> *frozen-gradient* era, when a LayerNorm backward bug pruned the graph and
+> backward did almost no work. Correct training (gradients through all 16
+> layers) is ~7x slower per step. SPOT halves the $/hr but a multi-day run
+> will be preempted repeatedly; on-demand is the realistic baseline.
 
 `small` (258M) and `base` (501M) are kept as architectural presets for
 inference of pre-trained checkpoints but do not fit on a single L4 for
@@ -113,22 +122,26 @@ optimal (17 toks/param) — enough for genuinely coherent English, simple
 question following, and recognizable knowledge from the FineWeb-Edu /
 Wikipedia / OpenHermes mix.
 
-Why this `batch_size`: candle's sequential WKV scan in
-`crates/tinybit-core/src/model/time_mix.rs` retains every intermediate
-state in the autograd graph for backward, so peak training VRAM scales
-linearly with `batch_size × max_seq_len × num_layers`. On a 24 GB L4 with
-the 16-layer 50M micro at `max_seq_len = 512`, `batch_size = 6` lands at
-~19.5 GB peak with ~3 GB headroom; B=4 leaves more headroom but ~30%
-slower, B=8 lands at the OOM cliff.
+Why this `batch_size`: with the fused WKV CUDA kernel (the default), peak
+training VRAM at `batch_size = 6`, `max_seq_len = 512` measures **~12.5 GB**
+on the L4 — well under the 24 GB cap. (The old "~19.5 GB / B=8 is the OOM
+cliff" rationale described candle's *unfused* sequential scan, which retained
+the full `O(T·dh²)` per-layer state graph; that path is now CPU /
+`TINYBIT_FUSED_WKV=off` only.) There is real headroom to raise `batch_size`
+on CUDA, but the configs are **not yet re-tuned** — raise it only after a
+live run confirms loss is unaffected (see CLAUDE.md design decision 16).
 
-If you're tighter on time:
+If you're tighter on time, fewer steps trade quality for wall-clock. At the
+measured ~23 s/step for `micro`, total time ≈ `total_steps × 23 s`:
 
-| Budget   | Model | DATA_TOKENS | total_steps | Expected output                    |
-|----------|-------|-------------|-------------|------------------------------------|
-| ~3-4h L4 | nano  | 200M        | 6000        | Coherent words, no real reasoning  |
-| ~5-7h L4 | nano  | 1B          | 15000       | Sentences, weak QA, some facts     |
-| ~10-15h  | micro | 1B          | 25000       | Paragraphs, QA, basic instructions |
-| ~20-30h  | micro | 1.5B        | 50000       | Better instruction following       |
+| total_steps | Model | DATA_TOKENS | ~Wall time | Expected output                    |
+|-------------|-------|-------------|------------|------------------------------------|
+| 6000        | micro | 200M        | ~38 h      | Coherent words, weak structure     |
+| 15000       | micro | 1B          | ~4 days    | Sentences, weak QA, some facts     |
+| 25000       | micro | 1.5B        | ~6.7 days  | Paragraphs, QA, basic instructions |
+| 50000       | micro | 1.5B        | ~13 days   | Better instruction following       |
+
+(`nano` is smaller/faster per step but its post-fix throughput is unmeasured.)
 
 Override per-run with env vars:
 
@@ -175,13 +188,18 @@ Healthy signs:
 - `val_loss` log lines decrease steadily from ~10.4 (the random init for
   vocab=32008) to under 5.0 by step 5k, under 4.0 by step 15k, under 3.5
   by step 25k.
-- `gnorm` log values mostly between 0.05 and 2.0; rarely above 5.0.
+- `gnorm` is the *pre-clip* global norm; `grad_clip = 1.0` caps the applied
+  update. Early-warmup spikes into the tens (observed 4–70 over the first
+  ~40 steps) are normal. What matters: it stays finite and trends down as
+  the LR schedule decays.
 - Final chat output is grammatical English on most prompts, even if
   factually unreliable.
 
 Unhealthy signs to investigate:
 
-- `gnorm` consistently above 10 → reduce `peak_lr` to 1e-4.
+- `gnorm` near-zero and unchanging (e.g. ~0.007) with `loss` stuck → the
+  backward graph is pruned (this was the pre-2026-05-28 LayerNorm bug).
+- `gnorm` growing without bound or going NaN/inf → reduce `peak_lr` to 1e-4.
 - `loss` flat or rising → check the data — usually means `train.bin`
   contains zeros or a tokenization mismatch.
 - Many `skipping update — non-finite` warnings → reduce `peak_lr` and/or

@@ -41,11 +41,14 @@ binary, and starts training — all unattended. Checkpoints sync to
 
 | GPU   | Machine        | VRAM  | RAM  | On-demand | SPOT       | Typical run (50 M micro, 25 k steps) |
 |-------|----------------|-------|------|-----------|------------|--------------------------------------|
-| L4    | g2-standard-4  | 24 GB | 16 G | ~$0.71/hr | ~$0.22/hr  | 15–22 h · ~$11 on-demand (SPOT: $4–6) |
+| L4    | g2-standard-4  | 24 GB | 16 G | ~$0.71/hr | ~$0.22/hr  | ~6.5–7 days · ~$115–125 on-demand |
 
-Costs are estimates for US zones. SPOT prices are roughly 30 % of on-demand
-but the VM can be preempted — training resumes from the latest checkpoint
-on relaunch, so SPOT runs typically cost $4–6 all-in after 1–2 preemptions.
+Costs are estimates for US zones. The 25 k-step `micro` run holds **~23 s/step**
+(~1,440 tok/s, fused WKV kernel) — about 162 h ≈ 6.7 days. SPOT is ~30 % of the
+on-demand $/hr and training resumes from the latest GCS checkpoint after a
+preemption, but a multi-day run will be preempted repeatedly, so on-demand is
+the realistic baseline. (Earlier "15–22 h" figures predate the LayerNorm
+backward fix, when the pruned graph made backward almost free.)
 
 ---
 
@@ -116,15 +119,16 @@ Set `DATA_TOKENS=1500000000` (~75 % headroom over the training budget) so
 data preparation collects enough tokens even if some datasets fail or are
 skipped.
 
-Why `batch_size = 6`: the RWKV-7 WKV scan in
-`crates/tinybit-core/src/model/time_mix.rs` is a candle-side sequential
-loop that retains every intermediate state in the autograd graph for
-backward. Peak training VRAM scales linearly with
-`batch_size × max_seq_len × num_layers`. On a 24 GB L4 with the 16-layer
-50M micro at `max_seq_len = 512`, `batch_size = 6` peaks at ~19.5 GB with
-~3 GB headroom — a balance between throughput and OOM safety. B=4 is
-safer but ~30 % slower; B=8 lands right at the OOM cliff under candle's
-pool allocator overhead.
+Why `batch_size = 6`: on CUDA the WKV scan uses the fused kernel by default
+(`crates/tinybit-core/src/model/wkv.rs`), whose chunk-checkpointed backward
+keeps only `O(B·H·√T·dh²)` scratch instead of the unfused loop's full
+`O(T·dh²)` per-layer retained graph. Measured peak at `batch_size = 6`,
+`max_seq_len = 512` is **~12.5 GB** on a 24 GB L4 — substantial headroom.
+The configs are held at `batch_size = 6` (not yet re-tuned for the fused
+kernel's headroom); raise it only after a live run confirms loss is
+unaffected (CLAUDE.md design decision 16). The old "~19.5 GB / B=8 OOM
+cliff" guidance applied to the unfused loop, now the CPU /
+`TINYBIT_FUSED_WKV=off` path only.
 
 ---
 
@@ -179,11 +183,17 @@ step=1000 lr=3.00e-04 loss=3.2847 gnorm=0.842
 step=1000 val_loss=3.3112
 ```
 
-Expected loss trajectory for the 50M micro model on ~1 B tokens:
-- Step 500:   loss ≈ 5.5–6.0 (early warmup)
-- Step 2000:  loss ≈ 4.0–4.5
-- Step 10000: loss ≈ 3.0–3.5
-- Step 25000: loss ≈ 2.6–3.0 (language modeling perplexity ~13–20)
+Projected loss trajectory for the 50M micro model on ~0.85 B tokens (the
+post-fix run is the first correct one — these are estimates, not yet measured
+to completion; step 0 starts at ~10.85, the vocab=32008 random-init floor):
+- Step 500:   loss ≈ 6–7   (LR still warming to 3e-4)
+- Step 2000:  loss ≈ 4.5–5.0
+- Step 10000: loss ≈ 3.5–4.0
+- Step 25000: loss ≈ 3.0–3.8 (perplexity ~20–45)
+
+A 50M ternary-capable model at ~17 tok/param lands well short of GPT-2-small
+quality; expect coherent short English and simple instruction following, not
+reliable factuality or reasoning.
 
 ---
 

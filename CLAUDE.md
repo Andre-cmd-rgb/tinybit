@@ -116,3 +116,14 @@ cargo test --workspace
   Initialize from the first microbatch's backward() result, then merge subsequent ones.
 - Do NOT raise `max_seq_len` or `batch_size` in the L4 configs without first
   verifying the WKV scan still fits in VRAM. See design decision 16.
+- Do NOT use `candle_nn::LayerNorm` (or `candle_nn::ops::layer_norm`) for the
+  pre-norms or head norm. candle dispatches contiguous affine inputs to a fused
+  op registered with `apply_op3_no_bwd` — it has NO backward and silently drops
+  all gradient, which froze the entire stack (loss stuck near ln(vocab), gnorm
+  ~0.007, unigram-gibberish output) before 2026-05-28. Use the hand-rolled
+  differentiable LayerNorm (primitive ops) in the model. `tests/grad_flow.rs`
+  guards this — it asserts every parameter gets a finite gradient and the model
+  overfits a fixed batch. Run it after touching any norm.
+- WKV time-decay is `w = exp(-exp(time_decay))` (w ∈ (0,1)), NOT
+  `softplus(-exp(td))`. The softplus form caps state retention at ln2≈0.69,
+  limiting memory to ~2 tokens. Do not "simplify" it back.

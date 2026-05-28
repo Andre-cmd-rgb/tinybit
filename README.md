@@ -45,8 +45,8 @@ All models use 3.5× FFN expansion (d_ffn = 3.5 × d_model) matching the RWKV-7 
 
 | Preset | Params  | Layers | d_model | d_ffn | Notes |
 |--------|---------|--------|---------|-------|-------|
-| nano   | ~25M    | 9      | 320     | 1120  | Fast iteration, L4 ~5–7 h |
-| micro  | ~50M    | 16     | 384     | 1344  | Main L4 target, ~15–22 h |
+| nano   | ~25M    | 9      | 320     | 1120  | Fast iteration |
+| micro  | ~50M    | 16     | 384     | 1344  | Main L4 target, ~6.5–7 days (measured) |
 | small  | ~258M   | 13     | 1024    | 3584  | Architecture only — too big to train on L4 |
 | base   | ~501M   | 17     | 1280    | 4480  | Architecture only — too big to train on L4 |
 
@@ -90,11 +90,11 @@ cargo build --release -p tinybit-cli
 export GCP_PROJECT="your-project-id"
 export GCP_BUCKET="gs://your-bucket"
 
-# 25M nano (~5-7 h, ~$1-2 SPOT)
+# 25M nano (fast iteration)
 DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-nano-l4.toml \
 PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh nano
 
-# 50M micro (~15-22 h, ~$4-6 SPOT)
+# 50M micro — 25k steps ≈ 6.5–7 days on L4, ~$115–125 on-demand (measured)
 DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-micro-l4.toml \
 PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh micro
 
