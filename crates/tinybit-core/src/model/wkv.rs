@@ -19,7 +19,7 @@
 //! CPU path of the candle custom op so the whole thing runs (slower) without
 //! CUDA.
 
-use candle_core::{CpuStorage, CustomOp2, DType, Layout, Result, Shape, Tensor};
+use candle_core::{CpuStorage, CustomOp2, CustomOp3, DType, Layout, Result, Shape, Tensor};
 
 /// Runtime toggle for the fused scan. Off by default so existing training and
 /// the documented L4 runs are unchanged until the kernel is validated on GPU.
@@ -212,10 +212,10 @@ fn pack_drkv(dr: &[f32], dk: &[f32], dv: &[f32], b: usize, t: usize, h: usize, d
 }
 
 /// candle custom op for the WKV scan over packed `(B,T,H,3,dh)` rkv and `(H,dh)`
-/// decay `w`. CPU path uses the verified reference above; the CUDA path (the
-/// fused kernel in [`WKV_CUDA_SRC`]) is wired in `cuda_fwd`/a cuda `bwd` once
-/// validated on a GPU. Until then `cuda_fwd` falls back to the trait default
-/// (errors), so CUDA callers must keep `TINYBIT_FUSED_WKV` off.
+/// decay `w`. The CPU path uses the verified reference above; the CUDA path runs
+/// the fused kernel in [`WKV_CUDA_SRC`] (forward in [`WkvScan::cuda_fwd`], backward
+/// via [`WkvBackwardOp`]). Without the `cuda` feature `cuda_fwd` falls back to the
+/// trait default (errors), so non-CUDA callers must keep `TINYBIT_FUSED_WKV` off.
 pub struct WkvScan;
 
 impl CustomOp2 for WkvScan {
@@ -249,6 +249,17 @@ impl CustomOp2 for WkvScan {
         Ok((CpuStorage::F32(y), Shape::from((b, t, h, dh))))
     }
 
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        cuda_impl::forward(s1, l1, s2, l2)
+    }
+
     fn bwd(
         &self,
         arg1: &Tensor,
@@ -258,9 +269,25 @@ impl CustomOp2 for WkvScan {
     ) -> Result<(Option<Tensor>, Option<Tensor>)> {
         let d = arg1.dims();
         let (b, t, h, dh) = (d[0], d[1], d[2], d[4]);
+
+        // CUDA: run the fused backward kernel via WkvBackwardOp, which returns the
+        // grads packed into one tensor [drkv | dw]; split it back out. Inputs are
+        // detached so candle does not try to build a (nonexistent) 2nd-order graph.
+        #[cfg(feature = "cuda")]
+        if arg1.device().is_cuda() {
+            let rkv = arg1.detach().contiguous()?;
+            let w = arg2.detach().contiguous()?;
+            let dy = grad_res.detach().contiguous()?;
+            let packed = rkv.apply_op3(&w, &dy, WkvBackwardOp)?;
+            let nbth = b * t * h;
+            let d_rkv = packed.narrow(0, 0, nbth * 3 * dh)?.reshape((b, t, h, 3, dh))?;
+            let d_w = packed.narrow(0, nbth * 3 * dh, h * dh)?.reshape((h, dh))?;
+            return Ok((Some(d_rkv), Some(d_w)));
+        }
+
         let dev = arg1.device().clone();
-        // Recompute on CPU (correct on any device; an optimized CUDA bwd kernel
-        // replaces this once validated).
+        // CPU recompute: correct on any device, and the reference the CUDA path is
+        // validated against. (On CUDA this is bypassed by the branch above.)
         let rkv = arg1.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
         let w = arg2.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
         let dy = grad_res.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
@@ -281,6 +308,191 @@ pub fn fused_wkv(r: &Tensor, k: &Tensor, v: &Tensor, w: &Tensor) -> Result<Tenso
     let rkv = Tensor::stack(&[r, k, v], 3)?.contiguous()?; // (B,T,H,3,dh)
     let w = w.contiguous()?;
     rkv.apply_op2(&w, WkvScan)
+}
+
+/// Backward of [`WkvScan`], as its own op so the CUDA kernel can run on-device
+/// (candle's `bwd` hands back `Tensor`s, not storage, so we re-enter the op
+/// machinery to reach `cuda_fwd`). Inputs are the saved `rkv` `(B,T,H,3,dh)`,
+/// decay `w` `(H,dh)`, and upstream `dy` `(B,T,H,dh)`. The single output packs
+/// the grads as a flat `[B*T*H*3*dh + H*dh]` tensor — `drkv` in the head, `dw`
+/// in the tail — which [`WkvScan::bwd`] slices back apart. No `bwd` of its own:
+/// callers detach the inputs, so no second-order graph is built.
+pub struct WkvBackwardOp;
+
+impl CustomOp3 for WkvBackwardOp {
+    fn name(&self) -> &'static str {
+        "wkv-backward"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        _l2: &Layout,
+        s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let d = l1.dims();
+        if d.len() != 5 || d[3] != 3 {
+            candle_core::bail!("wkv-backward: arg1 must be (B,T,H,3,dh), got {d:?}");
+        }
+        let (b, t, h, dh) = (d[0], d[1], d[2], d[4]);
+        if !l1.is_contiguous() || l1.start_offset() != 0 {
+            candle_core::bail!("wkv-backward cpu_fwd: inputs must be contiguous with zero offset");
+        }
+        let rkv = s1.as_slice::<f32>()?;
+        let w = s2.as_slice::<f32>()?;
+        let dy = s3.as_slice::<f32>()?;
+        let (r, k, v) = unpack_rkv(rkv, b, t, h, dh);
+        let (_, states) = wkv_forward_ref(&r, &k, &v, w, b, t, h, dh);
+        let (dr, dk, dv, dw) = wkv_backward_ref(&r, &k, &v, w, &states, dy, b, t, h, dh);
+        let drkv = pack_drkv(&dr, &dk, &dv, b, t, h, dh);
+        let nbth = b * t * h;
+        let mut out = vec![0f32; nbth * 3 * dh + h * dh];
+        out[..nbth * 3 * dh].copy_from_slice(&drkv);
+        out[nbth * 3 * dh..].copy_from_slice(&dw);
+        Ok((CpuStorage::F32(out), Shape::from((nbth * 3 * dh + h * dh,))))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+        s3: &candle_core::CudaStorage,
+        l3: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        cuda_impl::backward(s1, l1, s2, l2, s3, l3)
+    }
+}
+
+/// CUDA launchers for the fused WKV kernels. [`WKV_CUDA_SRC`] is compiled once per
+/// `head_dim` (via `-D DH=<dh>`) with nvrtc and cached on the device; each launch
+/// uses one block per `(batch, head)` and `DH` threads. Numerically equivalent to
+/// the CPU references in this module (validated by the `cuda` tests below).
+#[cfg(feature = "cuda")]
+mod cuda_impl {
+    use super::WKV_CUDA_SRC;
+    use candle_core::cuda_backend::cudarc;
+    use candle_core::cuda_backend::cudarc::driver::{
+        CudaFunction, CudaSlice, LaunchAsync, LaunchConfig,
+    };
+    use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice};
+    use candle_core::{Layout, Result, Shape};
+    use std::sync::Arc;
+
+    fn wrap<E: std::error::Error + Send + Sync + 'static>(e: E) -> candle_core::Error {
+        candle_core::Error::Cuda(Box::new(e))
+    }
+
+    fn f32_slice(s: &CudaStorage) -> Result<&CudaSlice<f32>> {
+        match &s.slice {
+            CudaStorageSlice::F32(sl) => Ok(sl),
+            _ => candle_core::bail!("wkv cuda: expected f32 storage"),
+        }
+    }
+
+    fn require_contig(l: &Layout) -> Result<()> {
+        if !l.is_contiguous() || l.start_offset() != 0 {
+            candle_core::bail!("wkv cuda: inputs must be contiguous with zero offset");
+        }
+        Ok(())
+    }
+
+    // Compile (once per head_dim) and fetch a kernel by name. Both kernels share
+    // one module, so a single nvrtc compile serves forward and backward.
+    fn get_func(
+        dev: &Arc<cudarc::driver::CudaDevice>,
+        dh: usize,
+        name: &'static str,
+    ) -> Result<CudaFunction> {
+        let module = format!("wkv_dh{dh}");
+        if dev.get_func(&module, name).is_none() {
+            let opts = cudarc::nvrtc::CompileOptions {
+                options: vec![format!("--define-macro=DH={dh}")],
+                ..Default::default()
+            };
+            let ptx = cudarc::nvrtc::safe::compile_ptx_with_opts(WKV_CUDA_SRC, opts).map_err(wrap)?;
+            dev.load_ptx(ptx, &module, &["wkv_forward_f32", "wkv_backward_f32"])
+                .map_err(wrap)?;
+        }
+        dev.get_func(&module, name)
+            .ok_or_else(|| candle_core::Error::Cuda(format!("wkv: missing fn {name}").into()))
+    }
+
+    fn launch_cfg(b: usize, h: usize, dh: usize) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: ((b * h) as u32, 1, 1),
+            block_dim: (dh as u32, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    pub fn forward(
+        s_rkv: &CudaStorage,
+        l_rkv: &Layout,
+        s_w: &CudaStorage,
+        l_w: &Layout,
+    ) -> Result<(CudaStorage, Shape)> {
+        let d = l_rkv.dims();
+        if d.len() != 5 || d[3] != 3 {
+            candle_core::bail!("wkv cuda fwd: arg1 must be (B,T,H,3,dh), got {d:?}");
+        }
+        let (b, t, h, dh) = (d[0], d[1], d[2], d[4]);
+        require_contig(l_rkv)?;
+        require_contig(l_w)?;
+        let dev = s_rkv.device.clone();
+        let cu = dev.cuda_device();
+        let rkv = f32_slice(s_rkv)?;
+        let w = f32_slice(s_w)?;
+        let out = cu.alloc_zeros::<f32>(b * t * h * dh).map_err(wrap)?;
+        let f = get_func(&cu, dh, "wkv_forward_f32")?;
+        let cfg = launch_cfg(b, h, dh);
+        unsafe { f.launch(cfg, (rkv, w, &out, b as i32, t as i32, h as i32)) }.map_err(wrap)?;
+        Ok((
+            CudaStorage { slice: CudaStorageSlice::F32(out), device: dev },
+            Shape::from((b, t, h, dh)),
+        ))
+    }
+
+    pub fn backward(
+        s_rkv: &CudaStorage,
+        l_rkv: &Layout,
+        s_w: &CudaStorage,
+        l_w: &Layout,
+        s_dy: &CudaStorage,
+        l_dy: &Layout,
+    ) -> Result<(CudaStorage, Shape)> {
+        let d = l_rkv.dims();
+        if d.len() != 5 || d[3] != 3 {
+            candle_core::bail!("wkv cuda bwd: arg1 must be (B,T,H,3,dh), got {d:?}");
+        }
+        let (b, t, h, dh) = (d[0], d[1], d[2], d[4]);
+        require_contig(l_rkv)?;
+        require_contig(l_w)?;
+        require_contig(l_dy)?;
+        let dev = s_rkv.device.clone();
+        let cu = dev.cuda_device();
+        let rkv = f32_slice(s_rkv)?;
+        let w = f32_slice(s_w)?;
+        let dy = f32_slice(s_dy)?;
+        let nbth = b * t * h;
+        // grads is pre-zeroed: dw is built with atomicAdd across the batch blocks.
+        let grads = cu.alloc_zeros::<f32>(nbth * 3 * dh + h * dh).map_err(wrap)?;
+        // Per-(b,h,t) forward states, recomputed and consumed within this call.
+        let scratch = cu.alloc_zeros::<f32>(b * h * t * dh * dh).map_err(wrap)?;
+        let f = get_func(&cu, dh, "wkv_backward_f32")?;
+        let cfg = launch_cfg(b, h, dh);
+        unsafe { f.launch(cfg, (rkv, w, dy, &grads, &scratch, b as i32, t as i32, h as i32)) }
+            .map_err(wrap)?;
+        Ok((
+            CudaStorage { slice: CudaStorageSlice::F32(grads), device: dev },
+            Shape::from((nbth * 3 * dh + h * dh,)),
+        ))
+    }
 }
 
 /// Fused WKV CUDA kernels (forward + backward), compiled per `head_dim` via
@@ -320,20 +532,24 @@ extern "C" __global__ void wkv_forward_f32(
 }
 
 // Backward. thread == row i. `scratch` is [B,H,T,DH,DH] (S_t per (b,h,t)).
-// dw is accumulated across batch with atomicAdd. Two sub-passes share the block.
+// All grads land in one packed buffer `grads` so the candle CustomOp3 can
+// return a single tensor: drkv occupies [0, B*T*H*3*DH), dw the tail [.., +H*DH).
+// dw is accumulated across batch with atomicAdd (so `grads` must be pre-zeroed).
+// Two sub-passes share the block.
 extern "C" __global__ void wkv_backward_f32(
     const float* __restrict__ rkv,
     const float* __restrict__ w,
     const float* __restrict__ dy,
-    float* __restrict__ drkv,       // [B,T,H,3,DH]: dr at +0, dk +DH, dv +2DH
-    float* __restrict__ dw,         // [H,DH], pre-zeroed
-    float* __restrict__ scratch,    // [B,H,T,DH,DH]
+    float* __restrict__ grads,      // [B*T*H*3*DH + H*DH]: drkv head, dw tail
+    float* __restrict__ scratch,    // [B,H,T,DH,DH], internal
     const int B, const int T, const int H)
 {
     const int bh = blockIdx.x;
     const int b = bh / H, h = bh % H;
     const int i = threadIdx.x;            // row index
     if (i >= DH) return;
+    float* drkv = grads;                          // [B,T,H,3,DH]: dr +0, dk +DH, dv +2DH
+    float* dw   = grads + (long)B*T*H*3*DH;        // [H,DH]
     const float wi = w[h*DH + i];
     __shared__ float sv[DH], sdy[DH], sr[DH], sk[DH], sdv[DH];
 
@@ -521,5 +737,134 @@ mod tests {
             .unwrap();
         eprintln!("fused vs candle-loop max abs diff = {diff:.3e}");
         assert!(diff < 1e-4, "fused scan diverged from candle loop: {diff}");
+    }
+
+    /// `cuda_fwd` must match the verified CPU forward at the real `head_dim` (64).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_forward_matches_cpu() {
+        use candle_core::Device;
+        let (b, t, h, dh) = (2usize, 7, 3, 64);
+        let n = b * t * h * dh;
+        let mut rng = Lcg(0xfeed_face_cafe_babe);
+        let rv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+        let kv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+        let vv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+        let wv: Vec<f32> = (0..h * dh).map(|_| 0.3 + rng.next_f32() * 0.5).collect();
+
+        let mk = |dev: &Device| -> (Tensor, Tensor, Tensor, Tensor) {
+            (
+                Tensor::from_vec(rv.clone(), (b, t, h, dh), dev).unwrap(),
+                Tensor::from_vec(kv.clone(), (b, t, h, dh), dev).unwrap(),
+                Tensor::from_vec(vv.clone(), (b, t, h, dh), dev).unwrap(),
+                Tensor::from_vec(wv.clone(), (h, dh), dev).unwrap(),
+            )
+        };
+        let cpu = Device::Cpu;
+        let cuda = Device::new_cuda(0).unwrap();
+        let (rc, kc, vc, wc) = mk(&cpu);
+        let (rg, kg, vg, wg) = mk(&cuda);
+
+        let y_cpu = super::fused_wkv(&rc, &kc, &vc, &wc).unwrap();
+        let y_cuda = super::fused_wkv(&rg, &kg, &vg, &wg)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap();
+        let diff = (y_cpu - y_cuda)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        eprintln!("cuda fwd vs cpu max abs diff = {diff:.3e}");
+        assert!(diff < 1e-4, "cuda forward diverged from cpu: {diff}");
+    }
+
+    /// The fused CUDA backward (via `WkvBackwardOp`) must match the CPU reference
+    /// grads. Compares the packed `[drkv | dw]` output element-wise.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_backward_matches_cpu() {
+        use candle_core::Device;
+        let (b, t, h, dh) = (2usize, 6, 3, 64);
+        let n = b * t * h * dh;
+        let mut rng = Lcg(0x5151_2323_9090_aaaa);
+        let rkvv: Vec<f32> = (0..n * 3).map(|_| rng.next_f32()).collect();
+        let wv: Vec<f32> = (0..h * dh).map(|_| 0.3 + rng.next_f32() * 0.5).collect();
+        let dyv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+
+        let pack = |dev: &Device| -> Vec<f32> {
+            let rkv = Tensor::from_vec(rkvv.clone(), (b, t, h, 3, dh), dev).unwrap();
+            let w = Tensor::from_vec(wv.clone(), (h, dh), dev).unwrap();
+            let dy = Tensor::from_vec(dyv.clone(), (b, t, h, dh), dev).unwrap();
+            rkv.apply_op3(&w, &dy, super::WkvBackwardOp)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let g_cpu = pack(&Device::Cpu);
+        let g_cuda = pack(&Device::new_cuda(0).unwrap());
+        let diff = g_cpu
+            .iter()
+            .zip(&g_cuda)
+            .map(|(a, c)| (a - c).abs())
+            .fold(0f32, f32::max);
+        eprintln!("cuda bwd vs cpu max abs diff = {diff:.3e}");
+        assert!(diff < 1e-4, "cuda backward diverged from cpu: {diff}");
+    }
+
+    /// End-to-end: gradients from `loss = sum(fused_wkv(r,k,v,w) * dy)` must agree
+    /// between CUDA and CPU, exercising the full `WkvScan::bwd` plumbing.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_autograd_matches_cpu() {
+        use candle_core::{Device, Var};
+        let (b, t, h, dh) = (2usize, 5, 2, 64);
+        let n = b * t * h * dh;
+        let mut rng = Lcg(0xc0ff_eeee_1234_5678);
+        let rv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+        let kv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+        let vv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+        let wv: Vec<f32> = (0..h * dh).map(|_| 0.3 + rng.next_f32() * 0.5).collect();
+        let dyv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+
+        let run = |dev: &Device| -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+            let r = Var::from_vec(rv.clone(), (b, t, h, dh), dev).unwrap();
+            let k = Var::from_vec(kv.clone(), (b, t, h, dh), dev).unwrap();
+            let v = Var::from_vec(vv.clone(), (b, t, h, dh), dev).unwrap();
+            let w = Var::from_vec(wv.clone(), (h, dh), dev).unwrap();
+            let dy = Tensor::from_vec(dyv.clone(), (b, t, h, dh), dev).unwrap();
+            let y = super::fused_wkv(r.as_tensor(), k.as_tensor(), v.as_tensor(), w.as_tensor())
+                .unwrap();
+            let loss = y.mul(&dy).unwrap().sum_all().unwrap();
+            let grads = loss.backward().unwrap();
+            let g = |x: &Var| {
+                grads
+                    .get(x.as_tensor())
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_device(&Device::Cpu)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            (g(&r), g(&k), g(&v), g(&w))
+        };
+
+        let (rc, kc, vc, wc) = run(&Device::Cpu);
+        let (rg, kg, vg, wg) = run(&Device::new_cuda(0).unwrap());
+        let md =
+            |a: &[f32], c: &[f32]| a.iter().zip(c).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let (dr, dk, dv, dw) = (md(&rc, &rg), md(&kc, &kg), md(&vc, &vg), md(&wc, &wg));
+        eprintln!("cuda autograd max abs diff: dr={dr:.2e} dk={dk:.2e} dv={dv:.2e} dw={dw:.2e}");
+        assert!(
+            dr < 1e-4 && dk < 1e-4 && dv < 1e-4 && dw < 1e-4,
+            "grad mismatch dr={dr} dk={dk} dv={dv} dw={dw}"
+        );
     }
 }

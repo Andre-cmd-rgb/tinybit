@@ -80,15 +80,25 @@ cargo test --workspace
     configs are tuned to this budget — don't bump them without changing
     the scan implementation.
 
-    IN PROGRESS: a fused scan exists in `crates/tinybit-core/src/model/wkv.rs`
-    as a candle `CustomOp2` (`WkvScan`), wired into `time_mix::forward_train`
-    behind the env flag `TINYBIT_FUSED_WKV=1` (DEFAULT OFF). It collapses the
-    autograd graph to O(T·dh) retained memory and is numerically identical to
-    the loop (parity test: max diff 4.5e-8 → checkpoints stay compatible). The
-    CPU path + forward/backward math are gradient-checked; the CUDA kernel
-    (`WKV_CUDA_SRC`) is written but NOT yet wired (`cuda_fwd`) or GPU-validated.
-    Until the fused path is validated and made default, the budget warning
-    above still governs the default (unfused) scan.
+    FUSED CUDA PATH (GPU-validated, still opt-in): a fused scan lives in
+    `crates/tinybit-core/src/model/wkv.rs` as a candle `CustomOp2` (`WkvScan`)
+    plus its backward op (`WkvBackwardOp`), wired into `time_mix::forward_train`
+    behind the env flag `TINYBIT_FUSED_WKV=1` (DEFAULT OFF). Forward + backward
+    CUDA kernels (`WKV_CUDA_SRC`, compiled per `head_dim` via nvrtc with
+    `-D DH=<dh>`, one block per (batch,head), DH threads) are validated on GPU
+    against the gradient-checked CPU references: forward parity 1.5e-7, backward
+    4.2e-7, end-to-end autograd ~1e-7 at the real head_dim=64. CPU parity vs the
+    loop is 4.5e-8 → checkpoints stay compatible (resume, don't restart). See the
+    `cuda_*` tests in wkv.rs: `cargo test -p tinybit-core --features cuda -- --test-threads=1`.
+    Memory: the forward collapses retained autograd state to O(T·dh) per layer;
+    the backward transiently allocates a B·H·T·dh² forward-state buffer (~290 MB
+    at the L4 micro shape b=6,t=512,h=6,dh=64), freed right after each layer's
+    backward — chunked checkpointing to shrink it is a TODO.
+
+    Still DEFAULT OFF, and the budget warning above still governs the default
+    (unfused) scan, because the fused path has NOT yet been (a) throughput/VRAM
+    benchmarked on the L4 or (b) used to re-tune batch_size/max_seq_len. Do that
+    on the L4 before flipping the default or bumping the L4 configs.
 
 ## Common mistakes to avoid
 
