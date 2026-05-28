@@ -131,11 +131,33 @@ fits. Live L4 (2026-05-28): batch 11 / accum 6 → **15.18 s/step, 2.23k tok/s**
 design decision 16). The old "~19.5 GB / B=8 OOM cliff" guidance applied to the
 unfused loop, now the CPU / `TINYBIT_FUSED_WKV=off` path only.
 
+### Throughput: where the time goes & how to speed it up further
+
+The `micro` step (~15 s) is far slower than its arithmetic implies: a fwd+bwd
+step is only ~6–7 TFLOP of matmul work (~55 ms ideal on a ~120 TFLOPS bf16 L4)
+plus a tiny (~1 GFLOP) WKV scan — i.e. **<1 % effective utilization**. The
+slowness is stalls / low GPU occupancy, not FLOPs. Two classes of fix:
+
+1. **Per-step sync stalls (done, 2026-05-28).** `global_grad_norm` previously
+   did one host read (`.to_scalar`) per parameter (~150–200 forced CUDA stream
+   syncs/step) and the loss synced once per microbatch. Both now accumulate
+   on-device and sync **once per step** — same numerics, fewer stalls.
+
+2. **WKV scan occupancy (open, needs a live L4 run).** The fused kernel
+   (`crates/tinybit-core/src/model/wkv.rs`) launches one block per
+   `(batch, head)` = 66 blocks of `dh`=64 threads on a GPU that runs ~89k
+   threads — under 5 % occupancy — and scans `T`=512 sequentially. This is the
+   prime suspect for the residual time. The principled fix is a chunked-parallel
+   scan (within-chunk = matmuls, only `T/L` inter-chunk carries sequential),
+   validated against the CPU reference + the `cuda_*` parity tests at T=512 so
+   it stays numerically equivalent (checkpoints remain compatible).
+
 **Profiling a step:** set `TINYBIT_PROFILE=1` to log, per optimizer step, the
 wall time split across forward+loss / backward / optimizer (the device is
 synchronized at each phase boundary so the numbers reflect real GPU time). Off
-by default → zero overhead on the normal training path. Use it to see where a
-step's time actually goes before tuning the kernel or batch size.
+by default → zero overhead on the normal training path. Run a few hundred steps
+with it to confirm the dominant phase before investing in (2) or raising
+`batch_size`.
 
 ---
 
