@@ -1,18 +1,20 @@
 # 50M `micro` model on a single NVIDIA L4 (24 GB VRAM).
 #
 # Per-step token budget:
-#   batch 10 × seq 512 × grad_accum 7 = 35_840 tokens / step
+#   batch 11 × seq 512 × grad_accum 6 = 33_792 tokens / step
 #
 # Total token budget:
-#   25_000 steps × 35_840 ≈ 0.90 B tokens (~18x params; near Chinchilla-optimal)
+#   25_000 steps × 33_792 ≈ 0.84 B tokens (~17x params; near Chinchilla-optimal)
 #
 # Throughput tuning (2026-05-28): bf16 mixed precision + a larger microbatch.
 # The fused WKV kernel launches one block per (batch, head); at batch 6 that is
-# only 36 blocks on the L4's 58 SMs (low occupancy). batch 10 → 60 blocks
+# only 36 blocks on the L4's 58 SMs (low occupancy). batch 11 → 66 blocks
 # (full occupancy) and reduces the grad_accum iteration count (less per-microbatch
 # graph-build overhead). bf16 halves activation VRAM, making the bigger batch fit.
-# A live L4 smoke run on 2026-05-28 confirmed batch 10 / grad_accum 7; batch 12
-# OOMed immediately, so do not raise this without re-measuring.
+# Live L4 benchmarks on 2026-05-28:
+#   batch 10 / accum 7: 16.999 s/step, 2.11k tok/s
+#   batch 11 / accum 6: 15.180 s/step, 2.23k tok/s
+# batch 12 OOMed immediately, so do not raise this without re-measuring.
 #
 # Pair with:
 #   DATA_TOKENS=1500000000
@@ -21,8 +23,8 @@ train_data     = "data/train.bin"
 val_data       = "data/val.bin"
 checkpoint_dir = "checkpoints/"
 
-batch_size     = 10
-grad_accum     = 7
+batch_size     = 11
+grad_accum     = 6
 total_steps    = 25000
 peak_lr        = 3e-4
 weight_decay   = 0.01
