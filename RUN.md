@@ -14,15 +14,15 @@ L4 is well-utilized but won't OOM.
 | Model preset | Train config                  | Time / Cost                          |
 |--------------|-------------------------------|--------------------------------------|
 | `nano`       | `configs/train-nano-l4.toml`  | unverified post-fix (faster than micro) |
-| `micro`      | `configs/train-micro-l4.toml` | ~6.5-7 days, ~$115-125 on-demand (measured) |
+| `micro`      | `configs/train-micro-l4.toml` | ~4.4 days, ~$75-85 on-demand (measured) |
 
-> **Throughput note (measured 2026-05-28, post LayerNorm fix):** the `micro`
-> run holds **~23 s/step** on L4 (~1,440 tok/s) with the fused WKV kernel, so
-> 25k steps takes ~6.7 days. Earlier docs quoted ~15-22 h — that was the
-> *frozen-gradient* era, when a LayerNorm backward bug pruned the graph and
-> backward did almost no work. Correct training (gradients through all 16
-> layers) is ~7x slower per step. SPOT halves the $/hr but a multi-day run
-> will be preempted repeatedly; on-demand is the realistic baseline.
+> **Throughput note (measured 2026-05-28, bf16 + batch 11):** the `micro`
+> run holds **~15.2 s/step** on L4 (**~2.23k tok/s**) with the fused WKV kernel
+> and bf16 mixed precision, so 25k steps takes ~4.4 days. Earlier docs quoted
+> ~23 s/step (pre-bf16, batch 6) and, before that, ~15-22 h — that oldest figure
+> was the *frozen-gradient* era, when a LayerNorm backward bug pruned the graph
+> and backward did almost no work. SPOT halves the $/hr but a multi-day run will
+> be preempted repeatedly; on-demand is the realistic baseline.
 
 `small` (258M) and `base` (501M) are kept as architectural presets for
 inference of pre-trained checkpoints but do not fit on a single L4 for
@@ -105,12 +105,13 @@ Watch it:
 ## What `configs/train-micro-l4.toml` does
 
 ```
-batch_size     = 6       # × max_seq_len 512 (from configs/micro.toml)
-grad_accum     = 11      # → effective batch 66  →  66 * 512 = 33_792 tokens / step
+batch_size     = 11      # × max_seq_len 512 (from configs/micro.toml)
+grad_accum     = 6       # → effective batch 66  →  66 * 512 = 33_792 tokens / step
 total_steps    = 25000   # → 25000 * 33_792 ≈ 845M token-passes
 peak_lr        = 3e-4    # WSD: 2% warmup, 78% stable, 20% cosine decay to 3e-5
 weight_decay   = 0.01
 grad_clip      = 1.0     # global L2 norm clipping
+bf16           = true    # mixed precision (block matmuls bf16; norms/WKV/loss f32)
 
 save_every     = 500     # ~50 checkpoints over the run; pruned to best-3 + recent-3
 eval_every     = 500
@@ -122,24 +123,25 @@ optimal (17 toks/param) — enough for genuinely coherent English, simple
 question following, and recognizable knowledge from the FineWeb-Edu /
 Wikipedia / OpenHermes mix.
 
-Why this `batch_size`: with the fused WKV CUDA kernel (the default), peak
-training VRAM at `batch_size = 6`, `max_seq_len = 512` measures **~12.5 GB**
-on the L4 — well under the 24 GB cap. (The old "~19.5 GB / B=8 is the OOM
-cliff" rationale described candle's *unfused* sequential scan, which retained
-the full `O(T·dh²)` per-layer state graph; that path is now CPU /
-`TINYBIT_FUSED_WKV=off` only.) There is real headroom to raise `batch_size`
-on CUDA, but the configs are **not yet re-tuned** — raise it only after a
-live run confirms loss is unaffected (see CLAUDE.md design decision 16).
+Why this `batch_size`: with the fused WKV CUDA kernel (the default) plus bf16,
+`batch_size = 11` keeps the L4's SMs busier — the kernel launches one block per
+`(batch, head)`, so batch 11 → 66 blocks (vs 36 at batch 6), and a larger
+microbatch also cuts the grad-accum iteration count. Live L4 (2026-05-28):
+batch 11 / accum 6 runs **15.18 s/step (2.23k tok/s)**; **batch 12 OOMs
+immediately**, so do not raise this without re-measuring. (The old "~19.5 GB /
+B=8 is the OOM cliff" rationale described candle's *unfused* sequential scan,
+which retained the full `O(T·dh²)` per-layer state graph; that path is now CPU /
+`TINYBIT_FUSED_WKV=off` only.) See CLAUDE.md design decision 16.
 
 If you're tighter on time, fewer steps trade quality for wall-clock. At the
-measured ~23 s/step for `micro`, total time ≈ `total_steps × 23 s`:
+measured ~15.2 s/step for `micro`, total time ≈ `total_steps × 15.2 s`:
 
 | total_steps | Model | DATA_TOKENS | ~Wall time | Expected output                    |
 |-------------|-------|-------------|------------|------------------------------------|
-| 6000        | micro | 200M        | ~38 h      | Coherent words, weak structure     |
-| 15000       | micro | 1B          | ~4 days    | Sentences, weak QA, some facts     |
-| 25000       | micro | 1.5B        | ~6.7 days  | Paragraphs, QA, basic instructions |
-| 50000       | micro | 1.5B        | ~13 days   | Better instruction following       |
+| 6000        | micro | 200M        | ~25 h      | Coherent words, weak structure     |
+| 15000       | micro | 1B          | ~63 h      | Sentences, weak QA, some facts     |
+| 25000       | micro | 1.5B        | ~4.4 days  | Paragraphs, QA, basic instructions |
+| 50000       | micro | 1.5B        | ~8.8 days  | Better instruction following       |
 
 (`nano` is smaller/faster per step but its post-fix throughput is unmeasured.)
 

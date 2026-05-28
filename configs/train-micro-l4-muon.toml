@@ -1,0 +1,39 @@
+# EXPERIMENTAL — 50M `micro` on an L4, identical to train-micro-l4.toml except it
+# drives the 2D hidden weight matrices with the Muon optimizer (Newton-Schulz
+# orthogonalized updates) while AdamW handles the tied embedding/LM-head, norms,
+# and biases. See CLAUDE.md design decision 3 and `apply_muon` in trainer.rs.
+#
+# Why this exists: Muon often improves loss-per-step for matrix params, but its
+# quality benefit at this scale is UNVERIFIED — only mechanical correctness
+# (runs, no NaNs, loss decreases) has been smoke-tested. The DEFAULT recipe and
+# the loss targets in RUN.md assume AdamW (train-micro-l4.toml). Use this only to
+# A/B Muon against that baseline on a live run; do NOT treat it as the validated
+# config until a full run confirms the loss curve.
+#
+# Everything else (token budget, LR schedule, bf16, batch geometry) matches the
+# validated config so the only variable is the optimizer.
+#
+# Pair with:
+#   DATA_TOKENS=1500000000
+
+train_data     = "data/train.bin"
+val_data       = "data/val.bin"
+checkpoint_dir = "checkpoints/"
+
+batch_size     = 11
+grad_accum     = 6
+total_steps    = 25000
+peak_lr        = 3e-4
+weight_decay   = 0.01
+grad_clip      = 1.0
+bf16           = true
+
+# Muon for the 2D hidden matrices; AdamW (peak_lr above) for everything else.
+optimizer      = "muon"
+muon_lr        = 0.02   # orthogonalized updates need a larger LR than AdamW; WSD-shaped
+
+save_every     = 500
+eval_every     = 500
+eval_batches   = 20
+
+smoke_test_steps = 0
