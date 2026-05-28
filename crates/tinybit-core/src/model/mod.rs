@@ -208,3 +208,66 @@ fn scalar_i64(
     let t = raw.get(name).ok_or_else(|| anyhow::anyhow!("quantized file missing {name}"))?;
     Ok(t.flatten_all()?.to_dtype(DType::I64)?.to_vec1::<i64>()?[0])
 }
+
+/// Full-model-step benchmark (ignored): times a fwd+bwd of the whole micro model
+/// (16 layers) with the fused WKV kernel vs the sequential candle loop, to confirm
+/// the op-level speedup carries through to a real training step. Run with:
+///   cargo test -p tinybit-core --features cuda -- --ignored --nocapture bench_full_step
+/// Uses t=256 so the memory-heavy loop path fits a 4 GB test GPU; the ratio is
+/// representative (both paths scale ~linearly in T).
+#[cfg(all(test, feature = "cuda"))]
+mod step_bench {
+    use super::{ModelConfig, TinyBit};
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn bench_full_step_fused_vs_loop() {
+        let dev = Device::new_cuda(0).unwrap();
+        let cfg = ModelConfig::micro();
+        let vocab = cfg.vocab_size as u32;
+        let (b, t) = (1usize, 256usize);
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+        let model = TinyBit::new(cfg, vb).unwrap();
+        let ids: Vec<u32> = (0..b * t)
+            .map(|i| (i as u32).wrapping_mul(2654435761) % vocab)
+            .collect();
+        let input = Tensor::from_vec(ids, (b, t), &dev).unwrap();
+
+        let run = || {
+            let (logits, _) = model.forward_train(&input).unwrap();
+            let loss = logits.sum_all().unwrap();
+            let _ = loss.backward().unwrap();
+            let _ = loss.to_scalar::<f32>().unwrap(); // pull a scalar -> sync stream
+        };
+        let bench = |fused: bool| -> f64 {
+            std::env::set_var("TINYBIT_FUSED_WKV", if fused { "on" } else { "off" });
+            let (iters, warm) = (8, 3);
+            let mut total = 0.0;
+            for it in 0..(iters + warm) {
+                let s = Instant::now();
+                run();
+                if it >= warm {
+                    total += s.elapsed().as_secs_f64();
+                }
+            }
+            total / iters as f64
+        };
+        let t_loop = bench(false);
+        let t_fused = bench(true);
+        std::env::remove_var("TINYBIT_FUSED_WKV");
+        let toks = (b * t) as f64;
+        eprintln!(
+            "FULL micro step (16L d384) b={b} t={t}: loop={:.0} ms, fused={:.0} ms, \
+             speedup={:.2}x ({:.0} vs {:.0} tok/s)",
+            t_loop * 1e3,
+            t_fused * 1e3,
+            t_loop / t_fused,
+            toks / t_fused,
+            toks / t_loop
+        );
+    }
+}

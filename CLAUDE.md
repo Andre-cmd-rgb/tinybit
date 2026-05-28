@@ -70,35 +70,35 @@ cargo test --workspace
 15. Startup script adds 32 GB swap early (before data prep and cargo build) so that
     the L4 VM (16 GB RAM) cannot OOM during large downloads or compilation.
 
-16. The RWKV-7 WKV scan in `crates/tinybit-core/src/model/time_mix.rs` is a
-    sequential candle loop, NOT a fused CUDA kernel. Each timestep allocates
-    a fresh state/outer tensor that the autograd graph keeps for backward,
-    so peak training VRAM scales linearly with
-    `batch_size × max_seq_len × num_layers`. On the L4's 22.5 GB free VRAM,
-    the 16-layer micro model fits at `batch_size = 2, max_seq_len = 512`;
-    larger combinations OOM. Both `configs/micro.toml` and the L4 train
-    configs are tuned to this budget — don't bump them without changing
-    the scan implementation.
+16. The RWKV-7 WKV scan has two implementations in
+    `crates/tinybit-core/src/model/`: a fused CUDA kernel (`wkv.rs`) and the
+    sequential candle loop (`time_mix.rs`). `time_mix::forward_train` selects via
+    `wkv::fused_wkv_enabled(device)`: DEFAULT is the fused kernel on CUDA and the
+    loop on CPU; `TINYBIT_FUSED_WKV=on|off` overrides either way.
 
-    FUSED CUDA PATH (GPU-validated, still opt-in): a fused scan lives in
-    `crates/tinybit-core/src/model/wkv.rs` as a candle `CustomOp2` (`WkvScan`)
-    plus its backward op (`WkvBackwardOp`), wired into `time_mix::forward_train`
-    behind the env flag `TINYBIT_FUSED_WKV=1` (DEFAULT OFF). Forward + backward
-    CUDA kernels (`WKV_CUDA_SRC`, compiled per `head_dim` via nvrtc with
-    `-D DH=<dh>`, one block per (batch,head), DH threads) are validated on GPU
-    against the gradient-checked CPU references: forward parity 1.5e-7, backward
-    4.2e-7, end-to-end autograd ~1e-7 at the real head_dim=64. CPU parity vs the
-    loop is 4.5e-8 → checkpoints stay compatible (resume, don't restart). See the
-    `cuda_*` tests in wkv.rs: `cargo test -p tinybit-core --features cuda -- --test-threads=1`.
-    Memory: the forward collapses retained autograd state to O(T·dh) per layer;
-    the backward transiently allocates a B·H·T·dh² forward-state buffer (~290 MB
-    at the L4 micro shape b=6,t=512,h=6,dh=64), freed right after each layer's
-    backward — chunked checkpointing to shrink it is a TODO.
+    Fused kernel (`wkv.rs`): candle `CustomOp2` (`WkvScan`, forward) + `CustomOp3`
+    (`WkvBackwardOp`, backward); CUDA kernels in `WKV_CUDA_SRC`, compiled per
+    `head_dim` via nvrtc (`-D DH=<dh>`), one block per (batch,head), DH threads.
+    The backward is chunk-checkpointed (chunk C≈√T): it stores only per-chunk entry
+    states and recomputes within-chunk states, so its scratch is O(B·H·√T·dh²)
+    (~28 MB at the L4 micro shape) instead of O(B·H·T·dh²), freed after each layer's
+    backward. The forward retains only O(T·dh) autograd state per layer (vs the
+    loop's O(T·dh²)). Validated on GPU against the gradient-checked CPU references
+    (parity ~1e-7 incl. T=512; CPU-vs-loop 4.5e-8) → numerically equivalent, so
+    checkpoints are compatible (resume across the switch, don't restart). Tests:
+    `cargo test -p tinybit-core --features cuda -- --test-threads=1` (cuda_* parity)
+    and `-- --ignored --nocapture bench` (speedup).
 
-    Still DEFAULT OFF, and the budget warning above still governs the default
-    (unfused) scan, because the fused path has NOT yet been (a) throughput/VRAM
-    benchmarked on the L4 or (b) used to re-tune batch_size/max_seq_len. Do that
-    on the L4 before flipping the default or bumping the L4 configs.
+    Speedup: measured ~3.9x on a full micro step (16L, d384) and ~3.65x on the
+    isolated WKV fwd+bwd, on an RTX A2000 (debug build). Expect the same order on
+    the L4; confirm from the live run's tok/s.
+
+    VRAM budget: with the fused kernel the old "micro fits only at batch_size=2,
+    max_seq_len=512 or it OOMs" limit (caused by the loop's O(T·dh²)×layers retained
+    graph) no longer governs CUDA — there is now headroom to raise batch_size. The
+    L4 configs in `configs/*.toml` are NOT yet re-tuned for this; raise batch_size
+    only after a live L4 run confirms the new headroom. The loop path (CPU, or
+    `TINYBIT_FUSED_WKV=off`) still carries the old budget.
 
 ## Common mistakes to avoid
 

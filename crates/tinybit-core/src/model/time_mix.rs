@@ -127,12 +127,12 @@ impl TimeMix {
         let k = k.reshape((b, t, self.num_heads, self.head_dim))?;
         let v = v.reshape((b, t, self.num_heads, self.head_dim))?;
 
-        let y = if crate::model::wkv::fused_wkv_enabled() {
-            // Fused scan: a single autograd node, so candle retains O(T·dh)
-            // instead of O(T·dh²) per layer. Numerically equal to the loop below.
+        let y = if crate::model::wkv::fused_wkv_enabled(x.device()) {
+            // Fused scan (default on CUDA): a single autograd node, so candle retains
+            // O(T·dh) instead of O(T·dh²) per layer. Numerically equal to the loop below.
             crate::model::wkv::fused_wkv(&r, &k, &v, &w)?.reshape((b, t, d))?
         } else {
-            // Sequential candle scan (default). decay broadcast (1,H,dh,1),
+            // Sequential candle scan (CPU default). decay broadcast (1,H,dh,1),
             // hoisted out of the per-timestep loop.
             let w_b = w.unsqueeze(0)?.unsqueeze(candle_core::D::Minus1)?.contiguous()?;
             let mut state = Tensor::zeros(

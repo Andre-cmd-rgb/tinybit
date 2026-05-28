@@ -21,14 +21,17 @@
 
 use candle_core::{CpuStorage, CustomOp2, CustomOp3, DType, Layout, Result, Shape, Tensor};
 
-/// Runtime toggle for the fused scan. Off by default so existing training and
-/// the documented L4 runs are unchanged until the kernel is validated on GPU.
-/// Enable with `TINYBIT_FUSED_WKV=1`.
-pub fn fused_wkv_enabled() -> bool {
-    matches!(
-        std::env::var("TINYBIT_FUSED_WKV").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    )
+/// Whether to use the fused scan for a given device. Defaults to ON for CUDA
+/// (the kernel is faster and the autograd-graph collapse cuts VRAM) and OFF for
+/// CPU (the candle loop is the well-trodden path). `TINYBIT_FUSED_WKV` overrides
+/// either way: `1`/`true`/`on` forces it on, `0`/`false`/`off` forces it off —
+/// used by the parity tests and benchmarks, and as an escape hatch.
+pub fn fused_wkv_enabled(device: &candle_core::Device) -> bool {
+    match std::env::var("TINYBIT_FUSED_WKV").as_deref() {
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("on") => true,
+        Ok("0") | Ok("false") | Ok("FALSE") | Ok("off") => false,
+        _ => device.is_cuda(),
+    }
 }
 
 /// Forward scan. Returns `(y, states)` where `y` is `[B,T,H,dh]` and `states`
@@ -482,12 +485,22 @@ mod cuda_impl {
         let nbth = b * t * h;
         // grads is pre-zeroed: dw is built with atomicAdd across the batch blocks.
         let grads = cu.alloc_zeros::<f32>(nbth * 3 * dh + h * dh).map_err(wrap)?;
-        // Per-(b,h,t) forward states, recomputed and consumed within this call.
-        let scratch = cu.alloc_zeros::<f32>(b * h * t * dh * dh).map_err(wrap)?;
+        // Chunk-checkpointed backward: store NC chunk-entry states + one C-step
+        // recompute buffer per (b,h) instead of all T states. C ≈ sqrt(T) balances
+        // checkpoint count (NC) against per-chunk recompute (C). scratch shrinks
+        // from B·H·T·dh² to B·H·(NC+C)·dh² (~10× at T=512).
+        let c = ((t as f64).sqrt().round() as usize).clamp(1, t.max(1));
+        let nc = (t + c - 1) / c;
+        let scratch = cu.alloc_zeros::<f32>(b * h * (nc + c) * dh * dh).map_err(wrap)?;
         let f = get_func(&cu, dh, "wkv_backward_f32")?;
         let cfg = launch_cfg(b, h, dh);
-        unsafe { f.launch(cfg, (rkv, w, dy, &grads, &scratch, b as i32, t as i32, h as i32)) }
-            .map_err(wrap)?;
+        unsafe {
+            f.launch(
+                cfg,
+                (rkv, w, dy, &grads, &scratch, b as i32, t as i32, h as i32, c as i32),
+            )
+        }
+        .map_err(wrap)?;
         Ok((
             CudaStorage { slice: CudaStorageSlice::F32(grads), device: dev },
             Shape::from((nbth * 3 * dh + h * dh,)),
@@ -531,73 +544,117 @@ extern "C" __global__ void wkv_forward_f32(
     }
 }
 
-// Backward. thread == row i. `scratch` is [B,H,T,DH,DH] (S_t per (b,h,t)).
-// All grads land in one packed buffer `grads` so the candle CustomOp3 can
-// return a single tensor: drkv occupies [0, B*T*H*3*DH), dw the tail [.., +H*DH).
-// dw is accumulated across batch with atomicAdd (so `grads` must be pre-zeroed).
-// Two sub-passes share the block.
+// Backward, chunk-checkpointed. thread == row i; one block per (b,h).
+// Instead of storing all T forward states (O(T·dh²)), checkpoint the state
+// entering each chunk of C steps and recompute within-chunk states on the fly —
+// cutting `scratch` to O((NC+C)·dh²) per (b,h), NC=ceil(T/C) (≈2·sqrt(T) at
+// C≈sqrt(T)). The math is identical to the all-states version, just recomputed.
+// All grads land in one packed buffer `grads`: drkv in [0, B*T*H*3*DH), dw in the
+// tail (accumulated with atomicAdd, so `grads` must be pre-zeroed). `scratch` per
+// block = [ckpt: NC·dh²][cbuf: C·dh²]:
+//   ckpt[c] = S_{c*C-1} (state entering chunk c; c=0 is the zero state, unused)
+//   cbuf[m] = S_{lo+m-1} for the chunk being reversed (reused across chunks).
 extern "C" __global__ void wkv_backward_f32(
     const float* __restrict__ rkv,
     const float* __restrict__ w,
     const float* __restrict__ dy,
     float* __restrict__ grads,      // [B*T*H*3*DH + H*DH]: drkv head, dw tail
-    float* __restrict__ scratch,    // [B,H,T,DH,DH], internal
-    const int B, const int T, const int H)
+    float* __restrict__ scratch,    // [B*H*(NC+C)*DH*DH], internal
+    const int B, const int T, const int H, const int C)
 {
     const int bh = blockIdx.x;
     const int b = bh / H, h = bh % H;
     const int i = threadIdx.x;            // row index
     if (i >= DH) return;
-    float* drkv = grads;                          // [B,T,H,3,DH]: dr +0, dk +DH, dv +2DH
+    float* drkv = grads;                          // dr +0, dk +DH, dv +2DH per (b,t,h)
     float* dw   = grads + (long)B*T*H*3*DH;        // [H,DH]
     const float wi = w[h*DH + i];
+    const int NC = (T + C - 1) / C;
+    const long sbase = (long)(b*H + h) * (NC + C) * DH * DH; // this block's scratch
+    float* ckpt = scratch + sbase;                          // [NC][DH][DH]
+    float* cbuf = scratch + sbase + (long)NC*DH*DH;          // [C][DH][DH]
     __shared__ float sv[DH], sdy[DH], sr[DH], sk[DH], sdv[DH];
 
-    // Sub-pass A: forward recompute, emit dr, store states.
-    float srow[DH];
-    for (int j = 0; j < DH; j++) srow[j] = 0.f;
-    for (int t = 0; t < T; t++) {
-        const long blk = (long)(b*T + t)*H + h;
-        const float* base = rkv + blk*3*DH;
-        sv[i]  = base[2*DH + i];
-        sdy[i] = dy[blk*DH + i];
-        __syncthreads();
-        const float ki = base[DH + i];
-        for (int j = 0; j < DH; j++) srow[j] = wi*srow[j] + ki*sv[j];
-        float dri = 0.f;
-        for (int j = 0; j < DH; j++) dri += sdy[j]*srow[j];
-        drkv[blk*3*DH + i] = dri;          // dr slot
-        float* st = scratch + (((long)(b*H + h)*T + t)*DH + i)*DH;
-        for (int j = 0; j < DH; j++) st[j] = srow[j];
-        __syncthreads();
+    // Sub-pass A: forward, emit dr, checkpoint chunk-entry states.
+    {
+        float srow[DH];
+        for (int j = 0; j < DH; j++) srow[j] = 0.f;
+        for (int t = 0; t < T; t++) {
+            const long blk = (long)(b*T + t)*H + h;
+            const float* base = rkv + blk*3*DH;
+            sv[i]  = base[2*DH + i];
+            sdy[i] = dy[blk*DH + i];
+            __syncthreads();
+            const float ki = base[DH + i];
+            for (int j = 0; j < DH; j++) srow[j] = wi*srow[j] + ki*sv[j]; // S_t row i
+            float dri = 0.f;
+            for (int j = 0; j < DH; j++) dri += sdy[j]*srow[j];
+            drkv[blk*3*DH + i] = dri;
+            if ((t + 1) % C == 0) {              // t = c*C-1 -> entering chunk c
+                int c = (t + 1) / C;
+                if (c < NC) {
+                    float* ck = ckpt + (long)c*DH*DH + (long)i*DH;
+                    for (int j = 0; j < DH; j++) ck[j] = srow[j];
+                }
+            }
+            __syncthreads();
+        }
     }
 
-    // Sub-pass B: reverse scan -> dk, dv, dw.
+    // Sub-pass B: reverse over chunks; recompute chunk states, emit dk/dv/dw.
     float dsrow[DH];
     for (int j = 0; j < DH; j++) dsrow[j] = 0.f;
     float dwi = 0.f;
-    for (int t = T - 1; t >= 0; t--) {
-        const long blk = (long)(b*T + t)*H + h;
-        const float* base = rkv + blk*3*DH;
-        sr[i]  = base[i];
-        sdy[i] = dy[blk*DH + i];
-        sk[i]  = base[DH + i];
-        sv[i]  = base[2*DH + i];
-        sdv[i] = 0.f;
-        __syncthreads();
-        const float ri = sr[i];
-        for (int j = 0; j < DH; j++) dsrow[j] = ri*sdy[j] + wi*dsrow[j];
-        float dki = 0.f;
-        for (int j = 0; j < DH; j++) dki += dsrow[j]*sv[j];
-        drkv[blk*3*DH + DH + i] = dki;     // dk slot
-        for (int j = 0; j < DH; j++) atomicAdd(&sdv[j], sk[i]*dsrow[j]);
-        __syncthreads();
-        drkv[blk*3*DH + 2*DH + i] = sdv[i]; // dv slot
-        if (t > 0) {
-            const float* sp = scratch + (((long)(b*H + h)*T + (t-1))*DH + i)*DH;
-            for (int j = 0; j < DH; j++) dwi += dsrow[j]*sp[j];
+    for (int c = NC - 1; c >= 0; c--) {
+        const int lo = c*C;
+        int hi = lo + C; if (hi > T) hi = T;
+        const int clen = hi - lo;
+        // Recompute cbuf[m] = S_{lo+m-1}, m = 0..clen-1, starting from ckpt[c].
+        {
+            float srow[DH];
+            if (c == 0) { for (int j = 0; j < DH; j++) srow[j] = 0.f; }
+            else {
+                float* ck = ckpt + (long)c*DH*DH + (long)i*DH;
+                for (int j = 0; j < DH; j++) srow[j] = ck[j];
+            }
+            float* cb0 = cbuf + (long)i*DH;       // cbuf[0] row i = S_{lo-1}
+            for (int j = 0; j < DH; j++) cb0[j] = srow[j];
+            for (int m = 1; m < clen; m++) {
+                const int t = lo + m - 1;
+                const long blk = (long)(b*T + t)*H + h;
+                const float* base = rkv + blk*3*DH;
+                sv[i] = base[2*DH + i];
+                __syncthreads();
+                const float ki = base[DH + i];
+                for (int j = 0; j < DH; j++) srow[j] = wi*srow[j] + ki*sv[j];
+                float* cb = cbuf + (long)m*DH*DH + (long)i*DH;
+                for (int j = 0; j < DH; j++) cb[j] = srow[j];
+                __syncthreads();
+            }
         }
-        __syncthreads();
+        // Reverse within chunk: m = clen-1..0, t = lo+m. S_{t-1} = cbuf[m].
+        for (int m = clen - 1; m >= 0; m--) {
+            const int t = lo + m;
+            const long blk = (long)(b*T + t)*H + h;
+            const float* base = rkv + blk*3*DH;
+            sr[i]  = base[i];
+            sdy[i] = dy[blk*DH + i];
+            sk[i]  = base[DH + i];
+            sv[i]  = base[2*DH + i];
+            sdv[i] = 0.f;
+            __syncthreads();
+            const float ri = sr[i];
+            for (int j = 0; j < DH; j++) dsrow[j] = ri*sdy[j] + wi*dsrow[j];
+            float dki = 0.f;
+            for (int j = 0; j < DH; j++) dki += dsrow[j]*sv[j];
+            drkv[blk*3*DH + DH + i] = dki;     // dk slot
+            for (int j = 0; j < DH; j++) atomicAdd(&sdv[j], sk[i]*dsrow[j]);
+            __syncthreads();
+            drkv[blk*3*DH + 2*DH + i] = sdv[i]; // dv slot
+            float* cb = cbuf + (long)m*DH*DH + (long)i*DH;  // S_{t-1} row i
+            for (int j = 0; j < DH; j++) dwi += dsrow[j]*cb[j];
+            __syncthreads();
+        }
     }
     atomicAdd(&dw[h*DH + i], dwi);
 }
@@ -783,88 +840,200 @@ mod tests {
     }
 
     /// The fused CUDA backward (via `WkvBackwardOp`) must match the CPU reference
-    /// grads. Compares the packed `[drkv | dw]` output element-wise.
+    /// grads. Compares the packed `[drkv | dw]` output element-wise across several
+    /// T that exercise the chunk-checkpointing: single step, multi-chunk, a
+    /// non-divisible tail, and the production seq len 512.
     #[cfg(feature = "cuda")]
     #[test]
     fn cuda_backward_matches_cpu() {
         use candle_core::Device;
-        let (b, t, h, dh) = (2usize, 6, 3, 64);
-        let n = b * t * h * dh;
-        let mut rng = Lcg(0x5151_2323_9090_aaaa);
-        let rkvv: Vec<f32> = (0..n * 3).map(|_| rng.next_f32()).collect();
-        let wv: Vec<f32> = (0..h * dh).map(|_| 0.3 + rng.next_f32() * 0.5).collect();
-        let dyv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+        let cuda = Device::new_cuda(0).unwrap();
+        for &(b, t, h, dh) in &[
+            (2usize, 1usize, 2usize, 64usize),
+            (2, 8, 3, 64),
+            (1, 33, 2, 64),
+            (2, 64, 3, 64),
+            (2, 512, 2, 64),
+        ] {
+            let n = b * t * h * dh;
+            let mut rng = Lcg(0x5151_2323_9090_aaaa ^ t as u64);
+            let rkvv: Vec<f32> = (0..n * 3).map(|_| rng.next_f32()).collect();
+            let wv: Vec<f32> = (0..h * dh).map(|_| 0.3 + rng.next_f32() * 0.5).collect();
+            let dyv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
 
-        let pack = |dev: &Device| -> Vec<f32> {
-            let rkv = Tensor::from_vec(rkvv.clone(), (b, t, h, 3, dh), dev).unwrap();
-            let w = Tensor::from_vec(wv.clone(), (h, dh), dev).unwrap();
-            let dy = Tensor::from_vec(dyv.clone(), (b, t, h, dh), dev).unwrap();
-            rkv.apply_op3(&w, &dy, super::WkvBackwardOp)
-                .unwrap()
-                .to_device(&Device::Cpu)
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap()
-        };
-        let g_cpu = pack(&Device::Cpu);
-        let g_cuda = pack(&Device::new_cuda(0).unwrap());
-        let diff = g_cpu
-            .iter()
-            .zip(&g_cuda)
-            .map(|(a, c)| (a - c).abs())
-            .fold(0f32, f32::max);
-        eprintln!("cuda bwd vs cpu max abs diff = {diff:.3e}");
-        assert!(diff < 1e-4, "cuda backward diverged from cpu: {diff}");
-    }
-
-    /// End-to-end: gradients from `loss = sum(fused_wkv(r,k,v,w) * dy)` must agree
-    /// between CUDA and CPU, exercising the full `WkvScan::bwd` plumbing.
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_autograd_matches_cpu() {
-        use candle_core::{Device, Var};
-        let (b, t, h, dh) = (2usize, 5, 2, 64);
-        let n = b * t * h * dh;
-        let mut rng = Lcg(0xc0ff_eeee_1234_5678);
-        let rv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
-        let kv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
-        let vv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
-        let wv: Vec<f32> = (0..h * dh).map(|_| 0.3 + rng.next_f32() * 0.5).collect();
-        let dyv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
-
-        let run = |dev: &Device| -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-            let r = Var::from_vec(rv.clone(), (b, t, h, dh), dev).unwrap();
-            let k = Var::from_vec(kv.clone(), (b, t, h, dh), dev).unwrap();
-            let v = Var::from_vec(vv.clone(), (b, t, h, dh), dev).unwrap();
-            let w = Var::from_vec(wv.clone(), (h, dh), dev).unwrap();
-            let dy = Tensor::from_vec(dyv.clone(), (b, t, h, dh), dev).unwrap();
-            let y = super::fused_wkv(r.as_tensor(), k.as_tensor(), v.as_tensor(), w.as_tensor())
-                .unwrap();
-            let loss = y.mul(&dy).unwrap().sum_all().unwrap();
-            let grads = loss.backward().unwrap();
-            let g = |x: &Var| {
-                grads
-                    .get(x.as_tensor())
-                    .unwrap()
-                    .flatten_all()
+            let pack = |dev: &Device| -> Vec<f32> {
+                let rkv = Tensor::from_vec(rkvv.clone(), (b, t, h, 3, dh), dev).unwrap();
+                let w = Tensor::from_vec(wv.clone(), (h, dh), dev).unwrap();
+                let dy = Tensor::from_vec(dyv.clone(), (b, t, h, dh), dev).unwrap();
+                rkv.apply_op3(&w, &dy, super::WkvBackwardOp)
                     .unwrap()
                     .to_device(&Device::Cpu)
                     .unwrap()
                     .to_vec1::<f32>()
                     .unwrap()
             };
-            (g(&r), g(&k), g(&v), g(&w))
+            let g_cpu = pack(&Device::Cpu);
+            let g_cuda = pack(&cuda);
+            let diff = g_cpu
+                .iter()
+                .zip(&g_cuda)
+                .map(|(a, c)| (a - c).abs())
+                .fold(0f32, f32::max);
+            eprintln!("cuda bwd T={t}: max abs diff = {diff:.3e}");
+            assert!(diff < 1e-4, "cuda backward diverged at T={t}: {diff}");
+        }
+    }
+
+    /// End-to-end: gradients from `loss = sum(fused_wkv(r,k,v,w) * dy)` must agree
+    /// between CUDA and CPU, exercising the full `WkvScan::bwd` plumbing across a
+    /// short, a multi-chunk, and the production (512) seq len.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_autograd_matches_cpu() {
+        use candle_core::{Device, Var};
+        let cuda = Device::new_cuda(0).unwrap();
+        for &(b, t, h, dh) in &[
+            (2usize, 5usize, 2usize, 64usize),
+            (2, 64, 3, 64),
+            (2, 512, 2, 64),
+        ] {
+            let n = b * t * h * dh;
+            let mut rng = Lcg(0xc0ff_eeee_1234_5678 ^ t as u64);
+            let rv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+            let kv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+            let vv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+            let wv: Vec<f32> = (0..h * dh).map(|_| 0.3 + rng.next_f32() * 0.5).collect();
+            let dyv: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+
+            let run = |dev: &Device| -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+                let r = Var::from_vec(rv.clone(), (b, t, h, dh), dev).unwrap();
+                let k = Var::from_vec(kv.clone(), (b, t, h, dh), dev).unwrap();
+                let v = Var::from_vec(vv.clone(), (b, t, h, dh), dev).unwrap();
+                let w = Var::from_vec(wv.clone(), (h, dh), dev).unwrap();
+                let dy = Tensor::from_vec(dyv.clone(), (b, t, h, dh), dev).unwrap();
+                let y =
+                    super::fused_wkv(r.as_tensor(), k.as_tensor(), v.as_tensor(), w.as_tensor())
+                        .unwrap();
+                let loss = y.mul(&dy).unwrap().sum_all().unwrap();
+                let grads = loss.backward().unwrap();
+                let g = |x: &Var| {
+                    grads
+                        .get(x.as_tensor())
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_device(&Device::Cpu)
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                };
+                (g(&r), g(&k), g(&v), g(&w))
+            };
+
+            let (rc, kc, vc, wc) = run(&Device::Cpu);
+            let (rg, kg, vg, wg) = run(&cuda);
+            let md = |a: &[f32], c: &[f32]| {
+                a.iter().zip(c).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+            };
+            let (dr, dk, dv, dw) = (md(&rc, &rg), md(&kc, &kg), md(&vc, &vg), md(&wc, &wg));
+            eprintln!("cuda autograd T={t}: dr={dr:.2e} dk={dk:.2e} dv={dv:.2e} dw={dw:.2e}");
+            assert!(
+                dr < 1e-4 && dk < 1e-4 && dv < 1e-4 && dw < 1e-4,
+                "grad mismatch T={t}: dr={dr} dk={dk} dv={dv} dw={dw}"
+            );
+        }
+    }
+
+    /// Benchmark (ignored): fused op vs the sequential candle loop, fwd+bwd, at a
+    /// representative training shape. Run with:
+    ///   cargo test -p tinybit-core --features cuda -- --ignored --nocapture bench_wkv
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn bench_wkv_fused_vs_loop() {
+        use candle_core::{Device, Var, D};
+        use std::time::Instant;
+        let dev = Device::new_cuda(0).unwrap();
+        let (b, t, h, dh) = (4usize, 512usize, 6usize, 64usize);
+        let n = b * t * h * dh;
+        let mut rng = Lcg(0xbeef_0bad_f00d_1234);
+        let mut mk = || -> Vec<f32> { (0..n).map(|_| rng.next_f32()).collect() };
+        let (rv, kv, vv) = (mk(), mk(), mk());
+        let wv: Vec<f32> = (0..h * dh).map(|_| 0.3 + rng.next_f32() * 0.5).collect();
+
+        // Fresh Vars each call so the autograd graph does not accumulate.
+        let make = || -> (Var, Var, Var, Var) {
+            (
+                Var::from_vec(rv.clone(), (b, t, h, dh), &dev).unwrap(),
+                Var::from_vec(kv.clone(), (b, t, h, dh), &dev).unwrap(),
+                Var::from_vec(vv.clone(), (b, t, h, dh), &dev).unwrap(),
+                Var::from_vec(wv.clone(), (h, dh), &dev).unwrap(),
+            )
         };
 
-        let (rc, kc, vc, wc) = run(&Device::Cpu);
-        let (rg, kg, vg, wg) = run(&Device::new_cuda(0).unwrap());
-        let md =
-            |a: &[f32], c: &[f32]| a.iter().zip(c).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
-        let (dr, dk, dv, dw) = (md(&rc, &rg), md(&kc, &kg), md(&vc, &vg), md(&wc, &wg));
-        eprintln!("cuda autograd max abs diff: dr={dr:.2e} dk={dk:.2e} dv={dv:.2e} dw={dw:.2e}");
-        assert!(
-            dr < 1e-4 && dk < 1e-4 && dv < 1e-4 && dw < 1e-4,
-            "grad mismatch dr={dr} dk={dk} dv={dv} dw={dw}"
+        // Sequential candle loop (mirrors the non-fused branch in time_mix).
+        let loop_scan = |r: &Tensor, k: &Tensor, v: &Tensor, w: &Tensor| -> Tensor {
+            let w_b = w.unsqueeze(0).unwrap().unsqueeze(D::Minus1).unwrap();
+            let mut state = Tensor::zeros((b, h, dh, dh), DType::F32, &dev).unwrap();
+            let mut outs = Vec::with_capacity(t);
+            for ti in 0..t {
+                let k_t = k.narrow(1, ti, 1).unwrap().squeeze(1).unwrap();
+                let v_t = v.narrow(1, ti, 1).unwrap().squeeze(1).unwrap();
+                let r_t = r.narrow(1, ti, 1).unwrap().squeeze(1).unwrap();
+                let outer = k_t
+                    .unsqueeze(D::Minus1)
+                    .unwrap()
+                    .broadcast_mul(&v_t.unsqueeze(D::Minus2).unwrap())
+                    .unwrap();
+                state = state.broadcast_mul(&w_b).unwrap().add(&outer).unwrap();
+                let y_t = r_t
+                    .unsqueeze(D::Minus2)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap()
+                    .matmul(&state.contiguous().unwrap())
+                    .unwrap()
+                    .squeeze(D::Minus2)
+                    .unwrap();
+                outs.push(y_t.unsqueeze(1).unwrap());
+            }
+            Tensor::cat(&outs, 1).unwrap()
+        };
+
+        let iters = 20;
+        let warmup = 5;
+        let bench = |fused: bool| -> f64 {
+            let mut total = 0f64;
+            for it in 0..(iters + warmup) {
+                let (r, k, v, w) = make();
+                let start = Instant::now();
+                let y = if fused {
+                    super::fused_wkv(r.as_tensor(), k.as_tensor(), v.as_tensor(), w.as_tensor())
+                        .unwrap()
+                } else {
+                    loop_scan(r.as_tensor(), k.as_tensor(), v.as_tensor(), w.as_tensor())
+                };
+                let loss = y.sum_all().unwrap();
+                let _g = loss.backward().unwrap();
+                // Force completion: pull a scalar to the host (syncs the stream).
+                let _ = loss.to_scalar::<f32>().unwrap();
+                if it >= warmup {
+                    total += start.elapsed().as_secs_f64();
+                }
+            }
+            total / iters as f64
+        };
+
+        let t_loop = bench(false);
+        let t_fused = bench(true);
+        let toks = (b * t) as f64;
+        eprintln!(
+            "WKV fwd+bwd @ b={b} t={t} h={h} dh={dh}: loop={:.2} ms, fused={:.2} ms, speedup={:.2}x ({:.0} vs {:.0} tok/s, one layer)",
+            t_loop * 1e3,
+            t_fused * 1e3,
+            t_loop / t_fused,
+            toks / t_fused,
+            toks / t_loop,
         );
     }
 }
