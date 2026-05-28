@@ -10,7 +10,7 @@ use crate::state::InferenceState;
 use block::Rwkv7Block;
 use embedding::EmbeddingHead;
 use candle_core::{Device, DType, Tensor};
-use candle_nn::{Linear, Module, VarBuilder};
+use candle_nn::{Linear, VarBuilder};
 
 /// The complete tinybit model.
 pub struct TinyBit {
@@ -18,6 +18,11 @@ pub struct TinyBit {
     embed: EmbeddingHead,
     blocks: Vec<Rwkv7Block>,
     spec_heads: Option<Vec<Linear>>,
+    /// Dtype the training forward runs in. Master weights stay f32 (the VarMap);
+    /// setting this to bf16 makes the block-stack matmuls run in bf16 on CUDA
+    /// (tensor cores) while norms, the WKV scan, and the loss stay f32. Default
+    /// f32 — inference and CPU are unaffected.
+    compute_dtype: DType,
 }
 
 impl TinyBit {
@@ -40,7 +45,13 @@ impl TinyBit {
         } else {
             None
         };
-        Ok(Self { config, embed, blocks, spec_heads })
+        Ok(Self { config, embed, blocks, spec_heads, compute_dtype: DType::F32 })
+    }
+
+    /// Set the training-forward compute dtype (e.g. `DType::BF16` for mixed
+    /// precision on CUDA). Master weights remain f32 regardless.
+    pub fn set_compute_dtype(&mut self, dtype: DType) {
+        self.compute_dtype = dtype;
     }
 
     /// Training forward pass. Returns logits (B, T, vocab_size) + optional spec logits.
@@ -48,7 +59,7 @@ impl TinyBit {
         &self,
         token_ids: &Tensor,
     ) -> anyhow::Result<(Tensor, Vec<Tensor>)> {
-        let mut x = self.embed.embed(token_ids)?;
+        let mut x = self.embed.embed(token_ids)?.to_dtype(self.compute_dtype)?;
         for block in &self.blocks {
             x = block.forward_train(&x)?;
         }
@@ -56,10 +67,7 @@ impl TinyBit {
         let spec = match &self.spec_heads {
             Some(heads) => heads
                 .iter()
-                .map(|h| {
-                    h.forward(&x)
-                        .map_err(anyhow::Error::from)
-                })
+                .map(|h| crate::model::bitlinear::linear_autocast(h, &x))
                 .collect::<anyhow::Result<Vec<_>>>()?,
             None => vec![],
         };

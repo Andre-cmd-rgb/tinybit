@@ -1,17 +1,20 @@
 # 50M `micro` model on a single NVIDIA L4 (24 GB VRAM).
 #
 # Per-step token budget:
-#   batch 6 × seq 512 × grad_accum 11 = 33_792 tokens / step
+#   batch 12 × seq 512 × grad_accum 6 = 36_864 tokens / step
 #
 # Total token budget:
-#   25_000 steps × 33_792 ≈ 0.84 B tokens (~17x params; near Chinchilla-optimal)
+#   25_000 steps × 36_864 ≈ 0.92 B tokens (~18x params; near Chinchilla-optimal)
 #
-# batch_size is HELD at 6 for now. A previous note here proposed batch 12 based
-# on a "~7 of 22.5 GB at batch 6" VRAM reading — but that reading was taken while
-# the LayerNorm gradient bug was silently pruning the backward graph, so it
-# *under*-counted backward activations. With gradients now flowing through the
-# full stack, real peak VRAM is higher; re-measure on a live L4 (watch
-# `nvidia-smi` for the first ~50 steps) before raising batch_size again.
+# Throughput tuning (2026-05-28): bf16 mixed precision + a larger microbatch.
+# The fused WKV kernel launches one block per (batch, head); at batch 6 that is
+# only 36 blocks on the L4's 58 SMs (low occupancy). batch 12 → 72 blocks
+# (full occupancy) and halves the grad_accum iteration count (less per-microbatch
+# graph-build overhead). bf16 halves activation VRAM, making the bigger batch fit;
+# measured ~12.5 GB at the old f32 batch-6, so batch 12 in bf16 should land near
+# that. WATCH `nvidia-smi` for the first ~30 steps after launch — if there is
+# still headroom, batch can go higher (drop grad_accum to keep effective batch
+# ~constant); if it OOMs, fall back to batch 8 / grad_accum 9.
 #
 # Pair with:
 #   DATA_TOKENS=1500000000
@@ -20,12 +23,13 @@ train_data     = "data/train.bin"
 val_data       = "data/val.bin"
 checkpoint_dir = "checkpoints/"
 
-batch_size     = 6
-grad_accum     = 11
+batch_size     = 12
+grad_accum     = 6
 total_steps    = 25000
 peak_lr        = 3e-4
 weight_decay   = 0.01
 grad_clip      = 1.0
+bf16           = true
 
 save_every     = 500
 eval_every     = 500

@@ -16,11 +16,14 @@ impl RmsNorm {
     }
 
     pub fn forward(&self, x: &Tensor) -> anyhow::Result<Tensor> {
+        // Reduction in f32 for stability, output restored to the input dtype so a
+        // bf16 activation stays bf16 (and the downstream matmul runs in bf16).
+        let x_dtype = x.dtype();
         let x_f32 = x.to_dtype(DType::F32)?;
         let variance = x_f32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
         let x_norm = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let w = self.weight.to_dtype(DType::F32)?;
-        Ok(x_norm.broadcast_mul(&w)?)
+        Ok(x_norm.broadcast_mul(&w)?.to_dtype(x_dtype)?)
     }
 }
 
@@ -90,8 +93,10 @@ impl BitLinear {
             _ => self.weight.clone(),
         };
         if !self.quantized {
-            let w_f32 = w.to_dtype(DType::F32)?;
-            Ok(x_norm.matmul(&w_f32.t()?)?)
+            // Match the activation dtype: bf16 activations → bf16 matmul (tensor
+            // cores on CUDA) while `self.weight` stays the f32 master copy.
+            let w = w.to_dtype(x_norm.dtype())?;
+            Ok(x_norm.matmul(&w.t()?)?)
         } else {
             let (w_ternary, scale_w) = quantize_ternary(&w)?;
             let (x_q, scale_x) = quantize_int8(&x_norm)?;
@@ -100,4 +105,22 @@ impl BitLinear {
             Ok((result * factor)?)
         }
     }
+}
+
+/// Forward a candle `Linear` honoring the activation's dtype: the f32 master
+/// weight (and bias, if any) is cast to the input dtype so the matmul runs in
+/// bf16 on CUDA (tensor cores) while gradients still accumulate into the f32
+/// master via the differentiable cast. Mirrors `Linear::forward`'s batched
+/// broadcasting. With an f32 input this is identical to `Linear::forward`.
+pub fn linear_autocast(lin: &candle_nn::Linear, x: &Tensor) -> anyhow::Result<Tensor> {
+    let w = lin.weight().to_dtype(x.dtype())?;
+    let w = match x.dims() {
+        &[bsize, _, _] => w.broadcast_left(bsize)?,
+        _ => w,
+    };
+    let mut y = x.matmul(&w.t()?)?;
+    if let Some(b) = lin.bias() {
+        y = y.broadcast_add(&b.to_dtype(x.dtype())?)?;
+    }
+    Ok(y)
 }

@@ -1,5 +1,5 @@
 use crate::config::ModelConfig;
-use crate::model::bitlinear::BitLinear;
+use crate::model::bitlinear::{linear_autocast, BitLinear};
 use crate::state::LayerState;
 use candle_core::{DType, Tensor};
 use candle_nn::{ops::silu, Linear, Module, VarBuilder};
@@ -70,6 +70,10 @@ impl TimeMix {
     }
 
     fn group_norm(&self, x: &Tensor) -> anyhow::Result<Tensor> {
+        // Per-head normalization in f32 (mean/var are precision-sensitive), output
+        // restored to the input dtype so the bf16 activation path stays bf16.
+        let x_dtype = x.dtype();
+        let x = x.to_dtype(DType::F32)?;
         let shape = x.dims().to_vec();
         let last = *shape.last().ok_or_else(|| anyhow::anyhow!("group_norm: empty tensor shape"))?;
         let prefix: Vec<usize> = shape[..shape.len() - 1].to_vec();
@@ -87,9 +91,9 @@ impl TimeMix {
         flat_shape.push(last);
         let xf = xn.reshape(flat_shape.as_slice())?;
 
-        let w = self.group_norm_weight.to_dtype(x.dtype())?;
-        let b = self.group_norm_bias.to_dtype(x.dtype())?;
-        Ok(xf.broadcast_mul(&w)?.broadcast_add(&b)?)
+        let w = self.group_norm_weight.to_dtype(DType::F32)?;
+        let b = self.group_norm_bias.to_dtype(DType::F32)?;
+        Ok(xf.broadcast_mul(&w)?.broadcast_add(&b)?.to_dtype(x_dtype)?)
     }
 
     fn compute_decay(&self) -> anyhow::Result<Tensor> {
@@ -128,9 +132,10 @@ impl TimeMix {
         let x_v = prev_x.broadcast_add(&maa_v.broadcast_mul(&diff)?)?;
 
         let r = self.w_r.forward(&x_r)?;
-        let k = self.w_k.forward(&x_k)?;
-        let v = self.w_v.forward(&x_v)?;
-        let g = silu(&self.w_g1.forward(&x_x)?)?.broadcast_mul(&self.w_g2.forward(&x_x)?)?;
+        let k = linear_autocast(&self.w_k, &x_k)?;
+        let v = linear_autocast(&self.w_v, &x_v)?;
+        let g = silu(&linear_autocast(&self.w_g1, &x_x)?)?
+            .broadcast_mul(&linear_autocast(&self.w_g2, &x_x)?)?;
 
         let w = self.compute_decay()?; // (H, dh)
 
@@ -142,7 +147,13 @@ impl TimeMix {
         let y = if crate::model::wkv::fused_wkv_enabled(x.device()) {
             // Fused scan (default on CUDA): a single autograd node, so candle retains
             // O(T·dh) instead of O(T·dh²) per layer. Numerically equal to the loop below.
-            crate::model::wkv::fused_wkv(&r, &k, &v, &w)?.reshape((b, t, d))?
+            // The fused op is f32-only, so cast in/out (the scan is not a GEMM and
+            // sees no tensor-core benefit from bf16; keeping it f32 preserves the
+            // recurrent-state precision).
+            let rf = r.to_dtype(DType::F32)?;
+            let kf = k.to_dtype(DType::F32)?;
+            let vf = v.to_dtype(DType::F32)?;
+            crate::model::wkv::fused_wkv(&rf, &kf, &vf, &w)?.reshape((b, t, d))?
         } else {
             // Sequential candle scan (CPU default). decay broadcast (1,H,dh,1),
             // hoisted out of the per-timestep loop.
@@ -182,7 +193,7 @@ impl TimeMix {
 
         let y = self.group_norm(&y.to_dtype(x.dtype())?)?;
         let out = y.broadcast_mul(&g)?;
-        Ok(self.w_o.forward(&out)?)
+        Ok(linear_autocast(&self.w_o, &out)?)
     }
 
     /// Inference step: (B, D) → (B, D), reads/writes LayerState

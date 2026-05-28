@@ -33,17 +33,21 @@ impl EmbeddingHead {
     /// Project hidden states to logits: (..., D) → (..., vocab_size)
     /// Handles both 2D (B, D) and 3D (B, T, D) inputs.
     pub fn lm_head(&self, hidden: &Tensor) -> anyhow::Result<Tensor> {
+        // LayerNorm preserves the input dtype; run the (large) vocab projection in
+        // that dtype so bf16 hidden states hit tensor cores, then return f32 logits
+        // for a stable softmax/loss. With f32 hidden (inference) this is unchanged.
         let normed = self.ln_out.forward(hidden)?;
-        let normed_f32 = normed.to_dtype(DType::F32)?;
-        let w = self.embed.embeddings().to_dtype(DType::F32)?; // (vocab_size, d_model)
+        let cdt = normed.dtype();
+        let w = self.embed.embeddings().to_dtype(cdt)?; // (vocab_size, d_model)
         // Expand weight for batched matmul — same trick as candle's Linear::forward
-        let w_exp = match normed_f32.dims() {
+        let w_exp = match normed.dims() {
             &[bsize, _, _] => w.broadcast_left(bsize)?, // (bsize, vocab_size, d_model)
             _ => w,
         };
+        let logits = normed.matmul(&w_exp.t()?)?.to_dtype(DType::F32)?;
         // Divide by sqrt(d_model) to counteract the N(0,1) embedding init scale.
         // Without this, logit std = sqrt(d_model) * std_embed ≈ 16, giving CE ≈ 87 instead of ~ln(V).
         let scale = 1.0 / (self.d_model as f64).sqrt();
-        Ok((normed_f32.matmul(&w_exp.t()?)? * scale)?)
+        Ok((logits * scale)?)
     }
 }

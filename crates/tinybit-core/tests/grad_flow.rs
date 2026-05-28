@@ -135,6 +135,56 @@ fn overfits_a_fixed_batch() {
     assert!(last < 0.5, "loss did not drop (final {last:.4}, baseline ln(V)={:.2})", (vocab as f64).ln());
 }
 
+/// bf16 mixed precision (CUDA only): the bf16 forward must track the f32 forward
+/// on identical weights, and bf16 training must overfit with finite gradients.
+/// Exercises the real production path (bf16 matmuls + f32 fused WKV scan + f32
+/// norms/loss + f32 master weights). Run with:
+///   cargo test -p tinybit-core --features cuda --test grad_flow -- --test-threads=1 bf16
+#[cfg(feature = "cuda")]
+#[test]
+fn bf16_tracks_f32_and_overfits_cuda() {
+    let dev = Device::new_cuda(0).unwrap();
+    let cfg = tiny_config();
+    let vocab = cfg.vocab_size as u32;
+    let (b, t) = (2usize, 16usize);
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+    let mut model = TinyBit::new(cfg, vb).unwrap();
+
+    let ids: Vec<u32> = (0..b * t).map(|i| (i as u32).wrapping_mul(2654435761) % vocab).collect();
+    let tgt: Vec<u32> = (0..b * t).map(|i| ((i + 7) as u32).wrapping_mul(40503) % vocab).collect();
+    let input = Tensor::from_vec(ids, (b, t), &dev).unwrap();
+    let target = Tensor::from_vec(tgt, (b, t), &dev).unwrap();
+
+    // (1) bf16 forward tracks f32 on the SAME weights.
+    let (lf32, _) = model.forward_train(&input).unwrap();
+    let loss_f32 = ce_loss(&lf32, &target).to_scalar::<f32>().unwrap();
+    model.set_compute_dtype(DType::BF16);
+    let (lbf16, _) = model.forward_train(&input).unwrap();
+    let loss_bf16 = ce_loss(&lbf16, &target).to_scalar::<f32>().unwrap();
+    assert!(loss_bf16.is_finite(), "bf16 forward produced non-finite loss");
+    assert!(
+        (loss_bf16 - loss_f32).abs() < 0.15,
+        "bf16 loss {loss_bf16:.4} diverged from f32 {loss_f32:.4}"
+    );
+
+    // (2) bf16 training overfits a fixed batch (grads finite, master weights f32).
+    let mut opt = AdamW::new(varmap.all_vars(), ParamsAdamW { lr: 3e-3, ..Default::default() }).unwrap();
+    let mut last = f32::INFINITY;
+    for _ in 0..150 {
+        let (logits, _) = model.forward_train(&input).unwrap();
+        let loss = ce_loss(&logits, &target);
+        last = loss.to_scalar::<f32>().unwrap();
+        assert!(last.is_finite(), "bf16 loss went non-finite during training");
+        opt.backward_step(&loss).unwrap();
+    }
+    assert!(
+        last < 1.0,
+        "bf16 did not overfit (final {last:.4}, baseline ln(V)={:.2})",
+        (vocab as f64).ln()
+    );
+}
+
 #[test]
 #[ignore]
 fn diagnose() {

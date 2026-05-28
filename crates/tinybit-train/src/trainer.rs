@@ -41,6 +41,12 @@ pub struct TrainingConfig {
 
     pub smoke_test_steps: usize,
 
+    /// Mixed-precision training. When true and the device is CUDA, the block-stack
+    /// matmuls run in bf16 (tensor cores) while master weights, the WKV scan, the
+    /// norms, and the loss stay f32. Absent/false → full f32 (unchanged behavior).
+    #[serde(default)]
+    pub bf16: bool,
+
     /// Optimizer selection. Absent in older configs → AdamW (unchanged behavior).
     #[serde(default)]
     pub optimizer: OptimizerKind,
@@ -99,7 +105,7 @@ impl Trainer {
         let device = Self::auto_device()?;
         info!("training device: {device:?}");
 
-        let (model, varmap, mut step, mut tokens_seen) =
+        let (mut model, varmap, mut step, mut tokens_seen) =
             if self.resume && self.config.checkpoint_dir.exists() {
                 match load_checkpoint(&self.config.checkpoint_dir, &device) {
                     Ok((model, meta, varmap)) => {
@@ -120,6 +126,15 @@ impl Trainer {
                 let model = TinyBit::new(self.model_config.clone(), vb)?;
                 (model, varmap, 0, 0)
             };
+
+        if self.config.bf16 {
+            if device.is_cuda() {
+                model.set_compute_dtype(DType::BF16);
+                info!("bf16 mixed precision: ON (compute bf16; master weights, WKV scan, norms, loss stay f32)");
+            } else {
+                warn!("bf16 requested but training device is CPU — staying f32");
+            }
+        }
 
         let train_ds = TokenDataset::open(&self.config.train_data, self.model_config.max_seq_len)?;
         let val_ds = TokenDataset::open(&self.config.val_data, self.model_config.max_seq_len)?;
