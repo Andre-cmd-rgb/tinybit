@@ -41,13 +41,13 @@ binary, and starts training — all unattended. Checkpoints sync to
 
 | GPU   | Machine        | VRAM  | RAM  | On-demand | SPOT       | Typical run (50 M micro, 25 k steps) |
 |-------|----------------|-------|------|-----------|------------|--------------------------------------|
-| L4    | g2-standard-4  | 24 GB | 16 G | ~$0.71/hr | ~$0.22/hr  | **~1.5–2.2 days · ~$25–40 on-demand** (projected; was ~4.4 days) |
+| L4    | g2-standard-4  | 24 GB | 16 G | ~$0.71/hr | ~$0.22/hr  | **~1.9 days · ~$32 on-demand** (measured; was ~4.4 days) |
 
 Costs are estimates for US zones. The 25 k-step `micro` run measured **15.2 s/step**
 (2.23k tok/s, fused WKV kernel + bf16) ≈ 4.4 days. The **2026-05-29 WKV backward
-fix** (see "Throughput" below) makes the step ~2–3× faster — projected **~5–7.5
-s/step ≈ 1.5–2.2 days** on L4; confirm from your live run's tok/s and update this
-table. SPOT is ~30 % of the on-demand $/hr and training resumes from the latest
+fix** (see "Throughput" below) made the step **2.33× faster — measured 6.5 s/step
+(5.2k tok/s) ≈ 1.9 days** on a live L4 (resumed from a checkpoint with the new
+code). SPOT is ~30 % of the on-demand $/hr and training resumes from the latest
 GCS checkpoint after a preemption, but a multi-day run will be preempted
 repeatedly, so on-demand is the realistic baseline. (Earlier "15–22 h" figures
 predate the LayerNorm backward fix, when the pruned graph made backward almost free.)

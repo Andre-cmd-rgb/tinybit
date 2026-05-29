@@ -98,7 +98,9 @@ cargo test --workspace
     step (16L, d384) is ~6x the loop / ~3x the pre-fix kernel. The forward is ~2%
     of the scan; the backward is the rest. At the real micro batch (b=11, t=512)
     one layer's fwd+bwd is ~33 ms (≈0.5 s across 16 layers), down from ~4.4 s.
-    Expect a similar large drop on the L4; confirm from the live run's tok/s.
+    Confirmed on a live L4 (resumed from a checkpoint with the new code):
+    **6.5 s/step at b=11, vs 15.2 before — 2.33x — so the 25k-step micro run is
+    ~1.9 days (~$32 on-demand), down from ~4.4 days.**
 
     VRAM budget: with the fused kernel the old "micro fits only at batch_size=2,
     max_seq_len=512 or it OOMs" limit (caused by the loop's O(T·dh²)×layers retained
