@@ -62,6 +62,21 @@ cargo test --workspace
     via NVIDIA's apt repo and exports CUDA_ROOT/PATH=/usr/local/cuda-12.8 before
     `cargo build`. Do not assume the image's `/usr/local/cuda` symlink is right.
 
+    Local CUDA build (Fedora / newer GCC): CUDA 12.8's nvcc only accepts host GCC
+    <= 14. The GCP L4 image (Ubuntu 22.04, GCC 11) is fine, but a modern Fedora
+    (GCC 15/16) fails the `candle-kernels` build — `-allow-unsupported-compiler`
+    bypasses the version assert but nvcc then can't parse the new libstdc++
+    headers (`char8_t undefined`, …). Fix: install a supported compiler and point
+    nvcc at it, e.g.
+        sudo dnf install gcc14 gcc14-c++
+        export CUDA_ROOT=/usr/local/cuda-12.8 PATH=/usr/local/cuda-12.8/bin:$PATH
+        export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH
+        export NVCC_CCBIN=/usr/bin/g++-14
+        cargo build --release -p tinybit-cli --features cuda
+    (A stale `target/.../candle-kernels-*` from an older GCC can make `cargo build`
+    appear to work in debug while a fresh/release build fails — `cargo clean -p`
+    candle-kernels if the cache lies.)
+
 13. prepare_data.sh streams tokens directly to disk with numpy uint32 (4 bytes/token).
     Never store tokens in a Python list — at 1B tokens that is ~28 GB of RAM.
     The script writes to a temp file, then copies the tail as val.bin and the head as
