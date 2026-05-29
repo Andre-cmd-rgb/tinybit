@@ -41,14 +41,16 @@ binary, and starts training — all unattended. Checkpoints sync to
 
 | GPU   | Machine        | VRAM  | RAM  | On-demand | SPOT       | Typical run (50 M micro, 25 k steps) |
 |-------|----------------|-------|------|-----------|------------|--------------------------------------|
-| L4    | g2-standard-4  | 24 GB | 16 G | ~$0.71/hr | ~$0.22/hr  | ~4.4 days · ~$75–85 on-demand |
+| L4    | g2-standard-4  | 24 GB | 16 G | ~$0.71/hr | ~$0.22/hr  | **~1.5–2.2 days · ~$25–40 on-demand** (projected; was ~4.4 days) |
 
-Costs are estimates for US zones. The 25 k-step `micro` run holds **~15.2 s/step**
-(~2.23k tok/s, fused WKV kernel + bf16) — about 106 h ≈ 4.4 days. SPOT is ~30 % of the
-on-demand $/hr and training resumes from the latest GCS checkpoint after a
-preemption, but a multi-day run will be preempted repeatedly, so on-demand is
-the realistic baseline. (Earlier "15–22 h" figures predate the LayerNorm
-backward fix, when the pruned graph made backward almost free.)
+Costs are estimates for US zones. The 25 k-step `micro` run measured **15.2 s/step**
+(2.23k tok/s, fused WKV kernel + bf16) ≈ 4.4 days. The **2026-05-29 WKV backward
+fix** (see "Throughput" below) makes the step ~2–3× faster — projected **~5–7.5
+s/step ≈ 1.5–2.2 days** on L4; confirm from your live run's tok/s and update this
+table. SPOT is ~30 % of the on-demand $/hr and training resumes from the latest
+GCS checkpoint after a preemption, but a multi-day run will be preempted
+repeatedly, so on-demand is the realistic baseline. (Earlier "15–22 h" figures
+predate the LayerNorm backward fix, when the pruned graph made backward almost free.)
 
 ---
 
@@ -133,24 +135,32 @@ unfused loop, now the CPU / `TINYBIT_FUSED_WKV=off` path only.
 
 ### Throughput: where the time goes & how to speed it up further
 
-The `micro` step (~15 s) is far slower than its arithmetic implies: a fwd+bwd
-step is only ~6–7 TFLOP of matmul work (~55 ms ideal on a ~120 TFLOPS bf16 L4)
-plus a tiny (~1 GFLOP) WKV scan — i.e. **<1 % effective utilization**. The
-slowness is stalls / low GPU occupancy, not FLOPs. Two classes of fix:
+The pre-fix `micro` step (~15 s) was far slower than its arithmetic implies: a
+fwd+bwd step is only ~6–7 TFLOP of matmul work (~55 ms ideal on a ~120 TFLOPS
+bf16 L4) plus a tiny (~1 GFLOP) WKV scan. The slowness was stalls, not FLOPs.
+Fixes applied so far:
 
 1. **Per-step sync stalls (done, 2026-05-28).** `global_grad_norm` previously
    did one host read (`.to_scalar`) per parameter (~150–200 forced CUDA stream
    syncs/step) and the loss synced once per microbatch. Both now accumulate
    on-device and sync **once per step** — same numerics, fewer stalls.
 
-2. **WKV scan occupancy (open, needs a live L4 run).** The fused kernel
-   (`crates/tinybit-core/src/model/wkv.rs`) launches one block per
-   `(batch, head)` = 66 blocks of `dh`=64 threads on a GPU that runs ~89k
-   threads — under 5 % occupancy — and scans `T`=512 sequentially. This is the
-   prime suspect for the residual time. The principled fix is a chunked-parallel
-   scan (within-chunk = matmuls, only `T/L` inter-chunk carries sequential),
-   validated against the CPU reference + the `cuda_*` parity tests at T=512 so
-   it stays numerically equivalent (checkpoints remain compatible).
+2. **WKV backward `dv` atomic storm (done, 2026-05-29).** The dominant cost was
+   the scan's backward, not the forward. The `dv` cross-thread reduction summed
+   over rows with a per-timestep storm of shared-memory `atomicAdd`s — all `dh`
+   threads contending on the same `dh` addresses, fully serialized. Replacing it
+   with a conflict-free padded-shared-buffer column reduction (same arithmetic,
+   no atomics) cut the backward **~9×** (110→12 ms at b4×t512 on an A2000) and the
+   whole scan ~8×; an end-to-end micro step is ~2–3× faster. Numerically
+   unchanged — the `cuda_*` parity tests at T=512 still pass, so checkpoints stay
+   compatible. The forward kernel was already cheap (~2 % of the scan) and was
+   left alone.
+
+3. **Further (optional, not needed yet).** The fused kernel launches `B*H`=66
+   blocks of `dh`=64 threads and scans `T`=512 sequentially; a chunked-parallel
+   scan (within-chunk matmuls, only `T/L` sequential inter-chunk carries) would
+   raise occupancy further, but with the atomic storm gone the WKV scan is no
+   longer the step's bottleneck, so this is unmotivated for now.
 
 **Profiling a step:** set `TINYBIT_PROFILE=1` to log, per optimizer step, the
 wall time split across forward+loss / backward / optimizer (the device is

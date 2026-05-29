@@ -33,13 +33,16 @@ pub struct ChatArgs {
 pub fn run(args: ChatArgs) -> anyhow::Result<()> {
     let config = ModelConfig::from_file(&args.config)?;
     let device = InferenceEngine::auto_device();
-    let engine = InferenceEngine::new(
+    let mut engine = InferenceEngine::new(
         &args.model,
         config.clone(),
         &args.tokenizer,
         &args.data_dir,
         device.clone(),
     )?;
+    // Honor the --temperature flag (otherwise the parsed value was ignored and
+    // sampling always used the default temperature).
+    engine.params.temperature = args.temperature;
 
     let mut session = if args.resume && args.session.exists() {
         Session::load(&args.session, &device)?

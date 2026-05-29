@@ -46,7 +46,7 @@ All models use 3.5× FFN expansion (d_ffn = 3.5 × d_model) matching the RWKV-7 
 | Preset | Params  | Layers | d_model | d_ffn | Notes |
 |--------|---------|--------|---------|-------|-------|
 | nano   | ~25M    | 9      | 320     | 1120  | Fast iteration |
-| micro  | ~50M    | 16     | 384     | 1344  | Main L4 target, ~6.5–7 days (measured) |
+| micro  | ~50M    | 16     | 384     | 1344  | Main L4 target, ~1.5–2.2 days (projected, post WKV-backward fix) |
 | small  | ~258M   | 13     | 1024    | 3584  | Architecture only — too big to train on L4 |
 | base   | ~501M   | 17     | 1280    | 4480  | Architecture only — too big to train on L4 |
 
@@ -94,7 +94,7 @@ export GCP_BUCKET="gs://your-bucket"
 DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-nano-l4.toml \
 PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh nano
 
-# 50M micro — 25k steps ≈ 6.5–7 days on L4, ~$115–125 on-demand (measured)
+# 50M micro — 25k steps ≈ 1.5–2.2 days on L4, ~$25–40 on-demand (projected post WKV fix; see RUN.md)
 DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-micro-l4.toml \
 PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh micro
 

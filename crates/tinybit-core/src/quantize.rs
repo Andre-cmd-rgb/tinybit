@@ -41,8 +41,13 @@ pub fn quantize_ternary(w: &Tensor) -> anyhow::Result<(Tensor, f32)> {
         let qi8 = zeros.to_dtype(DType::I64)?.to_dtype(DType::F32)?;
         return Ok((qi8, scale));
     }
-    // Threshold: values above mean-abs become +1, below -mean-abs become -1, else 0
-    let threshold = Tensor::full(scale, w_f32.shape(), w_f32.device())?;
+    // BitNet b1.58 absmean ternarization: W̃ = round(clip(W/scale, -1, +1)) with
+    // scale = mean(|W|). round() sends |W| ≥ 0.5·scale to ±1 and everything
+    // smaller to 0. (The earlier cutoff used the full `scale`, which zeroed
+    // ~twice as many weights as b1.58 prescribes — a much sparser, lossier
+    // export. `scale` is still the reconstruction magnitude.)
+    let cutoff = 0.5 * scale;
+    let threshold = Tensor::full(cutoff, w_f32.shape(), w_f32.device())?;
     let pos_mask = w_f32.ge(&threshold)?;
     let neg_mask = w_f32.le(&threshold.neg()?)?;
     let pos_f = pos_mask.to_dtype(DType::F32)?;
@@ -140,8 +145,8 @@ mod tests {
     #[test]
     fn quantize_dequantize_2d_roundtrip() {
         let dev = Device::Cpu;
-        // mean(|w|) = (2+2+0+0.5+0.5+3)/6 = 1.3333 -> threshold.
-        // ge:  2.0, 3.0 -> +1 ; le -thr: -2.0 -> -1 ; rest -> 0.
+        // scale = mean(|w|) = (2+2+0+0.5+0.5+3)/6 = 1.3333; b1.58 cutoff = 0.5·scale
+        // = 0.667. |w| >= 0.667 -> ±1 (2.0, 3.0 -> +1; -2.0 -> -1); 0.5/-0.5/0 -> 0.
         let w = Tensor::from_vec(
             vec![2.0f32, -2.0, 0.0, 0.5, -0.5, 3.0],
             (2, 3),

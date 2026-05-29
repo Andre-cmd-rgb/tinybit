@@ -575,7 +575,10 @@ extern "C" __global__ void wkv_backward_f32(
     const long sbase = (long)(b*H + h) * (NC + C) * DH * DH; // this block's scratch
     float* ckpt = scratch + sbase;                          // [NC][DH][DH]
     float* cbuf = scratch + sbase + (long)NC*DH*DH;          // [C][DH][DH]
-    __shared__ float sv[DH], sdy[DH], sr[DH], sk[DH], sdv[DH];
+    __shared__ float sv[DH], sdy[DH], sr[DH], sk[DH];
+    // dv reduction scratch: row i writes contrib[i][*], then each thread sums one
+    // column. Padded to DH+1 so the column reads hit distinct banks (no conflicts).
+    __shared__ float contrib[DH][DH + 1];
 
     // Sub-pass A: forward, emit dr, checkpoint chunk-entry states.
     {
@@ -643,16 +646,23 @@ extern "C" __global__ void wkv_backward_f32(
             sdy[i] = dy[blk*DH + i];
             sk[i]  = base[DH + i];
             sv[i]  = base[2*DH + i];
-            sdv[i] = 0.f;
             __syncthreads();
             const float ri = sr[i];
+            const float ki = sk[i];
             for (int j = 0; j < DH; j++) dsrow[j] = ri*sdy[j] + wi*dsrow[j];
             float dki = 0.f;
             for (int j = 0; j < DH; j++) dki += dsrow[j]*sv[j];
             drkv[blk*3*DH + DH + i] = dki;     // dk slot
-            for (int j = 0; j < DH; j++) atomicAdd(&sdv[j], sk[i]*dsrow[j]);
+            // dv_t[j] = sum_i dS[i][j]*k[i]. Each thread i writes its row of
+            // contributions; after the barrier thread i sums column i. This
+            // replaces a per-step storm of DH*DH shared atomicAdds (all DH threads
+            // contending on the same DH addresses) with conflict-free shared
+            // traffic — the dominant cost of the old backward.
+            for (int j = 0; j < DH; j++) contrib[i][j] = ki * dsrow[j];
             __syncthreads();
-            drkv[blk*3*DH + 2*DH + i] = sdv[i]; // dv slot
+            float dvi = 0.f;
+            for (int row = 0; row < DH; row++) dvi += contrib[row][i];
+            drkv[blk*3*DH + 2*DH + i] = dvi;   // dv slot
             float* cb = cbuf + (long)m*DH*DH + (long)i*DH;  // S_{t-1} row i
             for (int j = 0; j < DH; j++) dwi += dsrow[j]*cb[j];
             __syncthreads();
@@ -956,7 +966,21 @@ mod tests {
         use candle_core::{Device, Var, D};
         use std::time::Instant;
         let dev = Device::new_cuda(0).unwrap();
-        let (b, t, h, dh) = (4usize, 512usize, 6usize, 64usize);
+        // Shape overridable to match a real training microbatch: TINYBIT_BENCH_B /
+        // TINYBIT_BENCH_T (h, dh fixed at the micro preset). The loop path retains
+        // O(T·dh²) state, so it may OOM a small GPU at large b — set
+        // TINYBIT_BENCH_SKIP_LOOP=1 to time only the fused path.
+        let env_usize = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let (b, t, h, dh) = (
+            env_usize("TINYBIT_BENCH_B", 4),
+            env_usize("TINYBIT_BENCH_T", 512),
+            6usize,
+            64usize,
+        );
+        let skip_loop =
+            std::env::var("TINYBIT_BENCH_SKIP_LOOP").map(|v| v == "1").unwrap_or(false);
         let n = b * t * h * dh;
         let mut rng = Lcg(0xbeef_0bad_f00d_1234);
         let mut mk = || -> Vec<f32> { (0..n).map(|_| rng.next_f32()).collect() };
@@ -1004,7 +1028,7 @@ mod tests {
 
         let iters = 20;
         let warmup = 5;
-        let bench = |fused: bool| -> f64 {
+        let bench = |fused: bool, bwd: bool| -> f64 {
             let mut total = 0f64;
             for it in 0..(iters + warmup) {
                 let (r, k, v, w) = make();
@@ -1016,7 +1040,9 @@ mod tests {
                     loop_scan(r.as_tensor(), k.as_tensor(), v.as_tensor(), w.as_tensor())
                 };
                 let loss = y.sum_all().unwrap();
-                let _g = loss.backward().unwrap();
+                if bwd {
+                    let _g = loss.backward().unwrap();
+                }
                 // Force completion: pull a scalar to the host (syncs the stream).
                 let _ = loss.to_scalar::<f32>().unwrap();
                 if it >= warmup {
@@ -1026,16 +1052,36 @@ mod tests {
             total / iters as f64
         };
 
-        let t_loop = bench(false);
-        let t_fused = bench(true);
+        let t_fused = bench(true, true);
+        let t_fused_fwd = bench(true, false);
         let toks = (b * t) as f64;
+        if skip_loop {
+            eprintln!(
+                "WKV fwd+bwd @ b={b} t={t} h={h} dh={dh}: fused={:.2} ms ({:.0} tok/s, one layer)",
+                t_fused * 1e3,
+                toks / t_fused,
+            );
+        } else {
+            let t_loop = bench(false, true);
+            eprintln!(
+                "WKV fwd+bwd @ b={b} t={t} h={h} dh={dh}: loop={:.2} ms, fused={:.2} ms, speedup={:.2}x ({:.0} vs {:.0} tok/s, one layer)",
+                t_loop * 1e3,
+                t_fused * 1e3,
+                t_loop / t_fused,
+                toks / t_fused,
+                toks / t_loop,
+            );
+        }
+        // Forward and backward timed separately: the backward is the costly half,
+        // so its kernel is where occupancy/atomics improvements matter.
         eprintln!(
-            "WKV fwd+bwd @ b={b} t={t} h={h} dh={dh}: loop={:.2} ms, fused={:.2} ms, speedup={:.2}x ({:.0} vs {:.0} tok/s, one layer)",
-            t_loop * 1e3,
-            t_fused * 1e3,
-            t_loop / t_fused,
-            toks / t_fused,
-            toks / t_loop,
+            "WKV split: fused fwd-only={:.2} ms, fused bwd={:.2} ms (fwd {:.0}%, bwd {:.0}%); \
+             projected 16-layer fwd+bwd = {:.0} ms",
+            t_fused_fwd * 1e3,
+            (t_fused - t_fused_fwd) * 1e3,
+            100.0 * t_fused_fwd / t_fused,
+            100.0 * (t_fused - t_fused_fwd) / t_fused,
+            t_fused * 16.0 * 1e3,
         );
     }
 }

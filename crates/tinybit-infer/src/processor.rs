@@ -50,14 +50,23 @@ impl<'a> ToolProcessor<'a> {
         let streaming = on_token.is_some();
         let holdback = STOP_STRING_USER_TURN.chars().count();
 
+        // Prefill every prompt token EXCEPT the last; the last token's forward
+        // happens in the decode loop and produces the first prediction. Feeding
+        // it in both phases would apply it to the recurrent state twice, so the
+        // first generated token would be conditioned on a duplicated final
+        // prompt token.
+        let (prefill_ids, last_id) = match encoded_prompt.split_last() {
+            Some((last, head)) => (head, *last),
+            None => (&[][..], eng.tokenizer.bos_token_id),
+        };
         let t_prefill = Instant::now();
-        for &id in encoded_prompt {
+        for &id in prefill_ids {
             let tid = Tensor::from_vec(vec![id], (1, 1), &eng.device)?.to_dtype(DType::U32)?;
             eng.model.forward_step(&tid, state)?;
         }
         stats.prefill_secs = t_prefill.elapsed().as_secs_f64();
 
-        let mut prev_id = *encoded_prompt.last().unwrap_or(&eng.tokenizer.bos_token_id);
+        let mut prev_id = last_id;
 
         let t_decode = Instant::now();
         for _round in 0..self.max_rounds {

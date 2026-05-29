@@ -85,13 +85,20 @@ impl InferenceEngine {
         let ids = self.tokenizer.encode(prompt, false)?;
         let mut generated: Vec<u32> = Vec::new();
 
-        for &id in &ids {
+        // Prefill all but the last token; the last token's forward in the decode
+        // loop yields the first prediction. (Feeding it in both phases would apply
+        // it to the recurrent state twice — see ToolProcessor::run.)
+        let (prefill_ids, last_id) = match ids.split_last() {
+            Some((last, head)) => (head, *last),
+            None => (&[][..], self.tokenizer.bos_token_id),
+        };
+        for &id in prefill_ids {
             let tid = Tensor::from_vec(vec![id], (1, 1), &self.device)?.to_dtype(DType::U32)?;
             self.model.forward_step(&tid, state)?;
         }
         let mut history: Vec<u32> = ids.clone();
 
-        let mut prev_id = *ids.last().unwrap_or(&self.tokenizer.bos_token_id);
+        let mut prev_id = last_id;
         for _ in 0..self.params.max_new_tokens {
             let tid = Tensor::from_vec(vec![prev_id], (1, 1), &self.device)?.to_dtype(DType::U32)?;
             let logits = self.model.forward_step(&tid, state)?;

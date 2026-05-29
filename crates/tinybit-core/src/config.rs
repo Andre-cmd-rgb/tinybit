@@ -11,14 +11,24 @@ pub struct ModelConfig {
     pub head_dim:    usize,
 
     // Quantization
+    /// Export the FFN/projection matrices as ternary weights (see `quantize.rs`).
+    /// Consumed by the `convert` command's export path, not the training forward.
     pub ternary_ffn: bool,
+    /// Reserved: int8 time-mix quantization. Not applied by the current forward;
+    /// kept so existing configs/checkpoints deserialize unchanged.
     pub int8_time:   bool,
 
     // Training
     pub max_seq_len: usize,
+    /// Reserved: dropout probability. The forward pass applies NO dropout — at
+    /// ~1 epoch over the data (data-limited, not overfitting-limited) it is
+    /// unnecessary. Kept for config/checkpoint compatibility; any nonzero value
+    /// is currently a no-op.
     pub dropout:     f64,
 
-    // Speculative decoding heads
+    /// Number of extra speculative-decoding LM heads to allocate. The heads are
+    /// built and counted in `param_count`, but the training loss does not yet
+    /// supervise them, so leave at 0 unless experimenting. (See `forward_train`.)
     pub spec_heads:  usize,
 }
 

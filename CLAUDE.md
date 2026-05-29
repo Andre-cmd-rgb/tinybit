@@ -82,16 +82,23 @@ cargo test --workspace
     The backward is chunk-checkpointed (chunk C≈√T): it stores only per-chunk entry
     states and recomputes within-chunk states, so its scratch is O(B·H·√T·dh²)
     (~28 MB at the L4 micro shape) instead of O(B·H·T·dh²), freed after each layer's
-    backward. The forward retains only O(T·dh) autograd state per layer (vs the
-    loop's O(T·dh²)). Validated on GPU against the gradient-checked CPU references
-    (parity ~1e-7 incl. T=512; CPU-vs-loop 4.5e-8) → numerically equivalent, so
-    checkpoints are compatible (resume across the switch, don't restart). Tests:
+    backward. The backward's `dv` cross-thread reduction (sum over rows) uses a
+    padded shared buffer + column sum — NOT `atomicAdd` (see the profiling note in
+    "Common mistakes"; the atomic form was ~9x slower). The forward retains only
+    O(T·dh) autograd state per layer (vs the loop's O(T·dh²)). Validated on GPU
+    against the gradient-checked CPU references (parity ~1e-7 incl. T=512; CPU-vs-loop
+    4.5e-8) → numerically equivalent, so checkpoints are compatible (resume across the
+    switch, don't restart). Tests:
     `cargo test -p tinybit-core --features cuda -- --test-threads=1` (cuda_* parity)
-    and `-- --ignored --nocapture bench` (speedup).
+    and `-- --ignored --nocapture bench` (speedup; shape overridable via
+    `TINYBIT_BENCH_B`/`TINYBIT_BENCH_T`/`TINYBIT_BENCH_SKIP_LOOP`).
 
-    Speedup: measured ~3.9x on a full micro step (16L, d384) and ~3.65x on the
-    isolated WKV fwd+bwd, on an RTX A2000 (debug build). Expect the same order on
-    the L4; confirm from the live run's tok/s.
+    Speedup (RTX A2000, debug, after the 2026-05-29 backward fix): fused WKV
+    fwd+bwd is ~25x the candle loop and ~8x the pre-fix fused kernel; a full micro
+    step (16L, d384) is ~6x the loop / ~3x the pre-fix kernel. The forward is ~2%
+    of the scan; the backward is the rest. At the real micro batch (b=11, t=512)
+    one layer's fwd+bwd is ~33 ms (≈0.5 s across 16 layers), down from ~4.4 s.
+    Expect a similar large drop on the L4; confirm from the live run's tok/s.
 
     VRAM budget: with the fused kernel the old "micro fits only at batch_size=2,
     max_seq_len=512 or it OOMs" limit (caused by the loop's O(T·dh²)×layers retained
@@ -137,7 +144,16 @@ cargo test --workspace
   it retains every microbatch graph and defeats the VRAM-bounded accumulation.
 - To see where a step's wall time goes, set `TINYBIT_PROFILE=1`: the trainer
   logs forward/backward/optimizer time per step (device synced at phase
-  boundaries). The micro step is heavily GPU-underutilized (<1% MFU); the prime
-  suspect is the fused WKV scan's low occupancy (`wkv.rs` launches only
-  `B*H`=66 blocks of `dh`=64 threads). Any WKV kernel change must keep
-  `w = exp(-exp(td))` and pass the `cuda_*` parity tests at T=512.
+  boundaries). The fused WKV scan's FORWARD is already cheap (~2% of the scan);
+  the cost was the BACKWARD. Until 2026-05-29 the backward reduced `dv` with a
+  per-timestep storm of shared-memory `atomicAdd`s — all `dh` threads contending
+  on the same `dh` addresses — which was ~98% of the scan's fwd+bwd wall time.
+  It now writes each thread's row into a padded `contrib[dh][dh+1]` shared buffer
+  and sums down columns (conflict-free, no atomics): the backward dropped ~9x
+  (110→12 ms at b4×t512 on an A2000) and the whole scan ~8x. Do NOT reintroduce
+  the per-step `atomicAdd` reduction. Any WKV kernel change must keep
+  `w = exp(-exp(td))` and pass the `cuda_*` parity tests at T=512
+  (`cargo test -p tinybit-core --features cuda -- --test-threads=1 cuda_`).
+  The kernel launches `B*H` blocks of `dh` threads; occupancy is fine at the
+  micro batch (b=11 → 66 blocks) — a chunked parallel scan over time would add
+  more, but is unneeded now that the atomic storm is gone.
