@@ -287,18 +287,34 @@ fi
 test -x "$BIN"
 
 # ---------- prepare_data ------------------------------------------------------
+# Data is cached per-run in the bucket so a relaunch (SPOT preemption, or a code
+# redeploy that resumes from a checkpoint) does NOT re-tokenize the full token
+# budget (~hours for 1.5B). Resolution order: local disk → bucket cache →
+# fresh prep (which then populates the cache). FORCE_DATA=1 forces a fresh prep.
 log_stage prepare_data
 mkdir -p data
 if [ -s data/train.bin ] && [ -s data/val.bin ] && [ "${FORCE_DATA:-0}" != "1" ]; then
   log "[info] data/train.bin and data/val.bin already present — skipping (FORCE_DATA=1 to redo)"
 else
-  python3 -m pip install --break-system-packages --quiet datasets tokenizers tqdm \
-    || python3 -m pip install --user --quiet datasets tokenizers tqdm
-  if [ -n "$HF_TOKEN_VAL" ]; then
-    export HF_TOKEN="$HF_TOKEN_VAL"
+  if [ "${FORCE_DATA:-0}" != "1" ] && gs ls "$GCS_RUN_PREFIX/data/train.bin" >/dev/null 2>&1; then
+    log "Restoring cached data from $GCS_RUN_PREFIX/data/ (skips re-tokenization)…"
+    gs -q cp "$GCS_RUN_PREFIX/data/train.bin" data/train.bin || true
+    gs -q cp "$GCS_RUN_PREFIX/data/val.bin"   data/val.bin   || true
   fi
-  TOTAL_TOKENS="$DATA_TOKENS" MIN_TOKENS="$MIN_TOKENS" \
-    bash ./scripts/prepare_data.sh data/
+  if [ ! -s data/train.bin ] || [ ! -s data/val.bin ]; then
+    log "Preparing data from scratch (no usable cache)…"
+    python3 -m pip install --break-system-packages --quiet datasets tokenizers tqdm \
+      || python3 -m pip install --user --quiet datasets tokenizers tqdm
+    if [ -n "$HF_TOKEN_VAL" ]; then
+      export HF_TOKEN="$HF_TOKEN_VAL"
+    fi
+    TOTAL_TOKENS="$DATA_TOKENS" MIN_TOKENS="$MIN_TOKENS" \
+      bash ./scripts/prepare_data.sh data/
+    # Cache for future relaunches of this run (best-effort; never fatal).
+    log "Caching prepared data to $GCS_RUN_PREFIX/data/ …"
+    gs -q cp data/train.bin "$GCS_RUN_PREFIX/data/train.bin" || true
+    gs -q cp data/val.bin   "$GCS_RUN_PREFIX/data/val.bin"   || true
+  fi
 fi
 test -s data/train.bin
 test -s data/val.bin
