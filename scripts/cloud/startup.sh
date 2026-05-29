@@ -278,12 +278,12 @@ if [ "${FORCE_REBUILD:-0}" = "1" ]; then
   rm -rf target/release/build/cudarc-* target/release/deps/libcudarc* \
          target/release/build/candle-* target/release/deps/libcandle* || true
 fi
-if [ ! -x "$BIN" ]; then
-  RUSTFLAGS='-C target-cpu=native' \
-    cargo build --release -p tinybit-cli --features cuda
-else
-  log "[info] $BIN already built — skipping cargo build (set FORCE_REBUILD=1 to force)"
-fi
+# Always build: cargo is incremental, so a fresh VM does a full build (~20 min)
+# but a REUSED/rebooted VM with a warm target/ only recompiles changed crates
+# (~minutes) — what a code redeploy needs. (The old "skip if binary exists" guard
+# silently ran STALE code after redeploying onto an existing disk.)
+RUSTFLAGS='-C target-cpu=native' \
+  cargo build --release -p tinybit-cli --features cuda
 test -x "$BIN"
 
 # ---------- prepare_data ------------------------------------------------------
