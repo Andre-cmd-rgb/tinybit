@@ -236,7 +236,15 @@ mod step_bench {
         let dev = Device::new_cuda(0).unwrap();
         let cfg = ModelConfig::micro();
         let vocab = cfg.vocab_size as u32;
-        let (b, t) = (1usize, 256usize);
+        // Shape is overridable so the bench can be pointed at the real training
+        // microbatch on bigger GPUs: TINYBIT_BENCH_B / TINYBIT_BENCH_T. The loop
+        // path retains O(T·dh²)·layers and OOMs a small GPU at large shapes, so
+        // TINYBIT_BENCH_SKIP_LOOP=1 times only the fused path.
+        let env_usize = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let (b, t) = (env_usize("TINYBIT_BENCH_B", 1), env_usize("TINYBIT_BENCH_T", 256));
+        let skip_loop = std::env::var("TINYBIT_BENCH_SKIP_LOOP").map(|v| v == "1").unwrap_or(false);
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
         let model = TinyBit::new(cfg, vb).unwrap();
@@ -264,10 +272,19 @@ mod step_bench {
             }
             total / iters as f64
         };
-        let t_loop = bench(false);
         let t_fused = bench(true);
-        std::env::remove_var("TINYBIT_FUSED_WKV");
         let toks = (b * t) as f64;
+        if skip_loop {
+            std::env::remove_var("TINYBIT_FUSED_WKV");
+            eprintln!(
+                "FULL micro step (16L d384) b={b} t={t}: fused={:.0} ms ({:.0} tok/s)",
+                t_fused * 1e3,
+                toks / t_fused,
+            );
+            return;
+        }
+        let t_loop = bench(false);
+        std::env::remove_var("TINYBIT_FUSED_WKV");
         eprintln!(
             "FULL micro step (16L d384) b={b} t={t}: loop={:.0} ms, fused={:.0} ms, \
              speedup={:.2}x ({:.0} vs {:.0} tok/s)",

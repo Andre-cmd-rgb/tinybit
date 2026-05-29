@@ -11,18 +11,32 @@ decision 16); the unfused candle loop is the CPU / `TINYBIT_FUSED_WKV=off` path.
 Pick the training config that matches the model preset. Each is sized so the
 L4 is well-utilized but won't OOM.
 
-| Model preset | Train config                  | Time / Cost                          |
-|--------------|-------------------------------|--------------------------------------|
-| `nano`       | `configs/train-nano-l4.toml`  | unverified post-fix (faster than micro) |
-| `micro`      | `configs/train-micro-l4.toml` | ~4.4 days, ~$75-85 on-demand (measured) |
+| Model preset | Train config                  | Time / Cost (25k steps)                          |
+|--------------|-------------------------------|--------------------------------------------------|
+| `nano`       | `configs/train-nano-l4.toml`  | faster than micro (unmeasured post-fix)          |
+| `micro`      | `configs/train-micro-l4.toml` | **~1.5–2.2 days projected, ~$25–40 on-demand** (was ~4.4 days) |
 
-> **Throughput note (measured 2026-05-28, bf16 + batch 11):** the `micro`
-> run holds **~15.2 s/step** on L4 (**~2.23k tok/s**) with the fused WKV kernel
-> and bf16 mixed precision, so 25k steps takes ~4.4 days. Earlier docs quoted
-> ~23 s/step (pre-bf16, batch 6) and, before that, ~15-22 h — that oldest figure
-> was the *frozen-gradient* era, when a LayerNorm backward bug pruned the graph
-> and backward did almost no work. SPOT halves the $/hr but a multi-day run will
-> be preempted repeatedly; on-demand is the realistic baseline.
+> **Throughput note.** The fused WKV scan's BACKWARD dominated the training step.
+> A **2026-05-29 fix** (replacing a per-timestep shared-memory `atomicAdd` storm
+> in the `dv` reduction with a conflict-free column reduction — see CLAUDE.md
+> design decision 16) made the backward **~9× faster** with the model numerically
+> unchanged (all `cuda_*` parity tests pass at T=512). Measured end-to-end on a
+> local RTX A2000, a full micro step is **~2–3× faster** across shapes; the WKV
+> contribution at the real batch (b=11, t=512) fell from ~4.4 s to ~0.5 s per step
+> (16 layers).
+>
+> | Era | s/step (L4, b11 bf16) | 25k steps | Note |
+> |-----|----|----|----|
+> | frozen-gradient (pre-2026-05-28) | — | ~15–22 h | LayerNorm backward bug pruned the graph; "fast" but not learning |
+> | post-LayerNorm-fix, pre-bf16 | ~23 | ~6.7 d | batch 6 |
+> | bf16 + batch 11 (2026-05-28, measured) | **15.2** | ~4.4 d | 2.23k tok/s |
+> | + WKV backward fix (2026-05-29, projected) | **~5–7.5** | **~1.5–2.2 d** | confirm from live tok/s |
+>
+> The last row is **projected from local A2000 measurements**, not measured on L4 —
+> update it once a live run reports its tok/s. Because the model is unchanged, an
+> in-progress run can be **resumed** from its latest checkpoint with the new code
+> to pick up the speedup. SPOT halves the $/hr but a multi-day run is preempted
+> repeatedly; on-demand is the realistic baseline.
 
 `small` (258M) and `base` (501M) are kept as architectural presets for
 inference of pre-trained checkpoints but do not fit on a single L4 for
@@ -133,17 +147,22 @@ B=8 is the OOM cliff" rationale described candle's *unfused* sequential scan,
 which retained the full `O(T·dh²)` per-layer state graph; that path is now CPU /
 `TINYBIT_FUSED_WKV=off` only.) See CLAUDE.md design decision 16.
 
-If you're tighter on time, fewer steps trade quality for wall-clock. At the
-measured ~15.2 s/step for `micro`, total time ≈ `total_steps × 15.2 s`:
+If you're tighter on time, fewer steps trade quality for wall-clock. Wall time ≈
+`total_steps × s/step`. The post-fix column uses ~6 s/step (mid of the projected
+~5–7.5 s/step — confirm from your live run); the pre-fix column is the measured
+15.2 s/step for reference:
 
-| total_steps | Model | DATA_TOKENS | ~Wall time | Expected output                    |
-|-------------|-------|-------------|------------|------------------------------------|
-| 6000        | micro | 200M        | ~25 h      | Coherent words, weak structure     |
-| 15000       | micro | 1B          | ~63 h      | Sentences, weak QA, some facts     |
-| 25000       | micro | 1.5B        | ~4.4 days  | Paragraphs, QA, basic instructions |
-| 50000       | micro | 1.5B        | ~8.8 days  | Better instruction following       |
+| total_steps | Model | DATA_TOKENS | Pre-fix ~time | **Post-fix ~time (projected)** | Expected output                    |
+|-------------|-------|-------------|---------------|--------------------------------|------------------------------------|
+| 6000        | micro | 200M        | ~25 h         | **~10 h**                      | Coherent words, weak structure     |
+| 15000       | micro | 1B          | ~63 h         | **~25 h**                      | Sentences, weak QA, some facts     |
+| 25000       | micro | 1.5B        | ~4.4 days     | **~1.7 days**                  | Paragraphs, QA, basic instructions |
+| 50000       | micro | 1.5B        | ~8.8 days     | **~3.5 days**                  | Better instruction following       |
 
-(`nano` is smaller/faster per step but its post-fix throughput is unmeasured.)
+Because the 3× step speedup is "free" (same model), a good use of it is to spend
+the saved time on **more tokens**: e.g. 50k steps (~3.5 days) is now cheaper than
+the old 25k run (~4.4 days) and trains a meaningfully stronger model (~34 tok/param
+vs ~17). (`nano` is smaller/faster per step but its post-fix throughput is unmeasured.)
 
 Override per-run with env vars:
 

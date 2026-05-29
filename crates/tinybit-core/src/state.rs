@@ -40,22 +40,13 @@ impl InferenceState {
 
     /// Save state to disk (for session persistence).
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        let mut tensors: std::collections::HashMap<String, &Tensor> =
+        let mut map: std::collections::HashMap<String, candle_core::Tensor> =
             std::collections::HashMap::new();
         for (i, layer) in self.layers.iter().enumerate() {
-            tensors.insert(format!("layer_{i}_wkv"), &layer.wkv_state);
-            tensors.insert(format!("layer_{i}_time"), &layer.time_shift);
-            tensors.insert(format!("layer_{i}_ffn"), &layer.ffn_shift);
+            map.insert(format!("layer_{i}_wkv"), layer.wkv_state.clone());
+            map.insert(format!("layer_{i}_time"), layer.time_shift.clone());
+            map.insert(format!("layer_{i}_ffn"), layer.ffn_shift.clone());
         }
-        // Collect owned data for safetensors
-        let mut owned: Vec<(String, candle_core::Tensor)> = Vec::new();
-        for (i, layer) in self.layers.iter().enumerate() {
-            owned.push((format!("layer_{i}_wkv"), layer.wkv_state.clone()));
-            owned.push((format!("layer_{i}_time"), layer.time_shift.clone()));
-            owned.push((format!("layer_{i}_ffn"), layer.ffn_shift.clone()));
-        }
-        let map: std::collections::HashMap<String, candle_core::Tensor> =
-            owned.into_iter().collect();
         candle_core::safetensors::save(&map, path)?;
         Ok(())
     }
