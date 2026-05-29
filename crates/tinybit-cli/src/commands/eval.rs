@@ -65,6 +65,12 @@ pub struct EvalArgs {
     /// Max tokens to generate per sanity prompt.
     #[arg(long, default_value_t = 64)]
     pub gen_tokens: usize,
+
+    /// Raw greedy completion from this exact text (NO chat template). The right
+    /// tool for inspecting a base/pretrained model — it continues the text
+    /// instead of answering a chat turn. Replaces the sanity prompts when set.
+    #[arg(long)]
+    pub raw: Option<String>,
 }
 
 pub fn run(args: EvalArgs) -> anyhow::Result<()> {
@@ -146,6 +152,21 @@ pub fn run(args: EvalArgs) -> anyhow::Result<()> {
                 random.exp()
             );
         }
+    }
+
+    // ---- raw completion (base-model inspection) -----------------------------
+    if let Some(prompt) = &args.raw {
+        println!("\n{}", bold("[raw completion]"));
+        println!("  greedy, no chat template, up to {} tokens\n", args.gen_tokens);
+        engine.params.temperature = 0.0;
+        engine.params.max_new_tokens = args.gen_tokens;
+        let mut state = tinybit_core::state::InferenceState::zeros(&engine.model.config, &device)?;
+        let out = engine.generate(prompt, &mut state, None)?;
+        let cont: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        println!("  prompt: {prompt}");
+        println!("  ->      {prompt}{}", if cont.is_empty() { "  (no continuation)".into() } else { format!(" {cont}") });
+        println!("\n{}", dimmed("Note: small models are small — see caveat above."));
+        return Ok(());
     }
 
     // ---- generation sanity --------------------------------------------------
