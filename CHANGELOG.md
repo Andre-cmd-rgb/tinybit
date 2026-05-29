@@ -33,6 +33,16 @@ small, fast, tool-aware, measurable, and honest about its limits.
 - Documentation rewritten to be local-first and honest: new README, consolidated
   TRAINING.md (absorbed the old RUN.md), explicit **Known limitations**.
 
+### Performance
+- **Single-GEMM linear projections.** `BitLinear`, `linear_autocast`, and the
+  LM head no longer use candle's `broadcast_left` + batched matmul (one small
+  GEMM per batch element, weight replicated). They flatten `(B,T,D)→(B*T,D)` and
+  do one large GEMM (`linear_flat`). Numerically identical (proven by a tight
+  deterministic unit test; checkpoints unchanged). Measured on CPU at the micro
+  shape: **1.5–1.7× per projection**, **1.30× on a full micro fwd+bwd step**
+  (21.8 s → 16.7 s, b4×t256). The same structure helps on CUDA (one big cuBLAS
+  call vs B small ones); confirm the GPU magnitude on an L4 with `TINYBIT_PROFILE=1`.
+
 ### Removed
 - **The HTTP server (`tinybit serve`) and its OpenAI-compatible API.** tinybit
   V1.0 is local CLI inference first; `axum`/`tower`/`tower-http` dependencies are

@@ -135,6 +135,16 @@ cargo test --workspace
     is the measure-don't-guess quality gate. Don't reintroduce a server without
     a deliberate decision — it was removed to keep the project local-first.
 
+20. Linear projections run as a SINGLE GEMM over flattened batch×time rows
+    (`linear_flat` in model/bitlinear.rs), used by BitLinear, `linear_autocast`,
+    and the LM head. This replaced candle's `broadcast_left` + batched matmul (B
+    small GEMMs with the weight replicated). It is numerically EXACT (matmul rows
+    are independent) — pinned by a deterministic unit test in bitlinear.rs and by
+    the cuda_* / grad_flow parity tests — so checkpoints are unchanged. Do NOT
+    revert to the broadcast/bmm form. Measured: 1.5–1.7× per projection, 1.30× on
+    a full micro CPU step. Single-token inference (2D input) passes straight
+    through unchanged.
+
 ## Common mistakes to avoid
 
 - Do NOT use .unwrap() in library code — propagate with anyhow::Result + ?

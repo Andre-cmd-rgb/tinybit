@@ -39,12 +39,10 @@ impl EmbeddingHead {
         let normed = self.ln_out.forward(hidden)?;
         let cdt = normed.dtype();
         let w = self.embed.embeddings().to_dtype(cdt)?; // (vocab_size, d_model)
-        // Expand weight for batched matmul — same trick as candle's Linear::forward
-        let w_exp = match normed.dims() {
-            &[bsize, _, _] => w.broadcast_left(bsize)?, // (bsize, vocab_size, d_model)
-            _ => w,
-        };
-        let logits = normed.matmul(&w_exp.t()?)?.to_dtype(DType::F32)?;
+        // Single GEMM over the flattened (B*T, d_model) rows rather than a
+        // broadcast batched matmul — this is the largest matmul in the model
+        // (d_model × vocab_size), so it benefits most. See `linear_flat`.
+        let logits = crate::model::bitlinear::linear_flat(&normed, &w.t()?)?.to_dtype(DType::F32)?;
         // Divide by sqrt(d_model) to counteract the N(0,1) embedding init scale.
         // Without this, logit std = sqrt(d_model) * std_embed ≈ 16, giving CE ≈ 87 instead of ~ln(V).
         let scale = 1.0 / (self.d_model as f64).sqrt();

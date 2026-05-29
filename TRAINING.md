@@ -257,10 +257,19 @@ historical slowness was **stalls, not FLOPs**. Two fixes removed them:
    the backward **~9×** and the whole scan ~8× — numerically unchanged (the
    `cuda_*` parity tests pass at T=512), so checkpoints stay compatible. This is
    the 15.2 → 6.5 s/step (2.33×) win.
+3. **Single-GEMM linear projections.** Every projection (the 6 time-mix + 3
+   channel-mix matmuls per layer, plus the LM head) used candle's `broadcast_left`
+   + batched matmul: `B` small GEMMs with the weight replicated across the batch.
+   `linear_flat` now flattens `(B,T,D)→(B*T,D)` and runs one large GEMM — one big
+   cuBLAS call instead of `B` small ones, and no weight broadcast. Numerically
+   exact (deterministic unit test pins it; checkpoints unchanged). **Measured on
+   CPU: 1.5–1.7× per projection, 1.30× on a full micro fwd+bwd step.** The CUDA
+   magnitude is unmeasured here — the single large GEMM (especially the
+   `d_model × 32008` head) should help, but confirm on an L4 with `TINYBIT_PROFILE=1`.
 
 A chunked-parallel scan could raise occupancy further but is unmotivated now that
-the scan is no longer the bottleneck. See `CLAUDE.md` design decision 16 for the
-kernel details and regression guards.
+the scan is no longer the bottleneck. See `CLAUDE.md` design decisions 16 and 20
+for the kernel/matmul details and regression guards.
 
 ---
 
