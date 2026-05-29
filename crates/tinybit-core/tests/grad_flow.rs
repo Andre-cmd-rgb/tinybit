@@ -62,11 +62,11 @@ fn our_layernorm_is_differentiable() {
     let data = varmap.data().lock().unwrap();
 
     let xg = grads.get(x.as_tensor()).expect("LayerNorm dropped gradient to its input");
-    assert!(norm(&xg) > 0.0, "LayerNorm input gradient is zero");
+    assert!(norm(xg) > 0.0, "LayerNorm input gradient is zero");
     for p in ["ln.weight", "ln.bias"] {
         let v = data.get(p).unwrap();
         let g = grads.get(v.as_tensor()).unwrap_or_else(|| panic!("no gradient for {p}"));
-        assert!(norm(&g) > 0.0, "{p} gradient is zero");
+        assert!(norm(g) > 0.0, "{p} gradient is zero");
     }
 }
 
@@ -97,7 +97,7 @@ fn all_params_receive_finite_gradient() {
         match grads.get(v.as_tensor()) {
             None => missing.push(format!("{name}: NONE")),
             Some(g) => {
-                let n = norm(&g);
+                let n = norm(g);
                 if !n.is_finite() || n == 0.0 {
                     missing.push(format!("{name}: {n}"));
                 }
@@ -212,7 +212,7 @@ fn diagnose() {
     for key in ["embed.embed.weight", "embed.ln_out.weight", "embed.ln_out.bias"] {
         if let Some(v) = data.get(key) {
             let g = grads.get(v.as_tensor());
-            eprintln!("{key:32} gnorm={}", g.map(|g| format!("{:.4e}", norm(&g))).unwrap_or_else(|| "NONE".into()));
+            eprintln!("{key:32} gnorm={}", g.map(|g| format!("{:.4e}", norm(g))).unwrap_or_else(|| "NONE".into()));
         }
     }
     eprintln!("\n{:>3}  {:>14}  {:>14}  {:>14}", "blk", "ln1.w", "tmix.w_o", "cmix.w_v");
@@ -220,7 +220,7 @@ fn diagnose() {
         let gn = |suffix: &str| -> String {
             let key = format!("block_{i}.{suffix}");
             data.get(&key)
-                .and_then(|v| grads.get(v.as_tensor()).map(|g| norm(&g)))
+                .and_then(|v| grads.get(v.as_tensor()).map(norm))
                 .map(|n| format!("{:.4e}", n))
                 .unwrap_or_else(|| "NONE".into())
         };

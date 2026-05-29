@@ -193,7 +193,7 @@ impl TimeMix {
 
         let y = self.group_norm(&y.to_dtype(x.dtype())?)?;
         let out = y.broadcast_mul(&g)?;
-        Ok(linear_autocast(&self.w_o, &out)?)
+        linear_autocast(&self.w_o, &out)
     }
 
     /// Inference step: (B, D) → (B, D), reads/writes LayerState

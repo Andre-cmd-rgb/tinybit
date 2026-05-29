@@ -127,3 +127,17 @@ cargo test --workspace
 - WKV time-decay is `w = exp(-exp(time_decay))` (w ∈ (0,1)), NOT
   `softplus(-exp(td))`. The softplus form caps state retention at ln2≈0.69,
   limiting memory to ~2 tokens. Do not "simplify" it back.
+- Do NOT reintroduce a per-parameter (or per-microbatch) `.to_scalar()` in the
+  training loop. `global_grad_norm`/`clip_grad_norm` accumulate each param's
+  f32 sum-of-squares on-device and pull the whole vector to the host in ONE
+  sync; the per-microbatch loss is accumulated detached on-device and synced
+  once per step. Each host read forces a CUDA stream sync — doing one per param
+  (~150-200/step) serialized the GPU behind launch+sync latency. Keep reads at
+  one-per-step. The per-microbatch loss accumulator MUST stay `.detach()`ed or
+  it retains every microbatch graph and defeats the VRAM-bounded accumulation.
+- To see where a step's wall time goes, set `TINYBIT_PROFILE=1`: the trainer
+  logs forward/backward/optimizer time per step (device synced at phase
+  boundaries). The micro step is heavily GPU-underutilized (<1% MFU); the prime
+  suspect is the fused WKV scan's low occupancy (`wkv.rs` launches only
+  `B*H`=66 blocks of `dh`=64 threads). Any WKV kernel change must keep
+  `w = exp(-exp(td))` and pass the `cuda_*` parity tests at T=512.

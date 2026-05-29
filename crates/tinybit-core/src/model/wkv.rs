@@ -40,6 +40,7 @@ pub fn fused_wkv_enabled(device: &candle_core::Device) -> bool {
 /// Storing every `S_t` is fine for the CPU reference and tests (it has RAM);
 /// the CUDA kernel will instead checkpoint at chunk boundaries to stay within
 /// VRAM. Both must agree numerically.
+#[allow(clippy::too_many_arguments)] // flat-slice reference signature mirrors the CUDA kernel
 pub fn wkv_forward_ref(
     r: &[f32],
     k: &[f32],
@@ -88,6 +89,7 @@ pub fn wkv_forward_ref(
 /// Backward scan. Given upstream `dy` (`[B,T,H,dh]`) and the `states` from the
 /// forward pass, returns `(dr, dk, dv, dw)`. `dr/dk/dv` are `[B,T,H,dh]`; `dw`
 /// is `[H,dh]` (summed over batch and time).
+#[allow(clippy::too_many_arguments)] // flat-slice reference signature mirrors the CUDA kernel
 pub fn wkv_backward_ref(
     r: &[f32],
     k: &[f32],
@@ -730,8 +732,8 @@ mod tests {
             check(1, idx, dk[idx]);
             check(2, idx, dv[idx]);
         }
-        for idx in 0..h * dh {
-            check(3, idx, dw[idx]);
+        for (idx, &dwi) in dw.iter().enumerate().take(h * dh) {
+            check(3, idx, dwi);
         }
 
         eprintln!("wkv_gradient_check ok, max relative error = {max_rel:.5}");

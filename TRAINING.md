@@ -41,10 +41,10 @@ binary, and starts training — all unattended. Checkpoints sync to
 
 | GPU   | Machine        | VRAM  | RAM  | On-demand | SPOT       | Typical run (50 M micro, 25 k steps) |
 |-------|----------------|-------|------|-----------|------------|--------------------------------------|
-| L4    | g2-standard-4  | 24 GB | 16 G | ~$0.71/hr | ~$0.22/hr  | ~6.5–7 days · ~$115–125 on-demand |
+| L4    | g2-standard-4  | 24 GB | 16 G | ~$0.71/hr | ~$0.22/hr  | ~4.4 days · ~$75–85 on-demand |
 
-Costs are estimates for US zones. The 25 k-step `micro` run holds **~23 s/step**
-(~1,440 tok/s, fused WKV kernel) — about 162 h ≈ 6.7 days. SPOT is ~30 % of the
+Costs are estimates for US zones. The 25 k-step `micro` run holds **~15.2 s/step**
+(~2.23k tok/s, fused WKV kernel + bf16) — about 106 h ≈ 4.4 days. SPOT is ~30 % of the
 on-demand $/hr and training resumes from the latest GCS checkpoint after a
 preemption, but a multi-day run will be preempted repeatedly, so on-demand is
 the realistic baseline. (Earlier "15–22 h" figures predate the LayerNorm
@@ -97,11 +97,12 @@ int8_time   = false
 Controls the training run. Key fields:
 
 ```toml
-batch_size  = 6     # sequences per microbatch (per GPU forward pass)
-grad_accum  = 11    # microbatches before one optimizer step
+batch_size  = 11    # sequences per microbatch (per GPU forward pass)
+grad_accum  = 6     # microbatches before one optimizer step
 total_steps = 25000 # optimizer steps to run
 peak_lr     = 3e-4  # warmup target and stable-phase LR
 grad_clip   = 1.0   # global L2 norm clip
+bf16        = true  # mixed precision (block matmuls bf16; norms/WKV/loss f32)
 save_every  = 500   # save checkpoint every N optimizer steps
 eval_every  = 500   # compute val loss every N optimizer steps
 ```
@@ -109,7 +110,7 @@ eval_every  = 500   # compute val loss every N optimizer steps
 **Token budget:**
 ```
 effective_batch = batch_size × seq_len × grad_accum
-               = 6 × 512 × 11 = 33_792 tokens/step
+               = 11 × 512 × 6 = 33_792 tokens/step
 
 total_tokens = total_steps × effective_batch
              = 25_000 × 33_792 ≈ 845 M tokens
@@ -119,16 +120,44 @@ Set `DATA_TOKENS=1500000000` (~75 % headroom over the training budget) so
 data preparation collects enough tokens even if some datasets fail or are
 skipped.
 
-Why `batch_size = 6`: on CUDA the WKV scan uses the fused kernel by default
+Why `batch_size = 11`: on CUDA the WKV scan uses the fused kernel by default
 (`crates/tinybit-core/src/model/wkv.rs`), whose chunk-checkpointed backward
 keeps only `O(B·H·√T·dh²)` scratch instead of the unfused loop's full
-`O(T·dh²)` per-layer retained graph. Measured peak at `batch_size = 6`,
-`max_seq_len = 512` is **~12.5 GB** on a 24 GB L4 — substantial headroom.
-The configs are held at `batch_size = 6` (not yet re-tuned for the fused
-kernel's headroom); raise it only after a live run confirms loss is
-unaffected (CLAUDE.md design decision 16). The old "~19.5 GB / B=8 OOM
-cliff" guidance applied to the unfused loop, now the CPU /
-`TINYBIT_FUSED_WKV=off` path only.
+`O(T·dh²)` per-layer retained graph. The fused kernel launches one block per
+`(batch, head)`, so batch 11 → 66 blocks (vs 36 at batch 6) — fuller occupancy
+on the L4's 58 SMs — and bf16 halves activation VRAM so the larger microbatch
+fits. Live L4 (2026-05-28): batch 11 / accum 6 → **15.18 s/step, 2.23k tok/s**;
+**batch 12 OOMs immediately**, so do not raise it without re-measuring (CLAUDE.md
+design decision 16). The old "~19.5 GB / B=8 OOM cliff" guidance applied to the
+unfused loop, now the CPU / `TINYBIT_FUSED_WKV=off` path only.
+
+### Throughput: where the time goes & how to speed it up further
+
+The `micro` step (~15 s) is far slower than its arithmetic implies: a fwd+bwd
+step is only ~6–7 TFLOP of matmul work (~55 ms ideal on a ~120 TFLOPS bf16 L4)
+plus a tiny (~1 GFLOP) WKV scan — i.e. **<1 % effective utilization**. The
+slowness is stalls / low GPU occupancy, not FLOPs. Two classes of fix:
+
+1. **Per-step sync stalls (done, 2026-05-28).** `global_grad_norm` previously
+   did one host read (`.to_scalar`) per parameter (~150–200 forced CUDA stream
+   syncs/step) and the loss synced once per microbatch. Both now accumulate
+   on-device and sync **once per step** — same numerics, fewer stalls.
+
+2. **WKV scan occupancy (open, needs a live L4 run).** The fused kernel
+   (`crates/tinybit-core/src/model/wkv.rs`) launches one block per
+   `(batch, head)` = 66 blocks of `dh`=64 threads on a GPU that runs ~89k
+   threads — under 5 % occupancy — and scans `T`=512 sequentially. This is the
+   prime suspect for the residual time. The principled fix is a chunked-parallel
+   scan (within-chunk = matmuls, only `T/L` inter-chunk carries sequential),
+   validated against the CPU reference + the `cuda_*` parity tests at T=512 so
+   it stays numerically equivalent (checkpoints remain compatible).
+
+**Profiling a step:** set `TINYBIT_PROFILE=1` to log, per optimizer step, the
+wall time split across forward+loss / backward / optimizer (the device is
+synchronized at each phase boundary so the numbers reflect real GPU time). Off
+by default → zero overhead on the normal training path. Run a few hundred steps
+with it to confirm the dominant phase before investing in (2) or raising
+`batch_size`.
 
 ---
 

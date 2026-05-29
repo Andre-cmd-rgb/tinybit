@@ -8,6 +8,7 @@ use crate::{
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use indicatif::{ProgressBar, ProgressStyle};
+use std::time::{Duration, Instant};
 use tinybit_core::{config::ModelConfig, model::TinyBit};
 use tracing::{info, warn};
 
@@ -205,14 +206,28 @@ impl Trainer {
 
         let mut last_val_loss = f64::INFINITY;
 
+        // Coarse per-phase profiler (opt-in via TINYBIT_PROFILE=1). Attributes a
+        // step's wall time to forward+loss / backward / optimizer, synchronizing
+        // the device at phase boundaries so the numbers reflect real GPU time.
+        // Off by default → zero overhead on the normal training path.
+        let profile = std::env::var("TINYBIT_PROFILE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+
         while step < total_steps {
             // ---- gradient accumulation loop ----------------------------------
             // Each microbatch is backpropped immediately so its computation graph
             // is freed before the next microbatch is allocated. This keeps VRAM
             // usage proportional to one microbatch rather than grad_accum batches.
             let mut merged_grads: Option<GradStore> = None;
-            let mut accum_loss = 0.0f64;
+            // Running sum of the per-microbatch losses, kept on-device and synced
+            // to the host ONCE after the accumulation loop (was one
+            // `.to_scalar()` per microbatch). Stored detached so it never retains
+            // a microbatch's computation graph — that retention would defeat the
+            // per-microbatch graph-freeing this loop relies on for VRAM.
+            let mut loss_acc: Option<Tensor> = None;
             let mut actual_microbatches = 0usize;
+            let (mut t_fwd, mut t_bwd) = (Duration::ZERO, Duration::ZERO);
 
             for _ in 0..self.config.grad_accum {
                 let batch = train_loader.next_batch()?;
@@ -233,14 +248,29 @@ impl Trainer {
                 let target_t =
                     Tensor::from_vec(target_flat, (b, t), &device)?.to_dtype(DType::U32)?;
 
+                let fwd_start = profile.then(Instant::now);
                 let (logits, _) = model.forward_train(&input_t)?;
                 let loss = cross_entropy_loss(&logits, &target_t)?;
-                let loss_val = loss.to_scalar::<f32>()? as f64;
-                accum_loss += loss_val;
+
+                // Accumulate the (detached) loss on-device; synced once below.
+                let detached = loss.detach();
+                loss_acc = Some(match loss_acc {
+                    Some(acc) => (acc + &detached)?,
+                    None => detached,
+                });
 
                 // Scale and immediately backprop — frees this graph before next microbatch.
                 let scaled = (loss / self.config.grad_accum as f64)?;
+                if let Some(s) = fwd_start {
+                    device.synchronize()?;
+                    t_fwd += s.elapsed();
+                }
+                let bwd_start = profile.then(Instant::now);
                 let step_grads = scaled.backward()?;
+                if let Some(s) = bwd_start {
+                    device.synchronize()?;
+                    t_bwd += s.elapsed();
+                }
 
                 // Accumulate into merged_grads.
                 match merged_grads {
@@ -282,7 +312,11 @@ impl Trainer {
                 }
             }
 
-            let train_loss = accum_loss / actual_microbatches as f64;
+            // Single GPU->CPU sync for the whole step's mean loss.
+            let train_loss = match loss_acc {
+                Some(acc) => acc.to_scalar::<f32>()? as f64 / actual_microbatches as f64,
+                None => continue,
+            };
 
             // ---- guard: skip non-finite loss ---------------------------------
             if !train_loss.is_finite() {
@@ -302,6 +336,7 @@ impl Trainer {
             let lr = scheduler.get_lr(step);
             optimizer.set_learning_rate(lr);
 
+            let opt_start = profile.then(Instant::now);
             let grad_norm = if self.config.grad_clip > 0.0 {
                 clip_grad_norm(&mut grads, &all_vars, self.config.grad_clip)?
             } else {
@@ -320,6 +355,17 @@ impl Trainer {
             if let Some(ref mut muon) = muon {
                 muon.lr = muon_scheduler.get_lr(step);
                 apply_muon(muon, &muon_params, &grads)?;
+            }
+            if let Some(s) = opt_start {
+                device.synchronize()?;
+                let t_opt = s.elapsed();
+                info!(
+                    "profile step={step} fwd={:.0}ms bwd={:.0}ms opt={:.0}ms (sum over {} microbatches)",
+                    t_fwd.as_secs_f64() * 1e3,
+                    t_bwd.as_secs_f64() * 1e3,
+                    t_opt.as_secs_f64() * 1e3,
+                    actual_microbatches,
+                );
             }
 
             info!(
@@ -423,12 +469,26 @@ fn apply_muon(
 }
 
 fn global_grad_norm(grads: &GradStore, vars: &[Var]) -> anyhow::Result<f64> {
-    let mut sq_sum = 0.0f64;
+    // Accumulate each parameter's f32 sum-of-squares as a 1-element device
+    // tensor, concatenate them, and pull the whole vector to the host in a
+    // SINGLE GPU->CPU sync. The previous version did one `.to_scalar()` per
+    // parameter (~150-200 forced stream syncs per step, each serializing a tiny
+    // reduction kernel behind sync latency). The per-parameter f32 square-sums
+    // and the f64 host accumulation order are unchanged, so the resulting norm
+    // is bit-identical — this is purely a stall-removal. (Grads w.r.t. the f32
+    // master weights are f32; the explicit `to_dtype(F32)` is a no-op clone in
+    // practice but guards against a bf16 grad squaring/overflowing in bf16.)
+    let mut sqs: Vec<Tensor> = Vec::with_capacity(vars.len());
     for v in vars {
         if let Some(g) = grads.get(v.as_tensor()) {
-            sq_sum += g.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+            sqs.push(g.to_dtype(DType::F32)?.sqr()?.sum_all()?.reshape(1)?);
         }
     }
+    if sqs.is_empty() {
+        return Ok(0.0);
+    }
+    let all = Tensor::cat(&sqs, 0)?.to_vec1::<f32>()?;
+    let sq_sum: f64 = all.iter().map(|&x| x as f64).sum();
     Ok(sq_sum.sqrt())
 }
 
