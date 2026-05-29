@@ -1,0 +1,19 @@
+# tinybit small-coding — coding-specialized variant of `small` (~258M params).
+#
+# Architecture is IDENTICAL to configs/small.toml. What makes this a "coding"
+# model is the TRAINING DATA, not the shape:
+#   - prepare the dataset with PROFILE=coding (code-heavy mix; see scripts/prepare_data.sh)
+#   - chat/eval with `--profile coding` so the coding system prompt is used
+# NOTE: small does not fit on a single L4 for training — it is an architectural
+# preset for inference of checkpoints trained on larger hardware.
+vocab_size  = 32008
+num_layers  = 13
+d_model     = 1024
+d_ffn       = 3584
+num_heads   = 16
+head_dim    = 64
+max_seq_len = 2048
+dropout     = 0.05
+spec_heads  = 0
+ternary_ffn = false
+int8_time   = false

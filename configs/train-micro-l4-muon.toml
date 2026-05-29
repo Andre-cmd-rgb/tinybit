@@ -6,7 +6,7 @@
 # Why this exists: Muon often improves loss-per-step for matrix params, but its
 # quality benefit at this scale is UNVERIFIED — only mechanical correctness
 # (runs, no NaNs, loss decreases) has been smoke-tested. The DEFAULT recipe and
-# the loss targets in RUN.md assume AdamW (train-micro-l4.toml). Use this only to
+# the loss targets in TRAINING.md assume AdamW (train-micro-l4.toml). Use this only to
 # A/B Muon against that baseline on a live run; do NOT treat it as the validated
 # config until a full run confirms the loss curve.
 #

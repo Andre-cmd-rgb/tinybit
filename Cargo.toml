@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version    = "0.1.0"
+version    = "1.0.0"
 edition    = "2021"
 license    = "Apache-2.0"
 repository = "https://github.com/Andre-cmd-rgb/tinybit"
@@ -34,11 +34,9 @@ safetensors    = "0.4.5"
 # CLI
 clap           = { version = "4.5", features = ["derive", "env"] }
 
-# Async + HTTP
-tokio          = { version = "1.40", features = ["full"] }
-axum           = { version = "0.7", features = ["json"] }
-tower          = "0.4"
-tower-http     = { version = "0.5", features = ["cors", "trace"] }
+# Async runtime — used only by the tokenizer/model download path (hf-hub).
+# tinybit V1.0 is local-CLI-first: there is no HTTP server.
+tokio          = { version = "1.40", features = ["rt-multi-thread", "macros"] }
 
 # Errors + logging
 anyhow         = "1.0"

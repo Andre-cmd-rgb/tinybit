@@ -20,17 +20,22 @@ cargo test --workspace
    updates, LR = `muon_lr`, default 0.02) while candle's `AdamW` handles the
    tied embedding/LM-head, norms, and biases. The DEFAULT (field absent) is
    AdamW for ALL parameters — the documented L4 runs and their loss targets in
-   RUN.md assume AdamW, so do NOT change the default without re-validating a
+   TRAINING.md assume AdamW, so do NOT change the default without re-validating a
    full run. Muon's quality benefit is unverified at scale; only its mechanical
    correctness (runs, no NaNs, loss decreases) has been smoke-tested. See
    `apply_muon` and the param split in `Trainer::run`.
 
-4. Tool calls use special tokens, not a separate classifier.
-   The model is trained to output <|tool_call|>JSON<|end_tool_call|>.
-   See tools/parser.rs for detection logic.
+4. Tool calls use the marker protocol <|tool_call|>JSON<|end_tool_call|>, NOT a
+   separate classifier. `parse_tool_call` (tools/parser.rs) detects them in the
+   DECODED text, so they work whether or not the markers are single special
+   tokens. The detect→execute→inject→continue loop (infer/processor.rs) is
+   complete and tested, but the base-pretraining data contains no tool-call
+   demonstrations, so reliable EMISSION needs instruction/tool fine-tuning —
+   treat tool calling as experimental and document it as such.
 
-5. Tokenizer is LLaMA format (32k vocab + 8 special tokens = 32008).
-   The 8 extras are tool-call markers. IDs are deterministic — do not change.
+5. Tokenizer is LLaMA format (32k vocab + 8 reserved slots = 32008). Four of the
+   reserved slots are the <|tool_*|> markers the tokenizer installs when vocab
+   has room; the rest are spare. IDs are deterministic — do not change.
 
 6. All configs are in configs/*.toml. No magic numbers in model code.
    Everything reads from ModelConfig.
@@ -108,6 +113,27 @@ cargo test --workspace
     L4 configs in `configs/*.toml` are NOT yet re-tuned for this; raise batch_size
     only after a live L4 run confirms the new headroom. The loop path (CPU, or
     `TINYBIT_FUSED_WKV=off`) still carries the old budget.
+
+17. Two model families, ONE architecture. `general` (nano/micro/small/base) and
+    `coding` (`*-coding`) share byte-identical arch configs; they differ only in
+    (a) the training-data mix and (b) the default system prompt. The mix is
+    chosen by `DATA_PROFILE=general|coding` in prepare_data.sh; the persona by
+    `Profile` (core/tokenizer.rs) — `--profile`, or inferred from a config name
+    containing "coding". A checkpoint loads under either config. Do NOT diverge
+    the `*-coding.toml` shapes from their siblings.
+
+18. Prompt format is SHARED between training and inference and must stay that
+    way. The canonical template is the `ROLE_*_PREFIX` constants in
+    core/tokenizer.rs (`system:\n…\nuser:\n…\nassistant:\n…`). prepare_data.sh
+    formats conversation datasets (OpenHermes/dolphin) with the SAME strings, and
+    `STOP_STRING_USER_TURN` ("\nuser:") is how generation stops. If you change
+    the template, change BOTH places or chat and training silently disagree.
+
+19. V1.0 is local-CLI-first: subcommands are chat / eval / train / convert /
+    download. There is NO `serve`/HTTP server (axum/tower were removed). `eval`
+    (cli/commands/eval.rs) reports val perplexity + greedy generation sanity and
+    is the measure-don't-guess quality gate. Don't reintroduce a server without
+    a deliberate decision — it was removed to keep the project local-first.
 
 ## Common mistakes to avoid
 

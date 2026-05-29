@@ -7,7 +7,9 @@
 #
 # Placeholders (must all be substituted before upload):
 #   __RUN_ID__              — unique run id, e.g. 20260527-141500-nano
-#   __MODEL_SIZE__          — nano|micro|small|base
+#   __MODEL_SIZE__          — nano|micro|small|base (optionally with a -coding
+#                              suffix, e.g. micro-coding → configs/micro-coding.toml
+#                              + the coding data profile)
 #   __GCS_BUCKET__          — gs://bucket-name  (no trailing slash)
 #   __GCS_REPO_PREFIX__     — repo prefix inside bucket, e.g. tinybit
 #   __DATA_TOKENS__         — desired total training tokens
@@ -59,6 +61,14 @@ TRAIN_CONFIG_OVERRIDE="__TRAIN_CONFIG__"
 ZONE_INFO="__ZONE__"
 MACHINE_INFO="__MACHINE__"
 ACCELERATOR_INFO="__ACCELERATOR__"
+
+# Model family → data profile. A "*-coding" model size (e.g. micro-coding, which
+# uses configs/micro-coding.toml) trains on the code-heavy data mix; everything
+# else uses the general mix. See scripts/prepare_data.sh.
+case "$MODEL_SIZE" in
+  *-coding) DATA_PROFILE="coding" ;;
+  *)        DATA_PROFILE="general" ;;
+esac
 
 WORKDIR=/workspace/tinybit
 GCS_RUN_PREFIX="$GCS_BUCKET/runs/$RUN_ID"
@@ -177,7 +187,7 @@ LAST_CKPT=""
 
 log "=============================================================="
 log " tinybit cloud startup  v$SCRIPT_VERSION  run_id=$RUN_ID"
-log " model=$MODEL_SIZE zone=$ZONE_INFO machine=$MACHINE_INFO accel=$ACCELERATOR_INFO"
+log " model=$MODEL_SIZE (data_profile=$DATA_PROFILE) zone=$ZONE_INFO machine=$MACHINE_INFO accel=$ACCELERATOR_INFO"
 log " bucket=$GCS_BUCKET  data_tokens=$DATA_TOKENS  steps=$TRAIN_STEPS"
 log " cuda=$CUDA_DIR (apt=$CUDA_VERSION)  sync_interval=${SYNC_INTERVAL}s"
 log "=============================================================="
@@ -308,7 +318,7 @@ else
     if [ -n "$HF_TOKEN_VAL" ]; then
       export HF_TOKEN="$HF_TOKEN_VAL"
     fi
-    TOTAL_TOKENS="$DATA_TOKENS" MIN_TOKENS="$MIN_TOKENS" \
+    TOTAL_TOKENS="$DATA_TOKENS" MIN_TOKENS="$MIN_TOKENS" DATA_PROFILE="$DATA_PROFILE" \
       bash ./scripts/prepare_data.sh data/
     # Cache for future relaunches of this run (best-effort; never fatal).
     log "Caching prepared data to $GCS_RUN_PREFIX/data/ …"

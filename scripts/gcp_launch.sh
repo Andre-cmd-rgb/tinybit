@@ -33,7 +33,12 @@
 #                        TRAIN_STEPS.
 #
 # Usage:
-#   ./scripts/gcp_launch.sh [nano|micro]
+#   ./scripts/gcp_launch.sh [nano|micro|nano-coding|micro-coding]
+#
+# A "-coding" suffix selects configs/<size>-coding.toml and the code-heavy data
+# profile (startup.sh derives DATA_PROFILE from the name). Pair it with the same
+# train config as the general sibling, e.g.
+#   TRAIN_CONFIG=configs/train-micro-l4.toml ./scripts/gcp_launch.sh micro-coding
 
 set -Eeuo pipefail
 

@@ -1,290 +1,238 @@
 # tinybit
 
-A local AI assistant built on **RWKV-7** with **ternary BitLinear** quantization. Configurable from 25M to 500M parameters. Train on Google Cloud L4 free credits; run on Linux, macOS (M-series), or Windows.
+A small, fast, **local-first** AI assistant built on **RWKV-7** with **ternary
+BitLinear** quantization. Configurable from ~25M to ~500M parameters. Train
+cheaply on a Google Cloud L4; run locally on Linux, macOS (Apple Silicon), or
+Windows.
 
-Apache 2.0 — all Rust, no C++ compiler required.
+All Rust. No C++ compiler. No cloud calls at inference time. Apache 2.0.
 
 ---
 
-## Features
+## What tinybit is (and isn't)
 
-- **RWKV-7 architecture** — recurrent transformer with O(1) memory at inference (no KV cache)
-- **BitLinear quantization** — ternary weights `{-1, 0, +1}` via BitNet b1.58 STE
-- **Built-in tools** — calculator, time, todos, notes, calendar (SQLite-backed, user-extensible)
-- **Four size presets** — nano (25M), micro (50M), small (258M), base (501M)
-- **Muon + AdamW optimizer** — Newton-Schulz gradient orthogonalization for weight matrices
-- **OpenAI-compatible HTTP server** — drop-in for local inference
-- **Speculative decoding heads** — optional extra heads on small/base for faster sampling
+tinybit is a small assistant that is useful because it is **optimized,
+measurable, tool-aware, and honest about its limits**. It is meant to be hacked
+on and inspected.
+
+It is **not** a ChatGPT clone. A 50M-parameter model is not going to match a
+large cloud model on knowledge or reasoning, and tinybit doesn't pretend
+otherwise. It wins by being small, local, fast, controllable, easy to train,
+and easy to read.
+
+V1.0 is **local CLI inference first**: `chat`, `eval`, `train`, `convert`,
+`download`. There is intentionally no HTTP server.
+
+---
+
+## Highlights
+
+- **RWKV-7 architecture** — recurrent, O(1) memory at inference (no KV cache);
+  state is a fixed-size matrix per layer regardless of context length.
+- **Two model families** — *general* (`nano`/`micro`/`small`/`base`) and
+  *coding* (`*-coding`). Same architecture, different training data + persona.
+  See [MODELS.md](MODELS.md).
+- **BitLinear quantization** — ternary weights `{-1, 0, +1}` (BitNet b1.58 STE),
+  packed on export.
+- **Built-in local tools** — calculator, time, todos, notes, calendar
+  (SQLite-backed, user-extensible) via a stable token protocol.
+- **Stable prompt format** — the exact `system:/user:/assistant:` template used
+  in `tinybit chat` is the one the training data is formatted with.
+- **Cheap training** — a 50M `micro` model is ~1.9 days / ~$32 on a single L4
+  (measured post-optimization; see [TRAINING.md](TRAINING.md)).
+- **Fused WKV CUDA kernel** — the RWKV-7 scan runs as a single fused
+  forward/backward op on CUDA (≈25× the naive candle loop for the scan).
+- **Real evals** — `tinybit eval` reports perplexity and runs generation sanity
+  prompts so quality is measured, not guessed.
 
 ---
 
 ## Quick start
 
 ```bash
-# Prerequisites: Rust stable ≥ 1.82 (see rust-toolchain.toml)
+# Prerequisites: Rust stable (see rust-toolchain.toml)
 git clone <this-repo> && cd tinybit
+cargo build --release --workspace
 
-# Build everything
-cargo build --release
+# 1. Get the tokenizer
+./target/release/tinybit download --output .
 
-# Interactive chat (loads a model checkpoint)
-tinybit chat --model checkpoints/nano/latest.safetensors --config configs/nano.toml
-
-# HTTP server (OpenAI-compatible)
-tinybit serve --model checkpoints/micro/latest.safetensors --config configs/micro.toml --port 8080
-
-# Download tokenizer
-tinybit download --out data/tokenizer.json
-```
-
----
-
-## Model presets
-
-All models use 3.5× FFN expansion (d_ffn = 3.5 × d_model) matching the RWKV-7 paper.
-
-| Preset | Params  | Layers | d_model | d_ffn | Notes |
-|--------|---------|--------|---------|-------|-------|
-| nano   | ~25M    | 9      | 320     | 1120  | Fast iteration |
-| micro  | ~50M    | 16     | 384     | 1344  | Main L4 target, ~1.9 days (measured 6.5 s/step, post WKV-backward fix) |
-| small  | ~258M   | 13     | 1024    | 3584  | Architecture only — too big to train on L4 |
-| base   | ~501M   | 17     | 1280    | 4480  | Architecture only — too big to train on L4 |
-
-Config files live in `configs/`. Override any field:
-
-```toml
-# configs/nano.toml
-vocab_size  = 32008
-num_layers  = 9
-d_model     = 320
-d_ffn       = 1120
-num_heads   = 5
-head_dim    = 64
-max_seq_len = 512
-```
-
----
-
-## Training
-
-### 1. Prepare data (on GCP or locally)
-
-```bash
-# Download + tokenize FineWeb-Edu, Wikipedia, The Stack Smol
-bash scripts/prepare_data.sh data/
-
-# This creates data/train.bin and data/val.bin (packed u32 token IDs)
-```
-
-### 2. Train
-
-```bash
-# Local smoke test (CPU, ~15 min)
-cargo build --release -p tinybit-cli
+# 2. Verify the training pipeline locally (CPU, a few minutes)
 ./target/release/tinybit train \
   --model-config configs/nano.toml \
-  --train-config configs/train-nano-l4.toml \
-  --smoke-test
+  --train-config configs/train-nano-l4.toml --smoke-test
 
-# GCP — L4-only launcher
-export GCP_PROJECT="your-project-id"
-export GCP_BUCKET="gs://your-bucket"
+# 3. After you have a checkpoint, chat with it
+./target/release/tinybit chat \
+  --config configs/micro.toml \
+  --model  checkpoints/step_0025000.safetensors
 
-# 25M nano (fast iteration)
-DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-nano-l4.toml \
-PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh nano
-
-# 50M micro — 25k steps ≈ 1.9 days on L4, ~$32 on-demand (measured 6.5 s/step post WKV fix; see RUN.md)
-DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-micro-l4.toml \
-PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh micro
-
-# Watch the run
-./scripts/gcp_status.sh <RUN_ID>           # stage, step, last checkpoint
-./scripts/gcp_tail_logs.sh <RUN_ID>        # tail training log live
+# 4. Measure quality
+./target/release/tinybit eval \
+  --config configs/micro.toml \
+  --model  checkpoints/step_0025000.safetensors \
+  --data   data/val.bin
 ```
 
-Output layout in the bucket:
+> tinybit V1.0 ships **no pretrained weights** — you train your own. The 50M
+> `micro` run is the documented target (see [TRAINING.md](TRAINING.md)).
 
-```
-gs://$GCP_BUCKET/runs/<RUN_ID>/
-  launch.json                # what was provisioned
-  status.json                # latest stage, step, checkpoint
-  DONE.json | FAILED.json    # terminal marker
-  logs/bootstrap.log
-  logs/training.log
-  checkpoints/step_000NNNN.safetensors  (+ .json meta)
-gs://$GCP_BUCKET/latest_run.txt
-```
+---
 
-Failure handling: any error before training starts uploads `FAILED.json` and
-shuts the VM down (set `KEEP_VM_ON_FAILURE=1` to keep it for debugging).
+## Commands
 
-Key training config fields (`configs/train-micro-l4.toml`):
+| Command | What it does |
+|---------|--------------|
+| `tinybit chat` | Interactive local REPL. Streams tokens, supports tools, slash-commands (`/help`, `/reset`, `/system`, `/save`). |
+| `tinybit eval` | Perplexity over a token file + greedy generation sanity prompts (with tok/s). |
+| `tinybit train` | Train from a model+train config. `--smoke-test` runs a short sanity loop; `--resume` continues from the latest checkpoint. |
+| `tinybit convert` | Export a checkpoint; `--quantize` packs 2D matrices to ternary (smaller on disk). |
+| `tinybit download` | Fetch `tokenizer.json` from HuggingFace. |
 
-```toml
-batch_size     = 6       # sequences per microbatch (L4-tuned)
-grad_accum     = 11      # microbatches per optimizer step
-total_steps    = 25000   # optimizer steps
-peak_lr        = 3e-4
-grad_clip      = 1.0
-save_every     = 500
-eval_every     = 500
-```
+Run `tinybit <command> --help` for all flags.
 
-### 3. WSD learning rate schedule
+---
 
-- **Warmup**: linear ramp over first 2% of steps
-- **Stable**: constant LR
-- **Decay**: cosine decay over final 20% of steps
+## Model variants
 
-### 4. Optimizer
+Four sizes × two families. Architecture is shared; the family is the
+training-data mix + default persona. Full details in [MODELS.md](MODELS.md).
 
-- **Muon** for all 2D weight matrices (w_q, w_k, w_v, w_o, w_g1, w_g2, BitLinear weights)
-- **AdamW** for embeddings, LayerNorm params, biases, 1D tensors
+| Preset | Params | Layers | d_model | d_ffn | L4-trainable |
+|--------|--------|--------|---------|-------|--------------|
+| nano   | ~25M   | 9      | 320     | 1120  | ✅ |
+| micro  | ~50M   | 16     | 384     | 1344  | ✅ (main target) |
+| small  | ~258M  | 13     | 1024    | 3584  | inference-only |
+| base   | ~501M  | 17     | 1280    | 4480  | inference-only |
+
+Each has a `-coding` sibling (`configs/<size>-coding.toml`) trained on a
+code-heavy data mix. All use a 3.5× FFN expansion (d_ffn = 3.5 × d_model).
 
 ---
 
 ## Tool system
 
-The model can call tools via structured tokens:
+The model calls tools with a stable token protocol:
 
 ```
 <|tool_call|>{"tool":"calculator","args":{"expr":"2^10"}}<|end_tool_call|>
 ```
 
-Results are injected as:
+The runtime executes the tool and injects:
 
 ```
 <|tool_result|>1024<|end_tool_result|>
 ```
 
-### Built-in tools
-
 | Tool | Description |
 |------|-------------|
 | `time` | Current date, time, timezone |
-| `calculator` | Math expressions via `evalexpr` (e.g. `2+2`, `12^2`, `sin(3.14)`) |
+| `calculator` | Math via `evalexpr` (e.g. `2+2`, `12^2`, `sqrt(144)`) |
 | `todos` | Add / list / complete / delete tasks (SQLite) |
 | `notes` | Save and full-text search notes (SQLite FTS5) |
-| `calendar` | Add / list / delete calendar events (SQLite) |
+| `calendar` | Add / list / delete events (SQLite) |
 
-### Adding custom tools
-
-Implement the `Tool` trait in `tinybit-tools`:
-
-```rust
-use tinybit_tools::tool::{Tool, ToolOutput};
-
-struct MyTool;
-
-impl Tool for MyTool {
-    fn name(&self) -> &str { "my_tool" }
-    fn description(&self) -> &str { "Does something useful" }
-    fn execute(&self, args_json: &str) -> anyhow::Result<ToolOutput> {
-        // parse args_json, do work, return ToolOutput
-        Ok(ToolOutput { content: "result".to_string(), is_error: false })
-    }
-}
-
-// Register
-registry.register(Box::new(MyTool));
-```
+Add your own by implementing the `Tool` trait in `tinybit-tools` and registering
+it. Note: reliable tool *calling* depends on instruction/tool fine-tuning — the
+plumbing (detect → execute → inject → continue) is complete and tested, but a
+base-pretrained model emits tool calls only loosely. See **Known limitations**.
 
 ---
 
-## HTTP server (OpenAI-compatible)
+## Training
+
+Full guide: **[TRAINING.md](TRAINING.md)**. In short:
 
 ```bash
-tinybit serve --port 8080
+# Prepare data (general or coding mix)
+DATA_PROFILE=general TOTAL_TOKENS=1500000000 ./scripts/prepare_data.sh data/
+
+# Train locally or launch an L4 on GCP
+DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-micro-l4.toml \
+  ./scripts/gcp_launch.sh micro
 ```
 
-Endpoints:
-
-- `POST /v1/chat/completions` — chat completion (streaming and non-streaming)
-- `GET /v1/models` — list loaded model
-
-Example:
-
-```bash
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "tinybit",
-    "messages": [{"role": "user", "content": "What is 12^2?"}]
-  }'
-```
+- **Optimizer**: AdamW by default (validated). Muon is opt-in (`optimizer =
+  "muon"`) for 2D weight matrices and is experimental.
+- **LR schedule**: WSD (warmup → stable → cosine decay).
+- **Checkpoints**: safetensors + JSON meta; the trainer keeps the best-3 and
+  most-recent-3.
 
 ---
 
 ## Model export
 
 ```bash
-# Export to safetensors
-tinybit convert --model checkpoints/micro/latest.safetensors --out model.safetensors --format safetensors
+# Re-save as safetensors (identity copy)
+tinybit convert --input ckpt.safetensors --output model.safetensors
 
-# Export to GGUF (for llama.cpp compatibility)
-tinybit convert --model checkpoints/micro/latest.safetensors --out model.gguf --format gguf
+# Pack 2D weight matrices to ternary (smaller on disk; ~2 weights/byte)
+tinybit convert --input ckpt.safetensors --output model.q.safetensors --quantize
 ```
+
+The quantized export shrinks the on-disk file substantially. Loading it
+currently **dequantizes back to f32** and runs the normal path — a true
+ternary-matmul runtime is future work, so the quantized file is a storage/format
+win, not yet an inference-speed win. GGUF export is stubbed (not implemented).
 
 ---
 
-## Running tests
-
-```bash
-# All tests
-cargo test
-
-# Specific suites
-cargo test -p tinybit-tests --test model_correctness
-cargo test -p tinybit-tests --test tool_system
-cargo test -p tinybit-tests --test training_smoke
-cargo test -p tinybit-tests --test quantize
-```
-
-Gate tests that must pass before any real training run:
-- `test_forward_shapes_nano` — logits shape and finite check
-- `test_inference_step_matches_train` — step-by-step matches full-sequence forward (tolerance 1e-3)
-- `smoke_train_nano_100_steps` — initial loss ≤ 2× ln(vocab_size)
-
----
-
-## Architecture overview
+## Architecture
 
 ```
 Token IDs (B, T)
-    │
-    ▼ EmbeddingHead.embed()
+    │  EmbeddingHead.embed()
 Hidden (B, T, D)
-    │
-    ▼ × num_layers
-┌─────────────────────────────┐
-│  LayerNorm                  │
-│  TimeMix (RWKV-7 WKV scan)  │
-│  + residual                 │
-│  LayerNorm                  │
-│  ChannelMix (gated FFN)     │
-│  + residual                 │
-└─────────────────────────────┘
-    │
-    ▼ EmbeddingHead.lm_head()  (tied weights, scaled by 1/√d_model)
+    │  × num_layers:  LN → TimeMix (WKV scan) → +res → LN → ChannelMix → +res
+    │  EmbeddingHead.lm_head()   (tied weights, scaled by 1/√d_model)
 Logits (B, T, vocab_size)
 ```
 
-**TimeMix** (RWKV-7 WKV):
-- Token-shifted lerp inputs → r, k, v, gate
-- Recurrent state: `S_t = S_{t-1} * decay + k_t ⊗ v_t`
-- Output: `y_t = r_t @ S_t`, group-normalized, gated
+- **TimeMix (RWKV-7 WKV)**: token-shifted r/k/v/gate; recurrent state
+  `S_t = S_{t-1}·exp(-exp(time_decay)) + kᵀv`; readout `y = r·S`, group-normed,
+  gated. On CUDA this scan is a fused kernel; on CPU it's a sequential loop
+  (numerically equivalent).
+- **ChannelMix (FFN)**: `k = SiLU(W_k·x)`, `v = W_v·k²`, `r = σ(W_r·x)`,
+  `out = r·v`.
+- **BitLinear**: RMSNorm + linear; full-precision master weights in training
+  (STE), ternary on export.
 
-**ChannelMix** (RWKV-7 FFN):
-- `k = SiLU(W_k · x_k)`
-- `v = W_v · k²`
-- `r = sigmoid(W_r · x_r)`
-- `out = r * v`
+LayerNorms are a hand-rolled differentiable implementation (candle's fused
+LayerNorm has no backward — using it silently froze training before this was
+fixed; `tests/grad_flow.rs` guards against regressing it).
 
-**BitLinear**:
-- RMSNorm on input, then linear projection
-- At quantization time: ternary weights `{-1, 0, +1}`, int8 activations
-- Training: full float32 weights (STE for gradients)
+---
+
+## Tests
+
+```bash
+cargo test --workspace
+```
+
+Gate tests (must pass before any real run):
+- `test_forward_shapes_nano` — logits shape + finite check
+- `test_inference_step_matches_train` — step-by-step matches full-sequence forward
+- `smoke_train_nano_100_steps` — initial loss ≤ 2× ln(vocab)
+- `grad_flow` (in `tinybit-core`) — every parameter receives a finite gradient
+  and the model overfits a fixed batch
+
+---
+
+## Known limitations (honest)
+
+- **Small models are small.** Expect coherent short text and simple instruction
+  following — *not* reliable factuality or multi-step reasoning. `tinybit eval`
+  prints perplexity so you can see where a checkpoint actually lands.
+- **No pretrained weights ship with V1.0.** You train your own.
+- **Tool calling needs fine-tuning to be reliable.** The detect/execute/inject
+  loop is complete and tested; a base-pretrained model still emits tool calls
+  only loosely.
+- **`small`/`base` are inference-only on the supported hardware** — they don't
+  fit a single L4 for training.
+- **Quantized export is a disk-size win, not yet a speed win** (loads as f32).
+- **GGUF export is not implemented.**
+- **Muon optimizer is experimental** — mechanically correct, quality-at-scale
+  unverified. AdamW is the validated default.
 
 ---
 
@@ -296,11 +244,10 @@ crates/
   tinybit-tools/   — tool trait, registry, built-in tools
   tinybit-infer/   — inference engine, sampler, session, tool processor
   tinybit-train/   — trainer, optimizer, scheduler, loss, checkpoint, data
-  tinybit-cli/     — CLI (chat, serve, train, convert, download)
-tests/              — integration tests (workspace member)
-configs/            — TOML config files for each model size
-scripts/            — GCP provisioning and data preparation
-data/               — downloaded datasets (not committed)
+  tinybit-cli/     — CLI (chat, eval, train, convert, download)
+tests/             — integration tests (workspace member)
+configs/           — model + training TOML configs (8 model variants)
+scripts/           — data prep + GCP L4 launcher
 ```
 
 ---

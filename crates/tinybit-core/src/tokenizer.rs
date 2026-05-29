@@ -10,13 +10,64 @@ pub const ROLE_ASSISTANT_PREFIX: &str = "\nassistant:\n";
 /// model emits it.
 pub const STOP_STRING_USER_TURN: &str = "\nuser:";
 
-/// Default identity/system prompt. Gives the model its name and persona when no
-/// explicit `--system` prompt is set, so it knows it is "tinybit". A base-
-/// pretrained model only follows this loosely; reliable persona adherence needs
-/// instruction fine-tuning.
+/// Default identity/system prompt for the GENERAL model family. Gives the model
+/// its name and persona when no explicit `--system` prompt is set, so it knows
+/// it is "tinybit". A base-pretrained model only follows this loosely; reliable
+/// persona adherence needs instruction fine-tuning.
 pub const DEFAULT_SYSTEM_PROMPT: &str =
     "You are tinybit, a small and efficient AI assistant built on the RWKV-7 architecture. \
 You are helpful, concise, and honest.";
+
+/// Default system prompt for the CODING model family (`*-coding` variants).
+/// Steers the assistant toward programming help. Like the general prompt, a
+/// base-pretrained model follows it only loosely until instruction-tuned.
+pub const CODING_SYSTEM_PROMPT: &str =
+    "You are tinybit-coding, a small and efficient coding assistant built on the RWKV-7 \
+architecture. You help with programming, Rust, Python, Linux, shell commands, errors, \
+and debugging. You are concise, show working code, and are honest about what you are unsure of.";
+
+/// Model family — selects the default system prompt and the kind of help the
+/// assistant is tuned for. The architecture is identical across families; the
+/// difference is the training-data mix and the default persona.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Profile {
+    /// General assistant: explanations, notes, todos, summaries, simple Q&A.
+    #[default]
+    General,
+    /// Coding assistant: programming, Rust/Python/Linux, errors, debugging.
+    Coding,
+}
+
+impl Profile {
+    /// Parse a profile name (case-insensitive). Accepts "general" and "coding".
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "general" => Ok(Profile::General),
+            "coding" => Ok(Profile::Coding),
+            other => anyhow::bail!("unknown profile '{other}' (expected: general | coding)"),
+        }
+    }
+
+    /// The default system prompt for this family.
+    pub fn default_system_prompt(self) -> &'static str {
+        match self {
+            Profile::General => DEFAULT_SYSTEM_PROMPT,
+            Profile::Coding => CODING_SYSTEM_PROMPT,
+        }
+    }
+
+    /// Best-effort guess from a config path: a filename containing "coding"
+    /// (e.g. `configs/micro-coding.toml`) implies the coding family. Lets the
+    /// CLI pick a sensible default prompt without an explicit `--profile`.
+    pub fn from_config_path(path: &std::path::Path) -> Self {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.to_ascii_lowercase().contains("coding") {
+            Profile::Coding
+        } else {
+            Profile::General
+        }
+    }
+}
 
 /// Tool-call markers. These are *only* installed as actual special tokens when
 /// the model's vocabulary has room for them (vocab_size > base LLaMA vocab).

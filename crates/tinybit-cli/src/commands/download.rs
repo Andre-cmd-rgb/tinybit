@@ -2,15 +2,13 @@ use clap::Args;
 
 #[derive(Args)]
 pub struct DownloadArgs {
-    /// Model size to download: nano, micro, small, base
-    #[arg(long, default_value = "small")]
-    pub model: String,
-
-    /// HuggingFace model ID for tokenizer
+    /// HuggingFace repo to pull `tokenizer.json` from. The default is the LLaMA
+    /// tokenizer tinybit is built around (32k vocab; tinybit reserves 8 extra
+    /// slots for tool markers → vocab_size 32008).
     #[arg(long, default_value = "hf-internal-testing/llama-tokenizer")]
     pub tokenizer_id: String,
 
-    /// Output directory
+    /// Directory to write `tokenizer.json` into.
     #[arg(long, default_value = ".")]
     pub output: std::path::PathBuf,
 }
@@ -20,10 +18,13 @@ pub async fn run(args: DownloadArgs) -> anyhow::Result<()> {
     let api = hf_hub::api::tokio::Api::new()?;
     let repo = api.model(args.tokenizer_id.clone());
     let tokenizer_path = repo.get("tokenizer.json").await?;
+    std::fs::create_dir_all(&args.output)?;
     let dest = args.output.join("tokenizer.json");
     std::fs::copy(&tokenizer_path, &dest)?;
-    println!("Tokenizer saved to {}", dest.display());
-    println!("Note: pretrained weights for tinybit-{} are not yet available for download.", args.model);
-    println!("To train from scratch, run: tinybit train --smoke-test");
+    println!("Saved {}", dest.display());
+    println!();
+    println!("tinybit V1.0 does not ship pretrained weights — train your own:");
+    println!("  • local smoke test:  tinybit train --smoke-test");
+    println!("  • full run on an L4:  see TRAINING.md");
     Ok(())
 }

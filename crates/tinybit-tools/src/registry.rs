@@ -46,8 +46,13 @@ impl ToolRegistry {
         out
     }
 
-    /// Register all built-in tools.
+    /// Register all built-in tools. Creates `data_dir` if missing (the
+    /// SQLite-backed tools open db files inside it), so `chat`/`eval` work out
+    /// of the box without the user pre-creating the directory.
     pub fn with_builtins(data_dir: &std::path::Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(data_dir).map_err(|e| {
+            anyhow::anyhow!("could not create tools data dir {}: {e}", data_dir.display())
+        })?;
         let mut reg = Self::new();
         reg.register(Box::new(TimeTool));
         reg.register(Box::new(CalcTool));
