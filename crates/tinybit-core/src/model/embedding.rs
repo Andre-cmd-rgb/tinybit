@@ -48,4 +48,16 @@ impl EmbeddingHead {
         let scale = 1.0 / (self.d_model as f64).sqrt();
         Ok((logits * scale)?)
     }
+
+    /// Final pre-LM-head LayerNorm only (no vocab projection). The fused
+    /// cross-entropy folds the projection into the loss, so it needs `normed`
+    /// rather than full logits.
+    pub fn normed(&self, hidden: &Tensor) -> anyhow::Result<Tensor> {
+        Ok(self.ln_out.forward(hidden)?)
+    }
+
+    /// The tied embedding / LM-head weight (vocab_size, d_model).
+    pub fn weight(&self) -> &Tensor {
+        self.embed.embeddings()
+    }
 }

@@ -11,8 +11,14 @@
 #   ENABLE_GATED   1 to attempt gated datasets when HF_TOKEN is set (default 1)
 #
 # Profiles (the ONLY difference between the general and coding model families):
-#   general — natural-language assistant mix (FineWeb-Edu, Wikipedia, chat data,
-#             a little code).
+#   general — natural-language assistant mix tuned for a SMALL model: FineWeb-Edu
+#             (educational web) + Cosmopedia v2 (synthetic textbooks) + TinyStories
+#             (coherence) + OpenHermes/dolphin chat + a little code. There is NO
+#             raw Wikipedia: a ~50M model cannot store encyclopedic facts, so it
+#             only mimics Wikipedia's proper-noun register and hallucinates
+#             band/album/biography trivia. Clean pedagogical/narrative prose
+#             teaches it to explain and stay coherent instead (cf. SmolLM,
+#             TinyStories, Phi "textbooks are all you need").
 #   coding  — code-heavy mix (The Stack across several languages, technical
 #             chat), with some natural language retained. Code is gated on HF,
 #             so set HF_TOKEN for a real coding model.
@@ -97,12 +103,26 @@ EOS_ID = tokenizer.token_to_id("</s>") or 2
 #   kind = "text" → tokenize raw text field
 #          "chat" → field is a list of role/content turns; format with the
 #                   tinybit chat template so training matches inference.
+# General mix for a SMALL model. FineWeb-Edu MUST stay first: the val split is
+# taken from the head of the stream, so val perplexity reflects this clean
+# educational-web distribution. Weights are relative and renormalized over the
+# datasets that actually load (the-stack-smol is gated, see ENABLE_GATED).
 GENERAL_DATASETS = [
-    ("HuggingFaceFW/fineweb-edu",         "sample-10BT",  "train", "text",          0.40, False, "text"),
-    ("wikimedia/wikipedia",               "20231101.en",  "train", "text",          0.30, False, "text"),
-    ("teknium/OpenHermes-2.5",            None,           "train", "conversations", 0.15, False, "chat"),
-    ("cognitivecomputations/dolphin-r1",  "nonreasoning", "train", "messages",      0.10, False, "chat"),
-    ("bigcode/the-stack-smol",            "data/python",  "train", "content",       0.05, True,  "text"),
+    # Educational web prose — the backbone, and the val-set distribution.
+    ("HuggingFaceFW/fineweb-edu",         "sample-10BT",   "train", "text",          0.33, False, "text"),
+    # Synthetic textbooks/stories/articles. REPLACES raw Wikipedia: clean,
+    # pedagogical, explanatory prose with far fewer rare proper nouns, so the
+    # model learns to explain rather than to hallucinate encyclopedic trivia.
+    ("HuggingFaceTB/smollm-corpus",       "cosmopedia-v2", "train", "text",          0.30, False, "text"),
+    # Short, simple, fully-coherent narratives. Punches above its weight on a
+    # tiny model — teaches it to finish a thought instead of drifting.
+    ("roneneldan/TinyStories",            None,            "train", "text",          0.12, False, "text"),
+    # Instruction/chat, formatted with the canonical tinybit chat template so
+    # training matches what `tinybit chat` feeds the model at inference.
+    ("teknium/OpenHermes-2.5",            None,            "train", "conversations", 0.15, False, "chat"),
+    ("cognitivecomputations/dolphin-r1",  "nonreasoning",  "train", "messages",      0.07, False, "chat"),
+    # A little code so the general model can still read/write simple snippets.
+    ("bigcode/the-stack-smol",            "data/python",   "train", "content",       0.03, True,  "text"),
 ]
 # Coding mix: code-heavy across several languages + technical chat, with some
 # natural language retained so the model still writes coherent prose.

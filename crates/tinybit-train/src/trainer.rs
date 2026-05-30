@@ -1,7 +1,7 @@
 use crate::{
     checkpoint::{load_checkpoint, prune_checkpoints, save_checkpoint, CheckpointMeta},
     data::{DataLoader, TokenDataset},
-    loss::cross_entropy_loss,
+    loss::{cross_entropy_loss, fused_cross_entropy_grads},
     optimizer::Muon,
     scheduler::WsdScheduler,
 };
@@ -56,10 +56,27 @@ pub struct TrainingConfig {
     /// `optimizer = "muon"`.
     #[serde(default = "default_muon_lr")]
     pub muon_lr: f64,
+
+    /// Memory-frugal fused cross-entropy. When true, the LM-head projection and
+    /// softmax loss are computed in row-chunks and differentiated analytically,
+    /// so the full (B*T, vocab) F32 logits + log-softmax are never materialized
+    /// for autograd — freeing the VRAM that otherwise pins `batch_size`.
+    /// Numerically identical to the standard path (pinned by the parity +
+    /// end-to-end grad tests in `loss.rs`). Absent/false → standard CE.
+    #[serde(default)]
+    pub fused_ce: bool,
+    /// Row-chunk size for `fused_ce` (rows = B*T). Smaller → lower peak memory,
+    /// more launches. Ignored unless `fused_ce = true`.
+    #[serde(default = "default_fused_ce_chunk")]
+    pub fused_ce_chunk: usize,
 }
 
 fn default_muon_lr() -> f64 {
     0.02
+}
+
+fn default_fused_ce_chunk() -> usize {
+    4096
 }
 
 impl TrainingConfig {
@@ -248,29 +265,73 @@ impl Trainer {
                 let target_t =
                     Tensor::from_vec(target_flat, (b, t), &device)?.to_dtype(DType::U32)?;
 
+                // Forward + loss + backward for this microbatch → (detached
+                // per-microbatch loss, GradStore). Two paths: the memory-frugal
+                // fused cross-entropy (folds the LM-head projection into a
+                // chunked, analytically-differentiated loss — never materializes
+                // the full (B*T, vocab) logits) or the standard path. Both scale
+                // by 1/grad_accum before backprop and free the microbatch graph
+                // before the next iteration.
                 let fwd_start = profile.then(Instant::now);
-                let (logits, _) = model.forward_train(&input_t)?;
-                let loss = cross_entropy_loss(&logits, &target_t)?;
+                let (detached, step_grads) = if self.config.fused_ce {
+                    let normed = model.forward_train_normed(&input_t)?;
+                    let w = model.tied_lm_weight().clone();
+                    let scale = model.logit_scale();
+                    let inv = 1.0 / self.config.grad_accum as f64;
+                    let (loss_t, g_normed, g_w) = fused_cross_entropy_grads(
+                        &normed,
+                        &w,
+                        scale,
+                        &target_t,
+                        self.config.fused_ce_chunk,
+                    )?;
+                    let g_normed = (g_normed * inv)?.to_dtype(normed.dtype())?;
+                    if let Some(s) = fwd_start {
+                        device.synchronize()?;
+                        t_fwd += s.elapsed();
+                    }
+                    let bwd_start = profile.then(Instant::now);
+                    // Re-inject grad_normed through the model graph via a surrogate
+                    // whose gradient w.r.t. `normed` is exactly `g_normed`.
+                    let surrogate = normed.broadcast_mul(&g_normed)?.sum_all()?;
+                    let mut step_grads = surrogate.backward()?;
+                    // Add the LM-head (tied weight) gradient — the surrogate only
+                    // carried the input-embedding path's contribution to it.
+                    let g_w = (g_w * inv)?.to_dtype(w.dtype())?;
+                    let merged_w = match step_grads.remove(&w) {
+                        Some(p) => (p + &g_w)?,
+                        None => g_w,
+                    };
+                    step_grads.insert(&w, merged_w);
+                    if let Some(s) = bwd_start {
+                        device.synchronize()?;
+                        t_bwd += s.elapsed();
+                    }
+                    (loss_t, step_grads)
+                } else {
+                    let (logits, _) = model.forward_train(&input_t)?;
+                    let loss = cross_entropy_loss(&logits, &target_t)?;
+                    let detached = loss.detach();
+                    // Scale and immediately backprop — frees this graph before the next microbatch.
+                    let scaled = (loss / self.config.grad_accum as f64)?;
+                    if let Some(s) = fwd_start {
+                        device.synchronize()?;
+                        t_fwd += s.elapsed();
+                    }
+                    let bwd_start = profile.then(Instant::now);
+                    let step_grads = scaled.backward()?;
+                    if let Some(s) = bwd_start {
+                        device.synchronize()?;
+                        t_bwd += s.elapsed();
+                    }
+                    (detached, step_grads)
+                };
 
-                // Accumulate the (detached) loss on-device; synced once below.
-                let detached = loss.detach();
+                // Accumulate the (detached) loss on-device; synced once per step.
                 loss_acc = Some(match loss_acc {
                     Some(acc) => (acc + &detached)?,
                     None => detached,
                 });
-
-                // Scale and immediately backprop — frees this graph before next microbatch.
-                let scaled = (loss / self.config.grad_accum as f64)?;
-                if let Some(s) = fwd_start {
-                    device.synchronize()?;
-                    t_fwd += s.elapsed();
-                }
-                let bwd_start = profile.then(Instant::now);
-                let step_grads = scaled.backward()?;
-                if let Some(s) = bwd_start {
-                    device.synchronize()?;
-                    t_bwd += s.elapsed();
-                }
 
                 // Accumulate into merged_grads.
                 match merged_grads {

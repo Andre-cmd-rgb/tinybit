@@ -74,6 +74,31 @@ impl TinyBit {
         Ok((logits, spec))
     }
 
+    /// Training forward that stops BEFORE the LM-head matmul, returning the
+    /// post-final-LayerNorm hidden states `normed` (B, T, D). Pair with
+    /// `fused_cross_entropy_grads` (tinybit-train) to compute the loss without
+    /// materializing the full (B*T, vocab) logits. `spec_heads` are skipped —
+    /// the fused-CE path does not train them.
+    pub fn forward_train_normed(&self, token_ids: &Tensor) -> anyhow::Result<Tensor> {
+        let mut x = self.embed.embed(token_ids)?.to_dtype(self.compute_dtype)?;
+        for block in &self.blocks {
+            x = block.forward_train(&x)?;
+        }
+        self.embed.normed(&x)
+    }
+
+    /// The tied embedding / LM-head weight (vocab_size, d_model). Same tensor id
+    /// candle's autograd uses, so a manually-computed LM-head gradient can be
+    /// merged into the GradStore returned by `backward()`.
+    pub fn tied_lm_weight(&self) -> &Tensor {
+        self.embed.weight()
+    }
+
+    /// Logit scale applied inside the LM head (1/sqrt(d_model)).
+    pub fn logit_scale(&self) -> f64 {
+        1.0 / (self.config.d_model as f64).sqrt()
+    }
+
     /// Single-token inference step. Returns logits (B, vocab_size).
     pub fn forward_step(
         &self,

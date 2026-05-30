@@ -35,7 +35,7 @@ The architecture (`*-coding.toml` vs its sibling) is **byte-for-byte identical**
 A checkpoint trained either way loads under either config. The difference is:
 
 1. **Training data** — `scripts/prepare_data.sh` takes `DATA_PROFILE=general|coding`:
-   - *general*: FineWeb-Edu + Wikipedia + chat data + a little code.
+   - *general*: FineWeb-Edu + Cosmopedia v2 + TinyStories + chat data + a little code.
    - *coding*: The Stack (Python/Rust/JS/C/Go) + technical chat + some prose.
 2. **Default system prompt** — `--profile coding` (or a config filename
    containing `coding`) selects the coding persona at chat/eval time.

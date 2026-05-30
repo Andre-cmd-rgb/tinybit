@@ -108,7 +108,7 @@ Select the family mix with `DATA_PROFILE`:
 
 | Profile | Mix |
 |---------|-----|
-| `general` (default) | FineWeb-Edu, Wikipedia, OpenHermes/dolphin chat, a little code |
+| `general` (default) | FineWeb-Edu, Cosmopedia v2, TinyStories, OpenHermes/dolphin chat, a little code |
 | `coding` | The Stack (Python/Rust/JS/C/Go), technical chat, some prose |
 
 ```bash

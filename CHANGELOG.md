@@ -2,6 +2,18 @@
 
 All notable changes to tinybit are documented here.
 
+## [Unreleased]
+
+### Changed
+- **General data mix retuned for small models.** Dropped raw **Wikipedia** (was
+  30%) — at ~50M params the model could not store encyclopedic facts and only
+  learned Wikipedia's proper-noun register, hallucinating band/album/biography
+  trivia. Replaced with **Cosmopedia v2** (synthetic textbooks, 30%) and
+  **TinyStories** (coherent narratives, 12%); FineWeb-Edu stays the backbone and
+  val-set head. Net: cleaner, more coherent generation from a tiny model
+  (cf. SmolLM / TinyStories / Phi). Requires a data re-prep + fresh training run
+  to take effect. See `scripts/prepare_data.sh`.
+
 ## 1.0.0
 
 First serious release. tinybit is now a coherent, local-first Rust AI assistant:

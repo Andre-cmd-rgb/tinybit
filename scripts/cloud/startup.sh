@@ -58,6 +58,7 @@ SYNC_INTERVAL="__SYNC_INTERVAL__"
 HF_TOKEN_VAL="__HF_TOKEN__"
 SCRIPT_VERSION="__SCRIPT_VERSION__"
 TRAIN_CONFIG_OVERRIDE="__TRAIN_CONFIG__"
+RESET_RUN="__RESET_RUN__"
 ZONE_INFO="__ZONE__"
 MACHINE_INFO="__MACHINE__"
 ACCELERATOR_INFO="__ACCELERATOR__"
@@ -279,6 +280,21 @@ fi
 chmod +x "$WORKDIR"/scripts/*.sh 2>/dev/null || true
 chmod +x "$WORKDIR"/scripts/cloud/*.sh 2>/dev/null || true
 cd "$WORKDIR"
+
+# ---------- reset_run (fresh redeploy onto a warm/reused disk) -----------------
+# When RESET_RUN=1 — a redeploy that CHANGES the data mix or otherwise wants a
+# clean run on a reused VM's warm disk — wipe the stale tokenized data and old
+# checkpoints. Otherwise prepare_data would skip (seeing the old data/*.bin) and
+# start_training would --resume the previous run. With them gone, prepare_data
+# re-tokenizes the new mix and training starts from step 0. Default 0 → no-op
+# (fresh-VM launches have an empty disk anyway).
+if [ "$RESET_RUN" = "1" ]; then
+  log_stage reset_run
+  log "RESET_RUN=1 — clearing stale data/*.bin and checkpoints for a fresh run"
+  rm -f "$WORKDIR"/data/*.bin 2>/dev/null || true
+  rm -rf "$WORKDIR"/checkpoints/* 2>/dev/null || true
+  FORCE_DATA=1
+fi
 
 # ---------- cargo_build -------------------------------------------------------
 log_stage cargo_build

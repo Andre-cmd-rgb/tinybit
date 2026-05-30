@@ -14,7 +14,11 @@
 # Live L4 benchmarks on 2026-05-28:
 #   batch 10 / accum 7: 16.999 s/step, 2.11k tok/s
 #   batch 11 / accum 6: 15.180 s/step, 2.23k tok/s
-# batch 12 OOMed immediately, so do not raise this without re-measuring.
+# batch 12 OOMed immediately *with standard cross-entropy* — that OOM was the
+# (B*T, vocab) logits tensor. 2026-05-30: fused_ce (below) removes it, so batch
+# is raised to 14 / accum 5. Confirm live: if it still OOMs, lower batch_size
+# (data is cached → cheap restart); KEEP_VM_ON_FAILURE=1 makes an OOM
+# non-destructive for tuning.
 #
 # Pair with:
 #   DATA_TOKENS=1500000000
@@ -23,13 +27,22 @@ train_data     = "data/train.bin"
 val_data       = "data/val.bin"
 checkpoint_dir = "checkpoints/"
 
-batch_size     = 11
-grad_accum     = 6
+batch_size     = 14
+grad_accum     = 5
 total_steps    = 25000
 peak_lr        = 3e-4
 weight_decay   = 0.01
 grad_clip      = 1.0
 bf16           = true
+
+# Memory-frugal fused cross-entropy (loss::fused_cross_entropy_grads): the LM-head
+# projection + softmax loss are computed in row-chunks and differentiated
+# analytically, so the full (B*T, vocab) F32 logits/log-softmax are never
+# materialized for autograd. Once the WKV scan was fused, THAT loss tensor — not
+# the scan — was the VRAM ceiling pinning batch_size at 11; removing it is what
+# lets batch rise to 14. Numerically identical to standard CE (parity +
+# end-to-end grad tests in loss.rs).
+fused_ce       = true
 
 save_every     = 500
 eval_every     = 500

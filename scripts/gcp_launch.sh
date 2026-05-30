@@ -74,6 +74,10 @@ GCS_REPO_PREFIX="${GCS_REPO_PREFIX:-tinybit}"
 SKIP_UPLOAD="${SKIP_UPLOAD:-0}"
 FORCE="${FORCE:-0}"
 TRAIN_CONFIG="${TRAIN_CONFIG:-}"
+# RESET_RUN=1 wipes stale data/checkpoints on a reused/warm disk so a redeploy
+# that changed the data mix re-tokenizes and trains from step 0 (vs --resume).
+# Fresh launches default 0 (empty disk → nothing to clear).
+RESET_RUN="${RESET_RUN:-0}"
 
 # If a train config path was given, verify it exists locally so we fail fast
 # before paying for a VM.
@@ -223,6 +227,7 @@ subs = {
     "__HF_TOKEN__":           os.environ.get("HF_TOKEN_VAL", ""),
     "__SCRIPT_VERSION__":     os.environ["SCRIPT_VERSION"],
     "__TRAIN_CONFIG__":       os.environ.get("TRAIN_CONFIG", ""),
+    "__RESET_RUN__":          os.environ.get("RESET_RUN", "0"),
     "__ZONE__":               os.environ["ZONE_INFO"],
     "__MACHINE__":            os.environ["MACHINE_INFO"],
     "__ACCELERATOR__":        os.environ["ACCEL_INFO"],
@@ -256,7 +261,7 @@ for prov in "${PROVISIONING_LIST[@]}"; do
 
     export RUN_ID MODEL_SIZE GCP_BUCKET GCS_REPO_PREFIX DATA_TOKENS MIN_TOKENS \
            TRAIN_STEPS CUDA_VERSION CUDA_DIR KEEP_VM_ON_FAILURE SYNC_INTERVAL \
-           HF_TOKEN_VAL SCRIPT_VERSION TRAIN_CONFIG
+           HF_TOKEN_VAL SCRIPT_VERSION TRAIN_CONFIG RESET_RUN
     ZONE_INFO="$zone" MACHINE_INFO="$MACHINE_TYPE" ACCEL_INFO="$ACCELERATOR_TYPE" \
     render_startup "$zone"
 
