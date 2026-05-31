@@ -1,0 +1,9 @@
+# Force LF line endings on files that run on the Linux training VMs.
+# Windows checkouts (CRLF) otherwise upload \r\n and break bash/python:
+#   prepare_data.sh: line 49: $'\r': command not found  /  set: pipefail: invalid option
+*.sh   text eol=lf
+*.py   text eol=lf
+*.toml text eol=lf
+# Shell/cloud scripts explicitly (belt and suspenders).
+scripts/**       text eol=lf
+scripts/cloud/** text eol=lf
