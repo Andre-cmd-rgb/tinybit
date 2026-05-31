@@ -41,10 +41,17 @@ weight_decay   = 0.01
 grad_clip      = 1.0
 bf16           = true
 
-# fused_ce DISABLED: see the note above. The memory-frugal fused cross-entropy
-# (loss::fused_cross_entropy_grads) was intended to avoid materializing the full
-# (B*T, vocab) F32 logits for autograd, but on the L4 it OOMs even at batch=11
-# where standard CE fits. Left off until the regression is root-caused.
+# fused_ce: ROOT-CAUSED AND FIXED IN CODE (loss.rs), but left OFF here pending a
+# live GPU A/B. The regression was a missing `.detach()` on `weight` inside
+# fused_cross_entropy_grads: `weight` requires grad, so the per-chunk (C, vocab)
+# logits/softmax became retained autograd nodes (pinned by grad_normed_chunks for
+# the whole loop) — fused CE used MORE memory than standard CE and OOMed even at
+# batch=11. Now both `normed` AND `weight` are detached (grads are analytic), so
+# peak extra memory is one (chunk_rows, vocab) tile. Guarded by
+# loss::tests::fused_ce_outputs_are_detached. Before flipping this back to true
+# (and trying batch>11), confirm the memory win with a live L4 A/B that clears
+# step 0 — do NOT assume it from the code change alone (that assumption is exactly
+# what caused the original OOM).
 fused_ce       = false
 
 save_every     = 500

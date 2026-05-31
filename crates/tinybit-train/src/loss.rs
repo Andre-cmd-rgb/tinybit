@@ -58,11 +58,19 @@ pub fn fused_cross_entropy_grads(
 
     // Detach: the chunked matmuls below must NOT build/retain an autograd graph
     // over the (chunk, vocab) logits — that is the whole point (memory). The
-    // gradient w.r.t. `normed` is returned explicitly and re-injected by the
-    // caller via a surrogate (`(normed * grad_normed).sum().backward()`).
+    // gradients w.r.t. `normed` and `weight` are returned explicitly and
+    // re-injected by the caller (a surrogate `(normed * grad_normed).sum()
+    // .backward()` plus a manual `grad_w` merge), so candle must not track ANY of
+    // this. BOTH inputs have to be detached: `weight` is a model parameter that
+    // requires grad, so a non-detached `w` would make every chunk's logits/
+    // softmax `(C, V)` tensors graph nodes — and `g_nf` (pushed into
+    // `grad_normed_chunks`) would then pin that graph for EVERY chunk, retaining
+    // ~6×(B*T, V) instead of freeing each chunk. That un-detached `weight` was the
+    // VRAM regression that made fused CE OOM where standard CE fit (it used MORE
+    // memory, not less). Keep both detaches.
     let normed_flat = normed.detach().reshape((n, d))?.to_dtype(DType::F32)?;
     let targets_flat = targets.reshape((n,))?.to_dtype(DType::I64)?;
-    let w = weight.to_dtype(DType::F32)?; // (V, D)
+    let w = weight.detach().to_dtype(DType::F32)?; // (V, D) — detached, see above
     let wt = w.t()?.contiguous()?; // (D, V)
 
     let mut grad_w = Tensor::zeros((v, d), DType::F32, dev)?;
@@ -189,6 +197,44 @@ mod tests {
     #[test]
     fn fused_ce_matches_autograd() -> anyhow::Result<()> {
         fused_ce_parity_on(&Device::Cpu)
+    }
+
+    /// Regression guard for the VRAM blowup (the reason fused CE OOMed where
+    /// standard CE fit): the fused outputs MUST be fully detached from autograd,
+    /// because the grads are returned analytically. If `weight` (or `normed`) is
+    /// left attached, every chunk's `(C, V)` logits/softmax become retained graph
+    /// nodes that `grad_normed_chunks` pins for the whole loop — using MORE memory
+    /// than the standard `(B*T, V)` path. Here we differentiate the fused outputs
+    /// and assert no gradient flows back to the inputs (i.e. there is no graph).
+    #[test]
+    fn fused_ce_outputs_are_detached() -> anyhow::Result<()> {
+        let dev = Device::Cpu;
+        let (b, t, d, v) = (2usize, 5usize, 8usize, 17usize);
+        let scale = 1.0 / (d as f64).sqrt();
+
+        let normed = Var::from_tensor(&Tensor::randn(0f32, 1f32, (b, t, d), &dev)?)?;
+        let weight = Var::from_tensor(&Tensor::randn(0f32, 1f32, (v, d), &dev)?)?;
+        let tgt: Vec<u32> = (0..b * t).map(|i| (i % v) as u32).collect();
+        let targets = Tensor::from_vec(tgt, (b, t), &dev)?;
+
+        let (_loss, g_normed, g_w) =
+            fused_cross_entropy_grads(normed.as_tensor(), weight.as_tensor(), scale, &targets, 3)?;
+
+        // Differentiating any fused output must NOT reach the inputs: the outputs
+        // are plain data, not graph nodes. With an un-detached `weight`, backward
+        // would populate `weight`'s grad here (and the (C,V) graph would have been
+        // retained) — that is the regression this guards.
+        let probe = (g_normed.sum_all()? + g_w.sum_all()?)?;
+        let bg = probe.backward()?;
+        assert!(
+            bg.get(weight.as_tensor()).is_none(),
+            "fused output retains an autograd graph to `weight` — the un-detached-weight VRAM regression is back"
+        );
+        assert!(
+            bg.get(normed.as_tensor()).is_none(),
+            "fused output retains an autograd graph to `normed`"
+        );
+        Ok(())
     }
 
     /// End-to-end on a real (tiny) TinyBit: the fused training path
