@@ -9,6 +9,12 @@
 #   DATA_PROFILE   general | coding   (default: general; alias: PROFILE)
 #   HF_TOKEN       optional — enables gated datasets (the-stack-smol, etc.)
 #   ENABLE_GATED   1 to attempt gated datasets when HF_TOKEN is set (default 1)
+#   CUSTOM_CHAT_DIR    dir of your own {"messages":[...]} JSONL/TXT files to mix in
+#                      (default: datasets/). Validate them with
+#                      scripts/validate_chat_jsonl.py first.
+#   CUSTOM_CHAT_EPOCHS times to repeat each custom file (default 10; 0 disables).
+#                      Custom tokens are tokenized LAST and added on top of
+#                      TOTAL_TOKENS, so the val split stays the FineWeb-Edu head.
 #
 # Profiles (the ONLY difference between the general and coding model families):
 #   general — natural-language assistant mix tuned for a SMALL model: FineWeb-Edu
@@ -50,7 +56,7 @@ mkdir -p "$OUTPUT_DIR"
 echo "Preparing data in $OUTPUT_DIR ..."
 
 python3 - "$OUTPUT_DIR" <<'PYTHON'
-import os, sys
+import os, sys, json
 from pathlib import Path
 
 OUTPUT_DIR = sys.argv[1] if len(sys.argv) > 1 else "data"
@@ -73,6 +79,23 @@ PROFILE       = (os.environ.get("DATA_PROFILE") or os.environ.get("PROFILE") or 
 if PROFILE not in ("general", "coding"):
     print(f"ERROR: DATA_PROFILE must be 'general' or 'coding' (got {PROFILE!r})")
     sys.exit(1)
+
+# Custom curated chat data (your own generated JSONL — e.g. identity/tool-use).
+# Drop {"messages":[{role,content}...]} JSONL/TXT files into CUSTOM_CHAT_DIR; each
+# is tokenized LAST (so the val head stays the FineWeb-Edu distribution) and
+# repeated CUSTOM_CHAT_EPOCHS times. These tokens are ADDED ON TOP of TOTAL_TOKENS
+# rather than competing for its budget, so a small set is reliably included.
+CUSTOM_CHAT_DIR    = os.environ.get("CUSTOM_CHAT_DIR", "datasets")
+CUSTOM_CHAT_EPOCHS = int(os.environ.get("CUSTOM_CHAT_EPOCHS", "10"))
+custom_files = []
+if CUSTOM_CHAT_DIR and os.path.isdir(CUSTOM_CHAT_DIR) and CUSTOM_CHAT_EPOCHS > 0:
+    for fn in sorted(os.listdir(CUSTOM_CHAT_DIR)):
+        if fn.endswith((".jsonl", ".txt")):
+            custom_files.append(os.path.join(CUSTOM_CHAT_DIR, fn))
+if custom_files:
+    print(f"Custom chat data: {len(custom_files)} file(s) from {CUSTOM_CHAT_DIR}/ "
+          f"x{CUSTOM_CHAT_EPOCHS} epochs (tokenized last): "
+          + ", ".join(os.path.basename(f) for f in custom_files))
 
 # Write buffer: flush to disk every FLUSH_EVERY tokens to keep RAM usage bounded.
 # At ~4 bytes/token, 4M tokens = 16 MB peak RAM for the buffer.
@@ -142,6 +165,18 @@ if PROFILE == "coding" and not (HF_TOKEN and ENABLE_GATED):
     print("WARNING: coding profile selected but HF_TOKEN is missing/disabled — the gated")
     print("         The Stack code datasets will be skipped and the model will see little")
     print("         to no code. Set HF_TOKEN for a real coding model.")
+
+def read_jsonl(path):
+    """Yield parsed objects from a JSONL file (one JSON object per line)."""
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
 
 def normalize_turns(value):
     """Return a list of (role, content) from a conversations/messages field.
@@ -278,6 +313,33 @@ with open(tmp_path, 'wb') as tmp_f:
             flush_buf(tmp_f)
             collected[label] = 0
             continue
+
+    # ---- Custom curated chat data (your own generated JSONL) ----------------
+    # Appended after the weighted mix (so the val head stays FineWeb-Edu) and
+    # repeated for a few epochs. Tokens are additive on top of TOTAL_TOKENS.
+    for fp in custom_files:
+        label = f"custom:{os.path.basename(fp)}"
+        got = 0
+        for _epoch in range(CUSTOM_CHAT_EPOCHS):
+            for obj in read_jsonl(fp):
+                turns = normalize_turns(obj.get("messages", []))
+                roles = {r for r, _ in turns}
+                if "user" not in roles or "assistant" not in roles:
+                    continue  # skip degenerate entries (no real user/assistant exchange)
+                text = format_chat(turns)
+                if not text or not text.strip():
+                    continue
+                try:
+                    enc = tokenizer.encode(text)
+                except Exception:
+                    continue
+                write_buf.extend(enc.ids + [EOS_ID])
+                got += len(enc.ids) + 1
+                if len(write_buf) >= FLUSH_EVERY:
+                    flush_buf(tmp_f)
+        flush_buf(tmp_f)
+        collected[label] = got
+        print(f"  {label}: {got:,} tokens ({CUSTOM_CHAT_EPOCHS} epochs)")
 
 total_collected = total_written
 print()
