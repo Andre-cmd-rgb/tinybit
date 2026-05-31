@@ -1,11 +1,11 @@
-# tinybit small-coding — coding-specialized variant of `small` (~100M params).
+# tinybit bit-coding — coding-specialized variant of `bit` (~100M params).
 #
-# Architecture is IDENTICAL to configs/small.toml. What makes this a "coding"
+# Architecture is IDENTICAL to configs/bit.toml. What makes this a "coding"
 # model is the TRAINING DATA, not the shape:
 #   - prepare the dataset with PROFILE=coding (code-heavy mix; see scripts/prepare_data.sh)
 #   - chat/eval with `--profile coding` so the coding system prompt is used
-# NOTE: ~100M params is larger than the validated micro L4 batch — training on a
-# single L4 needs a smaller batch_size/max_seq_len (untuned) or bigger hardware.
+# NOTE: ~100M params is larger than the validated micro L4 batch — train on a
+# single L4 with configs/train-bit-l4.toml (smaller batch) or bigger hardware.
 vocab_size  = 32008
 num_layers  = 12
 d_model     = 640

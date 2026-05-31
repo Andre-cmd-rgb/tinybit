@@ -129,16 +129,17 @@ cargo test --workspace
     only after a live L4 run confirms the new headroom. The loop path (CPU, or
     `TINYBIT_FUSED_WKV=off`) still carries the old budget.
 
-17. Two model families, ONE architecture. `general` (micro/small/medium) and
+17. Two model families, ONE architecture. `general` (micro/bit/qbit) and
     `coding` (`*-coding`) share byte-identical arch configs; they differ only in
     (a) the training-data mix and (b) the default system prompt. The mix is
     chosen by `DATA_PROFILE=general|coding` in prepare_data.sh; the persona by
     `Profile` (core/tokenizer.rs) — `--profile`, or inferred from a config name
     containing "coding". A checkpoint loads under either config. Do NOT diverge
     the `*-coding.toml` shapes from their siblings. The shipped lineup is
-    micro≈50M / small≈100M / medium≈150M (`ModelConfig::{micro,small,medium}` +
-    `configs/{micro,small,medium}{,-coding}.toml`); only micro has a validated L4
-    training recipe (batch 11), small/medium need batch/seq tuning. Custom curated
+    micro≈50M / bit≈100M / qbit≈150M (`ModelConfig::{micro,bit,qbit}` +
+    `configs/{micro,bit,qbit}{,-coding}.toml`), each with an L4 train config
+    (`configs/train-{micro,bit,qbit}-l4.toml`; micro is the validated batch-11
+    target, bit/qbit use smaller batches to fit 24 GB). Custom curated
     chat data (e.g. identity/tool JSONL) lives in `datasets/` and is mixed in by
     prepare_data.sh (tokenized last, repeated `CUSTOM_CHAT_EPOCHS`×; see
     decision 18 / datasets/README.md).

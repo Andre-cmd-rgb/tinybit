@@ -29,7 +29,7 @@ V1.0 is **local CLI inference first**: `chat`, `eval`, `train`, `convert`,
 
 - **RWKV-7 architecture** — recurrent, O(1) memory at inference (no KV cache);
   state is a fixed-size matrix per layer regardless of context length.
-- **Two model families** — *general* (`micro`/`small`/`medium`) and
+- **Two model families** — *general* (`micro`/`bit`/`qbit`) and
   *coding* (`*-coding`). Same architecture, different training data + persona.
   See [MODELS.md](MODELS.md).
 - **BitLinear quantization** — ternary weights `{-1, 0, +1}` (BitNet b1.58 STE),
@@ -101,8 +101,8 @@ training-data mix + default persona. Full details in [MODELS.md](MODELS.md).
 | Preset | Params | Layers | d_model | d_ffn | L4-trainable |
 |--------|--------|--------|---------|-------|--------------|
 | micro  | ~50M   | 16     | 384     | 1344  | ✅ (main target, batch 11) |
-| small  | ~100M  | 12     | 640     | 2240  | ⚠️ needs batch/seq tuning |
-| medium | ~150M  | 13     | 768     | 2688  | ⚠️ needs batch/seq tuning |
+| bit    | ~100M  | 12     | 640     | 2240  | ✅ (train-bit-l4.toml) |
+| qbit   | ~150M  | 13     | 768     | 2688  | ✅ (train-qbit-l4.toml) |
 
 Each has a `-coding` sibling (`configs/<size>-coding.toml`) trained on a
 code-heavy data mix. All use a 3.5× FFN expansion (d_ffn = 3.5 × d_model).

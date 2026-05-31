@@ -33,9 +33,9 @@
 #                        TRAIN_STEPS.
 #
 # Usage:
-#   ./scripts/gcp_launch.sh [micro|small|medium|micro-coding|small-coding|medium-coding]
-#   (micro≈50M is the only size with a validated L4 batch; small≈100M / medium≈150M
-#    need batch/seq tuning before a full L4 run.)
+#   ./scripts/gcp_launch.sh [micro|bit|qbit|micro-coding|bit-coding|qbit-coding]
+#   (micro≈50M batch 11 is the validated target; bit≈100M / qbit≈150M use the
+#    smaller-batch configs/train-{bit,qbit}-l4.toml to fit the L4's 24 GB.)
 #
 # A "-coding" suffix selects configs/<size>-coding.toml and the code-heavy data
 # profile (startup.sh derives DATA_PROFILE from the name). Pair it with the same

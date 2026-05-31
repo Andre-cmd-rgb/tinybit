@@ -1,11 +1,11 @@
-# tinybit medium-coding — coding-specialized variant of `medium` (~150M params).
+# tinybit qbit-coding — coding-specialized variant of `qbit` (~150M params).
 #
-# Architecture is IDENTICAL to configs/medium.toml. What makes this a "coding"
+# Architecture is IDENTICAL to configs/qbit.toml. What makes this a "coding"
 # model is the TRAINING DATA, not the shape:
 #   - prepare the dataset with PROFILE=coding (code-heavy mix; see scripts/prepare_data.sh)
 #   - chat/eval with `--profile coding` so the coding system prompt is used
-# NOTE: ~150M params is the largest shipped model — training on a single L4 needs
-# a smaller batch_size/max_seq_len (untuned) or bigger hardware.
+# NOTE: ~150M params is the largest shipped model — train on a single L4 with
+# configs/train-qbit-l4.toml (smaller batch) or bigger hardware.
 vocab_size  = 32008
 num_layers  = 13
 d_model     = 768

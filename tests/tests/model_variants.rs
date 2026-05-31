@@ -12,7 +12,7 @@ fn config_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("configs").join(name)
 }
 
-const SIZES: &[&str] = &["micro", "small", "medium"];
+const SIZES: &[&str] = &["micro", "bit", "qbit"];
 
 #[test]
 fn all_six_variants_parse_and_validate() {

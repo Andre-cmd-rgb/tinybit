@@ -1,0 +1,39 @@
+# 100M `bit` model on a single NVIDIA L4 (24 GB VRAM).
+#
+# Per-step token budget:
+#   batch 4 × seq 1024 × grad_accum 8 = 32_768 tokens / step  (≈ micro's 33.8k)
+#
+# Total token budget:
+#   25_000 steps × 32_768 ≈ 0.82 B tokens (~8x params)
+#
+# BATCH SIZE IS A CONSERVATIVE ESTIMATE, NOT YET LIVE-VALIDATED. It is scaled
+# down from micro's validated batch 11 (d384/L16/seq512): bit is d640/L12/seq1024,
+# so each sample costs ~2.5× micro's activation memory and the 100M params add
+# ~1.6 GB of fixed optimizer state. batch 4 should fit with headroom; if it OOMs
+# at step 0, drop batch_size (KEEP_VM_ON_FAILURE=1 makes that cheap). If it fits
+# with lots of free VRAM, raise it. Validate on a live L4 before a full run.
+#
+# Pair with:
+#   DATA_TOKENS=1500000000
+
+train_data     = "data/train.bin"
+val_data       = "data/val.bin"
+checkpoint_dir = "checkpoints/"
+
+batch_size     = 4
+grad_accum     = 8
+total_steps    = 25000
+peak_lr        = 3e-4
+weight_decay   = 0.01
+grad_clip      = 1.0
+bf16           = true
+
+# fused_ce stays OFF until the cross-entropy memory path is re-validated on GPU
+# (see configs/train-micro-l4.toml and CLAUDE.md). Standard CE here.
+fused_ce       = false
+
+save_every     = 500
+eval_every     = 500
+eval_batches   = 20
+
+smoke_test_steps = 0

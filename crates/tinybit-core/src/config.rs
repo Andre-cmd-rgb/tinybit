@@ -63,9 +63,9 @@ impl ModelConfig {
         }
     }
 
-    /// ~100M params (3.5× FFN, 12 layers). Larger than an L4 comfortably trains
-    /// at the micro batch — treat as needing batch/seq tuning or bigger hardware.
-    pub fn small() -> Self {
+    /// ~100M params (3.5× FFN, 12 layers) — `bit`. Larger than an L4 trains at
+    /// the micro batch; see configs/train-bit-l4.toml for its tuned (smaller) batch.
+    pub fn bit() -> Self {
         Self {
             vocab_size: 32008, num_layers: 12, d_model: 640,
             d_ffn: 2240, num_heads: 10, head_dim: 64,
@@ -74,8 +74,9 @@ impl ModelConfig {
         }
     }
 
-    /// ~150M params (3.5× FFN, 13 layers) — the largest shipped model.
-    pub fn medium() -> Self {
+    /// ~150M params (3.5× FFN, 13 layers) — `qbit`, the largest shipped model.
+    /// See configs/train-qbit-l4.toml for its tuned (smaller) L4 batch.
+    pub fn qbit() -> Self {
         Self {
             vocab_size: 32008, num_layers: 13, d_model: 768,
             d_ffn: 2688, num_heads: 12, head_dim: 64,

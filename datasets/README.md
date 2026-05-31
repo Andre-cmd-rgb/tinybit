@@ -19,7 +19,7 @@ this folder into the training mix:
 ## Validate before training
 
 ```bash
-python scripts/validate_chat_jsonl.py datasets/dataset1_1000.jsonl
+python scripts/validate_chat_jsonl.py datasets/identity-tools-01.jsonl
 ```
 
 It checks JSON validity, role/content structure, and that every `<|tool_call|>`
@@ -42,4 +42,5 @@ needs a re-tokenize: relaunch with `RESET_RUN=1` (or `FORCE_DATA=1`). A fresh
 
 ## Current files
 
-- `dataset1_1000.jsonl` — 442 identity + tool-use examples (AI-generated, validated).
+- `identity-tools-01.jsonl` — 442 identity + tool-use examples (AI-generated, validated).
+- `identity-tools-02.jsonl` — 663 identity + tool-use examples (AI-generated, validated).

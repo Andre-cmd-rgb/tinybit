@@ -12,7 +12,7 @@
 #   * tokenizer.json or HF reachable
 #   * datasets package importable (data prep precheck — non-fatal)
 #
-# Usage: ./scripts/preflight.sh [micro|small|medium]
+# Usage: ./scripts/preflight.sh [micro|bit|qbit]
 
 set -uo pipefail
 

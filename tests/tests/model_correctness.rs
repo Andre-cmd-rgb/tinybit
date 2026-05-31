@@ -112,10 +112,10 @@ fn test_state_is_fixed_size() -> anyhow::Result<()> {
 fn test_all_config_presets_build() -> anyhow::Result<()> {
     let device = Device::Cpu;
     let configs = [
-        // Shipped lineup: micro 50M / small 100M / medium 150M.
-        ("micro",  ModelConfig::micro(),  30_000_000usize, 80_000_000),
-        ("small",  ModelConfig::small(),  80_000_000,      130_000_000),
-        ("medium", ModelConfig::medium(), 120_000_000,     200_000_000),
+        // Shipped lineup: micro 50M / bit 100M / qbit 150M.
+        ("micro", ModelConfig::micro(), 30_000_000usize, 80_000_000),
+        ("bit",   ModelConfig::bit(),   80_000_000,      130_000_000),
+        ("qbit",  ModelConfig::qbit(),  120_000_000,     200_000_000),
     ];
     for (name, cfg, lo, hi) in configs {
         let vmap = VarMap::new();

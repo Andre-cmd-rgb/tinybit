@@ -7,7 +7,7 @@
 #
 # Placeholders (must all be substituted before upload):
 #   __RUN_ID__              — unique run id, e.g. 20260527-141500-micro
-#   __MODEL_SIZE__          — micro|small|medium (optionally with a -coding
+#   __MODEL_SIZE__          — micro|bit|qbit (optionally with a -coding
 #                              suffix, e.g. micro-coding → configs/micro-coding.toml
 #                              + the coding data profile)
 #   __GCS_BUCKET__          — gs://bucket-name  (no trailing slash)
