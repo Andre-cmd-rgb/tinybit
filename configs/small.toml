@@ -1,10 +1,10 @@
 vocab_size  = 32008
-num_layers  = 13
-d_model     = 1024
-d_ffn       = 3584
-num_heads   = 16
+num_layers  = 12
+d_model     = 640
+d_ffn       = 2240
+num_heads   = 10
 head_dim    = 64
-max_seq_len = 2048
+max_seq_len = 1024
 dropout     = 0.05
 spec_heads  = 0
 ternary_ffn = false

@@ -3,6 +3,16 @@ use candle_nn::{VarBuilder, VarMap};
 use tinybit_core::{config::ModelConfig, model::TinyBit};
 use tinybit_train::loss::cross_entropy_loss;
 
+/// Tiny throwaway config — fast smoke fixture, decoupled from the shipped
+/// model lineup (micro/small/medium).
+fn tiny_config() -> ModelConfig {
+    ModelConfig {
+        vocab_size: 256, num_layers: 3, d_model: 64, d_ffn: 224,
+        num_heads: 1, head_dim: 64, ternary_ffn: false, int8_time: false,
+        max_seq_len: 64, dropout: 0.0, spec_heads: 0,
+    }
+}
+
 fn make_synthetic_data(
     n_chunks: usize,
     seq_len: usize,
@@ -40,7 +50,7 @@ fn forward_and_loss(
 fn smoke_train_nano_100_steps() -> anyhow::Result<()> {
     // Gate test — must pass before any real training run.
     let device = Device::Cpu;
-    let config = ModelConfig::nano();
+    let config = tiny_config();
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = TinyBit::new(config.clone(), vb)?;
@@ -88,7 +98,7 @@ fn test_loss_decreases_on_trivial_data() -> anyhow::Result<()> {
     // Full gradient-based training requires candle's grad system.
     // We test that loss is sensible and repeatable.
     let device = Device::Cpu;
-    let config = ModelConfig::nano();
+    let config = tiny_config();
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = TinyBit::new(config.clone(), vb)?;

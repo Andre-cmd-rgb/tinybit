@@ -2,8 +2,18 @@ use candle_core::{Device, DType, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use tinybit_core::{config::ModelConfig, model::TinyBit, state::InferenceState};
 
+/// Tiny throwaway config for fast correctness tests — decoupled from the shipped
+/// model lineup (micro/small/medium) so those can change without touching these.
+fn tiny_config() -> ModelConfig {
+    ModelConfig {
+        vocab_size: 256, num_layers: 3, d_model: 64, d_ffn: 224,
+        num_heads: 1, head_dim: 64, ternary_ffn: false, int8_time: false,
+        max_seq_len: 64, dropout: 0.0, spec_heads: 0,
+    }
+}
+
 fn nano_model() -> anyhow::Result<(TinyBit, ModelConfig)> {
-    let config = ModelConfig::nano();
+    let config = tiny_config();
     let device = Device::Cpu;
     let vmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&vmap, DType::F32, &device);
@@ -70,7 +80,7 @@ fn test_inference_step_matches_train() -> anyhow::Result<()> {
 
 #[test]
 fn test_state_is_fixed_size() -> anyhow::Result<()> {
-    let config = ModelConfig::nano();
+    let config = tiny_config();
     let device = Device::Cpu;
     let (model, _) = nano_model()?;
 
@@ -102,11 +112,10 @@ fn test_state_is_fixed_size() -> anyhow::Result<()> {
 fn test_all_config_presets_build() -> anyhow::Result<()> {
     let device = Device::Cpu;
     let configs = [
-        // Upper bounds include spec_heads (each = d_model × vocab_size params)
-        ("nano",  ModelConfig::nano(),  5_000_000usize,  30_000_000),
-        ("micro", ModelConfig::micro(), 30_000_000,     120_000_000),
-        ("small", ModelConfig::small(), 100_000_000,    280_000_000),
-        ("base",  ModelConfig::base(),  250_000_000,    700_000_000),
+        // Shipped lineup: micro 50M / small 100M / medium 150M.
+        ("micro",  ModelConfig::micro(),  30_000_000usize, 80_000_000),
+        ("small",  ModelConfig::small(),  80_000_000,      130_000_000),
+        ("medium", ModelConfig::medium(), 120_000_000,     200_000_000),
     ];
     for (name, cfg, lo, hi) in configs {
         let vmap = VarMap::new();

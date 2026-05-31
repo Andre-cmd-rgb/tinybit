@@ -20,9 +20,10 @@ export GCP_BUCKET=gs://your-bucket
 DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-micro-l4.toml \
 PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh micro
 
-# 25M nano (fast iteration)
-DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-nano-l4.toml \
-PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh nano
+# 100M small / 150M medium (define batch/seq tuning first — reuse a train config
+# with a lowered batch_size; micro's batch 11 will NOT fit these)
+# DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-micro-l4.toml \
+# PROVISIONING_MODEL=STANDARD,SPOT ./scripts/gcp_launch.sh small
 
 # Coding variant — same train config, code-heavy data (gated → set HF_TOKEN)
 HF_TOKEN=hf_xxx DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-micro-l4.toml \
@@ -226,7 +227,7 @@ before training resumes. To force a clean restart, use a new `RUN_ID` or set
 ## Launch options
 
 ```bash
-./scripts/gcp_launch.sh [nano|micro|nano-coding|micro-coding]
+./scripts/gcp_launch.sh [micro|small|medium|micro-coding|small-coding|medium-coding]
 ```
 
 | Variable | Default | Description |
@@ -279,8 +280,8 @@ for the kernel/matmul details and regression guards.
 TOTAL_TOKENS=200000 MIN_TOKENS=100000 ./scripts/prepare_data.sh data/
 cargo build --release -p tinybit-cli
 ./target/release/tinybit train \
-  --model-config configs/nano.toml \
-  --train-config configs/train-nano-l4.toml --smoke-test
+  --model-config configs/micro.toml \
+  --train-config configs/train-micro-l4.toml --smoke-test
 ```
 
 Completes in under ~15 min on CPU, ending at loss < 8.

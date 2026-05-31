@@ -2,26 +2,25 @@
 
 tinybit has **two model families**. Both use the *same* RWKV-7 architecture and
 the *same* tokenizer — they differ only in the **training-data mix** and the
-**default system prompt**. There are four sizes in each family.
+**default system prompt**. There are three sizes in each family.
 
-| Family  | Variant        | Params | Arch config                  | Data profile | Trainable on L4? |
-|---------|----------------|--------|------------------------------|--------------|------------------|
-| General | `nano`         | ~25M   | `configs/nano.toml`          | general      | ✅ yes           |
-| General | `micro`        | ~50M   | `configs/micro.toml`         | general      | ✅ yes           |
-| General | `small`        | ~258M  | `configs/small.toml`         | general      | ❌ inference-only|
-| General | `base`         | ~501M  | `configs/base.toml`          | general      | ❌ inference-only|
-| Coding  | `nano-coding`  | ~25M   | `configs/nano-coding.toml`   | coding       | ✅ yes           |
-| Coding  | `micro-coding` | ~50M   | `configs/micro-coding.toml`  | coding       | ✅ yes           |
-| Coding  | `small-coding` | ~258M  | `configs/small-coding.toml`  | coding       | ❌ inference-only|
-| Coding  | `base-coding`  | ~501M  | `configs/base-coding.toml`   | coding       | ❌ inference-only|
+| Family  | Variant         | Params | Arch config                   | Data profile | Trainable on L4?     |
+|---------|-----------------|--------|-------------------------------|--------------|----------------------|
+| General | `micro`         | ~50M   | `configs/micro.toml`          | general      | ✅ yes (batch 11)    |
+| General | `small`         | ~100M  | `configs/small.toml`          | general      | ⚠️ needs batch tuning|
+| General | `medium`        | ~150M  | `configs/medium.toml`         | general      | ⚠️ needs batch tuning|
+| Coding  | `micro-coding`  | ~50M   | `configs/micro-coding.toml`   | coding       | ✅ yes (batch 11)    |
+| Coding  | `small-coding`  | ~100M  | `configs/small-coding.toml`   | coding       | ⚠️ needs batch tuning|
+| Coding  | `medium-coding` | ~150M  | `configs/medium-coding.toml`  | coding       | ⚠️ needs batch tuning|
 
-> `small`/`base` are architectural presets for loading checkpoints trained on
-> bigger hardware — they do not fit a single L4 for training. The L4 launcher
-> supports `nano` and `micro` (and their `-coding` siblings).
+> Only `micro` (50M) has a validated L4 training recipe (`configs/train-micro-l4.toml`,
+> batch 11). `small` (100M) and `medium` (150M) are defined but their L4 batch/seq
+> sizes are **not yet tuned** — expect to lower `batch_size`/`max_seq_len` for them
+> or train on bigger hardware. The L4 launcher accepts any of these size names.
 
 ## What each family is for
 
-**General** (`nano`/`micro`/`small`/`base`) — a concise everyday assistant:
+**General** (`micro`/`small`/`medium`) — a concise everyday assistant:
 explanations, notes, to-dos, calendar, summaries, simple questions, light tool
 use, and local context. General models stay general; they are *not* tuned to be
 code-heavy.
@@ -45,8 +44,8 @@ A checkpoint trained either way loads under either config. The difference is:
 Local smoke test (any size, CPU, minutes):
 
 ```bash
-tinybit train --model-config configs/nano.toml \
-              --train-config configs/train-nano-l4.toml --smoke-test
+tinybit train --model-config configs/micro.toml \
+              --train-config configs/train-micro-l4.toml --smoke-test
 ```
 
 Full run on a GCP L4 (general):

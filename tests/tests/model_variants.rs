@@ -12,10 +12,10 @@ fn config_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("configs").join(name)
 }
 
-const SIZES: &[&str] = &["nano", "micro", "small", "base"];
+const SIZES: &[&str] = &["micro", "small", "medium"];
 
 #[test]
-fn all_eight_variants_parse_and_validate() {
+fn all_six_variants_parse_and_validate() {
     for size in SIZES {
         for suffix in ["", "-coding"] {
             let name = format!("{size}{suffix}.toml");

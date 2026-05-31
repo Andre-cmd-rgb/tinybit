@@ -1,7 +1,7 @@
 # tinybit
 
 A small, fast, **local-first** AI assistant built on **RWKV-7** with **ternary
-BitLinear** quantization. Configurable from ~25M to ~500M parameters. Train
+BitLinear** quantization. Shipped in three sizes, ~50M to ~150M parameters. Train
 cheaply on a Google Cloud L4; run locally on Linux, macOS (Apple Silicon), or
 Windows.
 
@@ -29,7 +29,7 @@ V1.0 is **local CLI inference first**: `chat`, `eval`, `train`, `convert`,
 
 - **RWKV-7 architecture** — recurrent, O(1) memory at inference (no KV cache);
   state is a fixed-size matrix per layer regardless of context length.
-- **Two model families** — *general* (`nano`/`micro`/`small`/`base`) and
+- **Two model families** — *general* (`micro`/`small`/`medium`) and
   *coding* (`*-coding`). Same architecture, different training data + persona.
   See [MODELS.md](MODELS.md).
 - **BitLinear quantization** — ternary weights `{-1, 0, +1}` (BitNet b1.58 STE),
@@ -59,8 +59,8 @@ cargo build --release --workspace
 
 # 2. Verify the training pipeline locally (CPU, a few minutes)
 ./target/release/tinybit train \
-  --model-config configs/nano.toml \
-  --train-config configs/train-nano-l4.toml --smoke-test
+  --model-config configs/micro.toml \
+  --train-config configs/train-micro-l4.toml --smoke-test
 
 # 3. After you have a checkpoint, chat with it
 ./target/release/tinybit chat \
@@ -95,15 +95,14 @@ Run `tinybit <command> --help` for all flags.
 
 ## Model variants
 
-Four sizes × two families. Architecture is shared; the family is the
+Three sizes × two families. Architecture is shared; the family is the
 training-data mix + default persona. Full details in [MODELS.md](MODELS.md).
 
 | Preset | Params | Layers | d_model | d_ffn | L4-trainable |
 |--------|--------|--------|---------|-------|--------------|
-| nano   | ~25M   | 9      | 320     | 1120  | ✅ |
-| micro  | ~50M   | 16     | 384     | 1344  | ✅ (main target) |
-| small  | ~258M  | 13     | 1024    | 3584  | inference-only |
-| base   | ~501M  | 17     | 1280    | 4480  | inference-only |
+| micro  | ~50M   | 16     | 384     | 1344  | ✅ (main target, batch 11) |
+| small  | ~100M  | 12     | 640     | 2240  | ⚠️ needs batch/seq tuning |
+| medium | ~150M  | 13     | 768     | 2688  | ⚠️ needs batch/seq tuning |
 
 Each has a `-coding` sibling (`configs/<size>-coding.toml`) trained on a
 code-heavy data mix. All use a 3.5× FFN expansion (d_ffn = 3.5 × d_model).

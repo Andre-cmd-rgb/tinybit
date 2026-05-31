@@ -51,43 +51,36 @@ impl ModelConfig {
         embed + self.num_layers * per_layer + ln_out + spec
     }
 
-    /// ~25M params — smallest useful model (3.5× FFN)
-    pub fn nano() -> Self {
-        Self {
-            vocab_size: 32000, num_layers: 9, d_model: 320,
-            d_ffn: 1120, num_heads: 5, head_dim: 64,
-            ternary_ffn: false, int8_time: false,
-            max_seq_len: 1024, dropout: 0.05, spec_heads: 0,
-        }
-    }
-
-    /// ~50M params (3.5× FFN, 16 layers)
+    /// ~50M params (3.5× FFN, 16 layers) — the smallest shipped model and the
+    /// only one validated end-to-end on a single L4 (batch 11). See
+    /// configs/micro.toml.
     pub fn micro() -> Self {
         Self {
-            vocab_size: 32000, num_layers: 16, d_model: 384,
+            vocab_size: 32008, num_layers: 16, d_model: 384,
             d_ffn: 1344, num_heads: 6, head_dim: 64,
+            ternary_ffn: false, int8_time: false,
+            max_seq_len: 512, dropout: 0.05, spec_heads: 0,
+        }
+    }
+
+    /// ~100M params (3.5× FFN, 12 layers). Larger than an L4 comfortably trains
+    /// at the micro batch — treat as needing batch/seq tuning or bigger hardware.
+    pub fn small() -> Self {
+        Self {
+            vocab_size: 32008, num_layers: 12, d_model: 640,
+            d_ffn: 2240, num_heads: 10, head_dim: 64,
             ternary_ffn: false, int8_time: false,
             max_seq_len: 1024, dropout: 0.05, spec_heads: 0,
         }
     }
 
-    /// ~258M params (3.5× FFN)
-    pub fn small() -> Self {
+    /// ~150M params (3.5× FFN, 13 layers) — the largest shipped model.
+    pub fn medium() -> Self {
         Self {
-            vocab_size: 32000, num_layers: 13, d_model: 1024,
-            d_ffn: 3584, num_heads: 16, head_dim: 64,
+            vocab_size: 32008, num_layers: 13, d_model: 768,
+            d_ffn: 2688, num_heads: 12, head_dim: 64,
             ternary_ffn: false, int8_time: false,
-            max_seq_len: 2048, dropout: 0.05, spec_heads: 0,
-        }
-    }
-
-    /// ~501M params (3.5× FFN)
-    pub fn base() -> Self {
-        Self {
-            vocab_size: 32000, num_layers: 17, d_model: 1280,
-            d_ffn: 4480, num_heads: 20, head_dim: 64,
-            ternary_ffn: false, int8_time: false,
-            max_seq_len: 2048, dropout: 0.05, spec_heads: 0,
+            max_seq_len: 1024, dropout: 0.05, spec_heads: 0,
         }
     }
 
