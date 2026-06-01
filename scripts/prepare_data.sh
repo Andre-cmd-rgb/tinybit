@@ -56,29 +56,33 @@ mkdir -p "$OUTPUT_DIR"
 echo "Preparing data in $OUTPUT_DIR ..."
 
 python3 - "$OUTPUT_DIR" <<'PYTHON'
-import os, sys, json, socket, signal
+import os, sys, json, socket, threading
+import queue as queue_mod
 from pathlib import Path
 
 # Streaming HuggingFace datasets can hang forever if a download connection
-# stalls (dead socket, no read timeout) — this froze a tokenization run at 62%.
-# A global socket timeout turns a hung read into a normal exception, which the
-# per-dataset try/except below catches and recovers from (collects what it got,
-# moves on) instead of blocking the whole run indefinitely.
-socket.setdefaulttimeout(120)
+# stalls (dead socket, no read timeout) — this froze tokenization at ~62%.
+# Two earlier fixes were NOT enough on their own:
+#   1. socket.setdefaulttimeout — does NOT cover the streaming read path. HF
+#      streams parquet via fsspec/aiohttp + pyarrow, which use their own
+#      timeouts and ignore the global socket default.
+#   2. a SIGALRM watchdog around next(it) — SIGALRM could NOT interrupt the
+#      hang: the blocked read sits inside a C extension (pyarrow) / fsspec's
+#      event-loop thread and never returns to the main interpreter loop, so the
+#      Python signal handler is never run. The run froze at the same shard
+#      boundary anyway (deterministic ~62% stall + leaked CLOSE-WAIT sockets).
+# Real fix (see iter_stream_resilient): a background producer thread owns the
+# un-interruptible HF iterator and pushes examples into a bounded queue; the
+# consumer pulls with queue.get(timeout=...). That get ALWAYS returns after the
+# timeout regardless of what the producer is doing (a pure-Python condition
+# wait, not a C-level read), so a wedged stream is detected and the dataset is
+# abandoned — keeping what was collected and moving on — instead of freezing the
+# whole run. The wedged producer is a daemon: it leaks one dead socket and is
+# reaped at process exit.
+socket.setdefaulttimeout(120)              # still helps the producer's reads error out eventually
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
-# Real protection: a SIGALRM watchdog around each streamed example (set up in the
-# streaming loop). SIGALRM interrupts a blocked socket read on Linux, so a hung
-# HF stream raises StreamStall instead of freezing the run forever.
-STREAM_TIMEOUT = int(os.environ.get("STREAM_TIMEOUT", "90"))  # max seconds for ONE streamed example
+STREAM_TIMEOUT = int(os.environ.get("STREAM_TIMEOUT", "90"))  # max seconds to wait for ONE example
 MAX_STALLS     = int(os.environ.get("MAX_STALLS", "3"))       # consecutive stalls before skipping a dataset
-class StreamStall(Exception):
-    pass
-def _on_alarm(signum, frame):
-    raise StreamStall()
-try:
-    signal.signal(signal.SIGALRM, _on_alarm)
-except (ValueError, AttributeError):
-    pass
 
 OUTPUT_DIR = sys.argv[1] if len(sys.argv) > 1 else "data"
 
@@ -256,6 +260,68 @@ def load_stream(name, config, split):
         return load_dataset(name, config, **kwargs)
     return load_dataset(name, **kwargs)
 
+# Hard per-example timeout for streaming datasets ----------------------------
+# See the top-of-file note for WHY socket timeouts + a SIGALRM watchdog were not
+# enough. A daemon producer thread owns the HF iterator (which can block
+# un-interruptibly inside pyarrow/fsspec on a dead connection) and feeds a
+# bounded queue; the consumer pulls with a timeout, so a wedged stream is given
+# up on after MAX_STALLS consecutive misses instead of hanging forever.
+class _StreamErr:
+    __slots__ = ("exc",)
+    def __init__(self, exc):
+        self.exc = exc
+
+_STREAM_DONE = object()
+
+def iter_stream_resilient(ds, timeout, max_stalls, label):
+    q = queue_mod.Queue(maxsize=256)
+    stop = threading.Event()
+
+    def _produce():
+        try:
+            for ex in ds:
+                if stop.is_set():
+                    return
+                while True:               # respect backpressure but stay killable
+                    try:
+                        q.put(ex, timeout=1.0)
+                        break
+                    except queue_mod.Full:
+                        if stop.is_set():
+                            return
+            q.put(_STREAM_DONE)
+        except Exception as exc:          # surface, don't die silently
+            try:
+                q.put(_StreamErr(exc), timeout=5.0)
+            except Exception:
+                pass
+
+    threading.Thread(target=_produce, name="stream:" + str(label), daemon=True).start()
+    try:
+        stalls = 0
+        while True:
+            try:
+                item = q.get(timeout=timeout)
+            except queue_mod.Empty:
+                stalls += 1
+                print(f"  [stall] {label}: no example for {timeout}s "
+                      f"(strike {stalls}/{max_stalls})", flush=True)
+                if stalls >= max_stalls:
+                    print(f"  [stall] {label}: giving up — keeping what was "
+                          f"collected so far and moving on", flush=True)
+                    return
+                continue
+            if item is _STREAM_DONE:
+                return
+            if isinstance(item, _StreamErr):
+                print(f"  [warn] {label}: stream raised {item.exc!r} — keeping "
+                      f"what was collected so far", flush=True)
+                return
+            stalls = 0
+            yield item
+    finally:
+        stop.set()
+
 # Skip gated datasets if no auth ---------------------------------------------
 active, skipped = [], []
 for entry in DATASETS:
@@ -307,25 +373,10 @@ with open(tmp_path, 'wb') as tmp_f:
         got = 0
         try:
             ds = load_stream(name, cfg, split)
-            it = iter(ds)
             pbar = tqdm(desc=label, unit="ex", mininterval=2.0, total=max(target // 1024, 100))
-            stalls = 0
-            while got < target:
-                signal.alarm(STREAM_TIMEOUT)        # watchdog: abort a blocked read
-                try:
-                    ex = next(it)
-                except StopIteration:
+            for ex in iter_stream_resilient(ds, STREAM_TIMEOUT, MAX_STALLS, label):
+                if got >= target:
                     break
-                except StreamStall:
-                    stalls += 1
-                    print(f"  [stall] {label}: no data for {STREAM_TIMEOUT}s (strike {stalls}/{MAX_STALLS})")
-                    if stalls >= MAX_STALLS:
-                        print(f"  [stall] {label}: giving up, keeping {got:,} tokens collected so far")
-                        break
-                    continue
-                finally:
-                    signal.alarm(0)                 # always disarm before tokenizing
-                stalls = 0
                 pbar.update(1)
                 text = text_from_example(ex, field, kind)
                 if not text or not text.strip():

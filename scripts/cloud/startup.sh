@@ -59,6 +59,7 @@ HF_TOKEN_VAL="__HF_TOKEN__"
 SCRIPT_VERSION="__SCRIPT_VERSION__"
 TRAIN_CONFIG_OVERRIDE="__TRAIN_CONFIG__"
 RESET_RUN="__RESET_RUN__"
+CUSTOM_CHAT_EPOCHS="__CUSTOM_CHAT_EPOCHS__"   # times to repeat datasets/*.jsonl (identity/tools)
 ZONE_INFO="__ZONE__"
 MACHINE_INFO="__MACHINE__"
 ACCELERATOR_INFO="__ACCELERATOR__"
@@ -345,6 +346,7 @@ else
       export HF_TOKEN="$HF_TOKEN_VAL"
     fi
     TOTAL_TOKENS="$DATA_TOKENS" MIN_TOKENS="$MIN_TOKENS" DATA_PROFILE="$DATA_PROFILE" \
+    CUSTOM_CHAT_EPOCHS="${CUSTOM_CHAT_EPOCHS:-10}" \
       bash ./scripts/prepare_data.sh data/
     # Cache for future relaunches of this run (best-effort; never fatal).
     log "Caching prepared data to $GCS_RUN_PREFIX/data/ …"
