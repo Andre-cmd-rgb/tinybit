@@ -56,8 +56,16 @@ mkdir -p "$OUTPUT_DIR"
 echo "Preparing data in $OUTPUT_DIR ..."
 
 python3 - "$OUTPUT_DIR" <<'PYTHON'
-import os, sys, json
+import os, sys, json, socket
 from pathlib import Path
+
+# Streaming HuggingFace datasets can hang forever if a download connection
+# stalls (dead socket, no read timeout) — this froze a tokenization run at 62%.
+# A global socket timeout turns a hung read into a normal exception, which the
+# per-dataset try/except below catches and recovers from (collects what it got,
+# moves on) instead of blocking the whole run indefinitely.
+socket.setdefaulttimeout(120)
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
 
 OUTPUT_DIR = sys.argv[1] if len(sys.argv) > 1 else "data"
 
