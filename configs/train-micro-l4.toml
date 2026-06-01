@@ -3,8 +3,12 @@
 # Per-step token budget:
 #   batch 11 × seq 512 × grad_accum 6 = 33_792 tokens / step
 #
-# Total token budget:
-#   25_000 steps × 33_792 ≈ 0.84 B tokens (~17x params; near Chinchilla-optimal)
+# Total token budget (DEFINITIVE RUN, 2026-05-31):
+#   70_000 steps × 33_792 ≈ 2.37 B tokens (~47x params — small models keep
+#   improving well past Chinchilla; cf. SmolLM). Scaled to fit a hard <€100
+#   on-demand-L4 budget (~6.5 s/step → ~5.3 days → ~€85 STANDARD). A 5B-token run
+#   would be ~148k steps / ~11 days / ~€185 — over budget — so it was scaled down.
+#   Pair with DATA_TOKENS=2400000000 and CUSTOM_CHAT_EPOCHS=50 (identity/tool data).
 #
 # Throughput tuning (2026-05-28): bf16 mixed precision + a larger microbatch.
 # The fused WKV kernel launches one block per (batch, head); at batch 6 that is
@@ -35,7 +39,7 @@ checkpoint_dir = "checkpoints/"
 
 batch_size     = 11
 grad_accum     = 6
-total_steps    = 25000
+total_steps    = 70000
 peak_lr        = 3e-4
 weight_decay   = 0.01
 grad_clip      = 1.0

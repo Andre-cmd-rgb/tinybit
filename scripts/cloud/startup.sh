@@ -288,12 +288,22 @@ cd "$WORKDIR"
 # start_training would --resume the previous run. With them gone, prepare_data
 # re-tokenizes the new mix and training starts from step 0. Default 0 → no-op
 # (fresh-VM launches have an empty disk anyway).
-if [ "$RESET_RUN" = "1" ]; then
+# RESET_RUN is honored ONCE per disk: the first boot wipes stale data/checkpoints
+# and re-tokenizes, then drops a sentinel. Subsequent boots (e.g. a GCP host-
+# maintenance TERMINATE + auto-restart during a multi-day run) see the sentinel
+# and DO NOT wipe — so training resumes from the last checkpoint instead of
+# restarting from step 0 and re-tokenizing. Without this guard a single restart
+# would throw away days of progress on a long run.
+RESET_SENTINEL="$WORKDIR/.reset_done"
+if [ "$RESET_RUN" = "1" ] && [ ! -f "$RESET_SENTINEL" ]; then
   log_stage reset_run
-  log "RESET_RUN=1 — clearing stale data/*.bin and checkpoints for a fresh run"
+  log "RESET_RUN=1 (first boot) — clearing stale data/*.bin and checkpoints for a fresh run"
   rm -f "$WORKDIR"/data/*.bin 2>/dev/null || true
   rm -rf "$WORKDIR"/checkpoints/* 2>/dev/null || true
+  touch "$RESET_SENTINEL"
   FORCE_DATA=1
+elif [ "$RESET_RUN" = "1" ]; then
+  log "RESET_RUN=1 but reset already performed on this disk ($RESET_SENTINEL exists) — NOT wiping; resuming from checkpoints."
 fi
 
 # ---------- cargo_build -------------------------------------------------------

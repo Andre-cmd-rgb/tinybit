@@ -44,3 +44,6 @@ needs a re-tokenize: relaunch with `RESET_RUN=1` (or `FORCE_DATA=1`). A fresh
 
 - `identity-tools-01.jsonl` — 442 identity + tool-use examples (AI-generated, validated).
 - `identity-tools-02.jsonl` — 663 identity + tool-use examples (AI-generated, validated).
+- `identity-tools-03.jsonl` — 240 identity + tool-use examples (AI-generated, validated).
+
+Total: 1345 validated entries. The definitive micro run mixes these at `CUSTOM_CHAT_EPOCHS=50`.
