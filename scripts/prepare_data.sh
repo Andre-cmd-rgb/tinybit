@@ -56,7 +56,7 @@ mkdir -p "$OUTPUT_DIR"
 echo "Preparing data in $OUTPUT_DIR ..."
 
 python3 - "$OUTPUT_DIR" <<'PYTHON'
-import os, sys, json, socket
+import os, sys, json, socket, signal
 from pathlib import Path
 
 # Streaming HuggingFace datasets can hang forever if a download connection
@@ -66,6 +66,19 @@ from pathlib import Path
 # moves on) instead of blocking the whole run indefinitely.
 socket.setdefaulttimeout(120)
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
+# Real protection: a SIGALRM watchdog around each streamed example (set up in the
+# streaming loop). SIGALRM interrupts a blocked socket read on Linux, so a hung
+# HF stream raises StreamStall instead of freezing the run forever.
+STREAM_TIMEOUT = int(os.environ.get("STREAM_TIMEOUT", "90"))  # max seconds for ONE streamed example
+MAX_STALLS     = int(os.environ.get("MAX_STALLS", "3"))       # consecutive stalls before skipping a dataset
+class StreamStall(Exception):
+    pass
+def _on_alarm(signum, frame):
+    raise StreamStall()
+try:
+    signal.signal(signal.SIGALRM, _on_alarm)
+except (ValueError, AttributeError):
+    pass
 
 OUTPUT_DIR = sys.argv[1] if len(sys.argv) > 1 else "data"
 
@@ -294,8 +307,26 @@ with open(tmp_path, 'wb') as tmp_f:
         got = 0
         try:
             ds = load_stream(name, cfg, split)
-            for ex in tqdm(ds, desc=label, unit="ex", mininterval=2.0,
-                           total=max(target // 1024, 100)):
+            it = iter(ds)
+            pbar = tqdm(desc=label, unit="ex", mininterval=2.0, total=max(target // 1024, 100))
+            stalls = 0
+            while got < target:
+                signal.alarm(STREAM_TIMEOUT)        # watchdog: abort a blocked read
+                try:
+                    ex = next(it)
+                except StopIteration:
+                    break
+                except StreamStall:
+                    stalls += 1
+                    print(f"  [stall] {label}: no data for {STREAM_TIMEOUT}s (strike {stalls}/{MAX_STALLS})")
+                    if stalls >= MAX_STALLS:
+                        print(f"  [stall] {label}: giving up, keeping {got:,} tokens collected so far")
+                        break
+                    continue
+                finally:
+                    signal.alarm(0)                 # always disarm before tokenizing
+                stalls = 0
+                pbar.update(1)
                 text = text_from_example(ex, field, kind)
                 if not text or not text.strip():
                     continue
@@ -309,8 +340,7 @@ with open(tmp_path, 'wb') as tmp_f:
                 # Flush buffer periodically to keep RAM bounded
                 if len(write_buf) >= FLUSH_EVERY:
                     flush_buf(tmp_f)
-                if got >= target:
-                    break
+            pbar.close()
             # Flush any remaining tokens for this dataset
             flush_buf(tmp_f)
             collected[label] = got
