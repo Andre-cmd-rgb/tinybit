@@ -145,6 +145,21 @@ def dataset_label(name, cfg):
     return f"{name}:{cfg}" if cfg else name
 
 
+def is_permanent_error(msg):
+    """True for errors that will NEVER succeed on retry (gating, auth, missing
+    dataset) — so we skip the source immediately instead of burning the restart
+    budget. Transient network/stream errors are NOT matched and still retry."""
+    if not msg:
+        return False
+    m = str(msg).lower()
+    needles = (
+        "gated dataset", "ask for access", "datasetnotfounderror", "gatedrepoerror",
+        "repositorynotfounderror", "doesn't exist", "does not exist", "not found",
+        "401", "403", "404", "unauthorized", "forbidden", "authentication",
+    )
+    return any(n in m for n in needles)
+
+
 def normalize_turns(value):
     role_map = {
         "system": "system",
@@ -607,6 +622,12 @@ class DataPrep:
                         return
                     elif kind == "err":
                         kill_process(proc)
+                        if is_permanent_error(payload):
+                            # Gating/auth/missing — retrying can never succeed. Give
+                            # up on THIS dataset now; the caller decides whether the
+                            # run can still finalize (MIN_TOKENS) or must fail.
+                            log_event("stream_permanent_error", dataset=label, error=payload, cursor=cursor)
+                            raise RuntimeError(f"{label}: permanent/unavailable source, not retrying: {payload}")
                         restarts += 1
                         if not progressed_this_run:
                             restarts_no_progress += 1
@@ -711,8 +732,25 @@ class DataPrep:
                     start_index += 1
                     self.progress["current_index"] = start_index
                     self.save_progress()
-                except Exception:
+                except Exception as exc:
                     self.flush_buf(tmp_f)
+                    total = int(self.progress.get("total_written", 0))
+                    # A dataset that can't be streamed is only FATAL if we don't yet
+                    # have enough data. If MIN_TOKENS is already met, skip it and
+                    # finalize with what we have — one optional/gated source must not
+                    # throw away a multi-hour, otherwise-complete tokenization.
+                    if total >= MIN_TOKENS:
+                        log_event("dataset_skipped", dataset=label, error=str(exc),
+                                  total_written=total, min_tokens=MIN_TOKENS,
+                                  note="source failed but MIN_TOKENS already met — skipping, not failing")
+                        ds_state["done"] = True
+                        ds_state["skipped"] = True
+                        ds_state.pop("hf_state_b64", None)
+                        ds_state.pop("hf_state_base", None)
+                        start_index += 1
+                        self.progress["current_index"] = start_index
+                        self.save_progress(last_event=f"skipped:{label}")
+                        continue
                     self.save_progress(last_event=f"dataset_failed:{label}")
                     raise
 

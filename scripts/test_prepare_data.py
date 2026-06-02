@@ -106,7 +106,37 @@ def test_permanent_wedge_fails_loudly():
         print(f"PASS: failed loudly after bounded restarts; marker reason: {rec['reason'][:80]}...")
 
 
+def test_failing_dataset_skipped_when_min_met():
+    print("\n=== TEST 3: dataset fails AFTER MIN_TOKENS met -> skip + finalize (not fail) ===")
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        proc = run_case({
+            "TINYBIT_FAKE_N": "8000",
+            "TINYBIT_FAKE_HANG_AT": "2000",   # produce 2000 examples, then wedge forever
+            "TOTAL_TOKENS": "10000000",       # target far above what 2000 examples yield
+            "MIN_TOKENS": "1",                # ...but MIN is already met after a few examples
+            "SEQ_LEN": "64",
+            "STREAM_TIMEOUT": "2",
+            "MAX_STALLS": "1",
+            "MAX_RESTARTS_NO_PROGRESS": "2",
+            "CHECKPOINT_EVERY": "500",
+        }, d, timeout=120)
+        print(proc.stdout[-1500:])
+        if proc.returncode != 0:
+            print("STDERR:", proc.stderr[-1500:])
+            raise AssertionError(f"expected success (skip+finalize), got rc={proc.returncode}")
+        assert '"event": "dataset_skipped"' in proc.stdout, "dataset was not skipped after MIN met"
+        train, val = d / "train.bin", d / "val.bin"
+        assert train.exists() and val.exists(), "train/val not produced after skip"
+        assert not (d / "prepare_FAILED.json").exists(), "should not have failed"
+        toks = (train.stat().st_size + val.stat().st_size) // 4
+        # ~2000 examples * 22 tokens were collected before the permanent wedge.
+        assert 2000 * 22 * 0.5 < toks <= 2000 * 22 + 22, f"unexpected token count {toks}"
+        print(f"PASS: failing trailing dataset skipped, finalized with {toks:,} tokens")
+
+
 if __name__ == "__main__":
     test_transient_wedge_recovers()
     test_permanent_wedge_fails_loudly()
+    test_failing_dataset_skipped_when_min_met()
     print("\nALL TESTS PASSED")
