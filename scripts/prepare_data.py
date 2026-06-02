@@ -883,6 +883,15 @@ class DataPrep:
             log_event("already_done", train=str(self.TRAIN_PATH), val=str(self.VAL_PATH))
             return
 
+        # Clear any stale failure marker from a previous attempt up front, so it
+        # exists ONLY if THIS run fails. (Otherwise a resumed run that succeeds can
+        # look failed when the orchestration re-syncs a leftover marker before the
+        # finalize step removes it.)
+        try:
+            self.FAILED_PATH.unlink()
+        except FileNotFoundError:
+            pass
+
         self.save_progress(phase="starting", last_event="setup")
         self._setup()
         log_event("start", profile=PROFILE, total_tokens=TOTAL_TOKENS, min_tokens=MIN_TOKENS,
