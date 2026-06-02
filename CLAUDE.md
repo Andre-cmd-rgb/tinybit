@@ -167,6 +167,25 @@ cargo test --workspace
     a full micro CPU step. Single-token inference (2D input) passes straight
     through unchanged.
 
+21. Data prep (`scripts/prepare_data.py`) MUST stay hang-proof. HF streaming
+    deterministically wedges in a C-level read (~60% into fineweb-edu); the ONLY
+    reliable recovery is a killable child PROCESS (not a thread — a thread
+    blocked in C can't be killed). The contract, do not weaken any part:
+    (a) each dataset streams in a `multiprocessing` child the parent kills on a
+    queue-`get` timeout; (b) restarts resume via HF `IterableDataset.state_dict()`
+    checkpoints (offset re-scan fallback), base = `global_idx+1`; (c)
+    `MAX_RESTARTS_NO_PROGRESS` consecutive zero-progress restarts → write
+    `data/prepare_FAILED.json` + exit non-zero (NEVER loop forever, NEVER silently
+    skip); (d) `heartbeat_unix`/`phase`/`total_written` are persisted to
+    `data/prepare_progress.json` and logs are one-line `EVENT {json}`. The module
+    is import-safe (no network at import) so it runs under spawn AND is testable.
+    `startup.sh::run_data_prep_watched` runs it in its own process group, syncs
+    progress to the bucket every 30s, and kills+FAILS the run if the heartbeat is
+    stale (>15m) or tokens flatline (>45m) — a silent multi-hour hang is the bug
+    this prevents (it froze run 20260602-074307). Guarded by
+    `scripts/test_prepare_data.py` (offline, `TINYBIT_FAKE_STREAM=1`): run it after
+    touching prepare_data.py.
+
 ## Common mistakes to avoid
 
 - Do NOT use .unwrap() in library code — propagate with anyhow::Result + ?
