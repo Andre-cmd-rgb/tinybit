@@ -1,44 +1,42 @@
+```python
 #!/usr/bin/env python3
-# tinybit data preparation — downloads and tokenizes datasets for training.
+# tinybit data preparation — robust HuggingFace streaming version.
 #
-# Invoked by scripts/prepare_data.sh (Linux/macOS) and scripts/prepare_data.ps1
-# (Windows). All configuration is via environment variables; the single
-# positional argument is the output directory (default: data).
+# Fixes the FineWeb-Edu ~60% freeze problem by running each HF streaming dataset
+# inside a separate killable process. If the stream hangs, the parent kills the
+# child, saves progress, restarts the same dataset, fast-forwards to the last
+# processed example, and continues.
 #
-# Env vars (see scripts/prepare_data.sh header for full docs):
-#   TOTAL_TOKENS, MIN_TOKENS, SEQ_LEN, DATA_PROFILE (alias PROFILE),
+# Important reality:
+# HuggingFace streaming does not support true random-access resume inside a
+# remote parquet shard. This script resumes by example offset. That means a
+# restart may need to re-scan already-seen examples until it reaches the saved
+# offset, but it will not duplicate written tokens and it will not silently skip
+# the dataset.
+#
+# Env vars:
+#   TOTAL_TOKENS, MIN_TOKENS, SEQ_LEN, DATA_PROFILE / PROFILE,
 #   HF_TOKEN, ENABLE_GATED, CUSTOM_CHAT_DIR, CUSTOM_CHAT_EPOCHS,
-#   STREAM_TIMEOUT, MAX_STALLS
+#   STREAM_TIMEOUT, MAX_STALLS, MAX_RESTARTS_PER_DATASET,
+#   FLUSH_EVERY, RESUME_DATA_PREP
 
-import os, sys, json, socket, threading
+import json
+import multiprocessing as mp
+import os
 import queue as queue_mod
+import shutil
+import socket
+import sys
+import time
 from pathlib import Path
 
-# Streaming HuggingFace datasets can hang forever if a download connection
-# stalls (dead socket, no read timeout) — this froze tokenization at ~62%.
-# Two earlier fixes were NOT enough on their own:
-#   1. socket.setdefaulttimeout — does NOT cover the streaming read path. HF
-#      streams parquet via fsspec/aiohttp + pyarrow, which use their own
-#      timeouts and ignore the global socket default.
-#   2. a SIGALRM watchdog around next(it) — SIGALRM could NOT interrupt the
-#      hang: the blocked read sits inside a C extension (pyarrow) / fsspec's
-#      event-loop thread and never returns to the main interpreter loop, so the
-#      Python signal handler is never run. The run froze at the same shard
-#      boundary anyway (deterministic ~62% stall + leaked CLOSE-WAIT sockets).
-# Real fix (see iter_stream_resilient): a background producer thread owns the
-# un-interruptible HF iterator and pushes examples into a bounded queue; the
-# consumer pulls with queue.get(timeout=...). That get ALWAYS returns after the
-# timeout regardless of what the producer is doing (a pure-Python condition
-# wait, not a C-level read), so a wedged stream is detected and the dataset is
-# abandoned — keeping what was collected and moving on — instead of freezing the
-# whole run. The wedged producer is a daemon: it leaks one dead socket and is
-# reaped at process exit.
-socket.setdefaulttimeout(120)              # still helps the producer's reads error out eventually
+socket.setdefaulttimeout(60)
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
-STREAM_TIMEOUT = int(os.environ.get("STREAM_TIMEOUT", "90"))  # max seconds to wait for ONE example
-MAX_STALLS     = int(os.environ.get("MAX_STALLS", "3"))       # consecutive stalls before skipping a dataset
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
+os.environ.setdefault("HF_DATASETS_IN_MEMORY_MAX_SIZE", "0")
 
-OUTPUT_DIR = sys.argv[1] if len(sys.argv) > 1 else "data"
+OUTPUT_DIR = Path(sys.argv[1] if len(sys.argv) > 1 else "data")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 try:
     import numpy as np
@@ -46,123 +44,98 @@ try:
     from tokenizers import Tokenizer
     from tqdm import tqdm
 except ImportError:
-    print("ERROR: Install required packages: pip install datasets tokenizers tqdm numpy")
+    print("ERROR: Install required packages: pip install datasets tokenizers tqdm numpy", flush=True)
     sys.exit(1)
 
-SEQ_LEN       = int(os.environ.get("SEQ_LEN", "1024"))
-TOTAL_TOKENS  = int(os.environ.get("TOTAL_TOKENS", "500000000"))
-MIN_TOKENS    = int(os.environ.get("MIN_TOKENS", str(int(TOTAL_TOKENS * 0.75))))
-HF_TOKEN      = os.environ.get("HF_TOKEN", "").strip() or None
-ENABLE_GATED  = os.environ.get("ENABLE_GATED", "1") == "1"
-PROFILE       = (os.environ.get("DATA_PROFILE") or os.environ.get("PROFILE") or "general").strip().lower()
-if PROFILE not in ("general", "coding"):
-    print(f"ERROR: DATA_PROFILE must be 'general' or 'coding' (got {PROFILE!r})")
-    sys.exit(1)
+SEQ_LEN = int(os.environ.get("SEQ_LEN", "1024"))
+TOTAL_TOKENS = int(os.environ.get("TOTAL_TOKENS", "500000000"))
+MIN_TOKENS = int(os.environ.get("MIN_TOKENS", str(int(TOTAL_TOKENS * 0.75))))
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip() or None
+ENABLE_GATED = os.environ.get("ENABLE_GATED", "1") == "1"
+PROFILE = (os.environ.get("DATA_PROFILE") or os.environ.get("PROFILE") or "general").strip().lower()
 
-# Custom curated chat data (your own generated JSONL — e.g. identity/tool-use).
-# Drop {"messages":[{role,content}...]} JSONL/TXT files into CUSTOM_CHAT_DIR; each
-# is tokenized LAST (so the val head stays the FineWeb-Edu distribution) and
-# repeated CUSTOM_CHAT_EPOCHS times. These tokens are ADDED ON TOP of TOTAL_TOKENS
-# rather than competing for its budget, so a small set is reliably included.
-CUSTOM_CHAT_DIR    = os.environ.get("CUSTOM_CHAT_DIR", "datasets")
+STREAM_TIMEOUT = int(os.environ.get("STREAM_TIMEOUT", "45"))
+MAX_STALLS = int(os.environ.get("MAX_STALLS", "2"))
+MAX_RESTARTS_PER_DATASET = int(os.environ.get("MAX_RESTARTS_PER_DATASET", "0"))  # 0 = unlimited
+FLUSH_EVERY = int(os.environ.get("FLUSH_EVERY", "500000"))
+RESUME_DATA_PREP = os.environ.get("RESUME_DATA_PREP", "1") == "1"
+
+CUSTOM_CHAT_DIR = os.environ.get("CUSTOM_CHAT_DIR", "datasets")
 CUSTOM_CHAT_EPOCHS = int(os.environ.get("CUSTOM_CHAT_EPOCHS", "10"))
-custom_files = []
-if CUSTOM_CHAT_DIR and os.path.isdir(CUSTOM_CHAT_DIR) and CUSTOM_CHAT_EPOCHS > 0:
-    for fn in sorted(os.listdir(CUSTOM_CHAT_DIR)):
-        if fn.endswith((".jsonl", ".txt")):
-            custom_files.append(os.path.join(CUSTOM_CHAT_DIR, fn))
-if custom_files:
-    print(f"Custom chat data: {len(custom_files)} file(s) from {CUSTOM_CHAT_DIR}/ "
-          f"x{CUSTOM_CHAT_EPOCHS} epochs (tokenized last): "
-          + ", ".join(os.path.basename(f) for f in custom_files))
 
-# Write buffer: flush to disk every FLUSH_EVERY tokens to keep RAM usage bounded.
-# At ~4 bytes/token, 4M tokens = 16 MB peak RAM for the buffer.
-FLUSH_EVERY = 4_000_000
+if PROFILE not in ("general", "coding"):
+    print(f"ERROR: DATA_PROFILE must be 'general' or 'coding' (got {PROFILE!r})", flush=True)
+    sys.exit(1)
 
-print(f"PROFILE={PROFILE}  TOTAL_TOKENS={TOTAL_TOKENS:,}  MIN_TOKENS={MIN_TOKENS:,}  HF_TOKEN={'set' if HF_TOKEN else 'unset'}")
+print(
+    f"PROFILE={PROFILE}  TOTAL_TOKENS={TOTAL_TOKENS:,}  MIN_TOKENS={MIN_TOKENS:,}  "
+    f"HF_TOKEN={'set' if HF_TOKEN else 'unset'}",
+    flush=True,
+)
+print(
+    f"STREAM_TIMEOUT={STREAM_TIMEOUT}s  MAX_STALLS={MAX_STALLS}  "
+    f"MAX_RESTARTS_PER_DATASET={MAX_RESTARTS_PER_DATASET or 'unlimited'}  "
+    f"FLUSH_EVERY={FLUSH_EVERY:,}",
+    flush=True,
+)
 
-# Canonical chat template — MUST match crates/tinybit-core/src/tokenizer.rs.
-SYS_PREFIX  = "system:\n"
+SYS_PREFIX = "system:\n"
 USER_PREFIX = "\nuser:\n"
 ASST_PREFIX = "\nassistant:\n"
 
-# Tokenizer ------------------------------------------------------------------
-print("Loading tokenizer...")
-try:
-    tokenizer = Tokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
-except Exception:
-    if os.path.exists("tokenizer.json"):
-        tokenizer = Tokenizer.from_file("tokenizer.json")
-    else:
-        print("ERROR: No tokenizer found. Run: tinybit download")
+PROGRESS_PATH = OUTPUT_DIR / "prepare_progress.json"
+TMP_PATH = OUTPUT_DIR / "_tokens_tmp.bin"
+TRAIN_PATH = OUTPUT_DIR / "train.bin"
+VAL_PATH = OUTPUT_DIR / "val.bin"
+
+
+GENERAL_DATASETS = [
+    ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text", 0.33, False, "text"),
+    ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text", 0.30, False, "text"),
+    ("roneneldan/TinyStories", None, "train", "text", 0.12, False, "text"),
+    ("teknium/OpenHermes-2.5", None, "train", "conversations", 0.15, False, "chat"),
+    ("cognitivecomputations/dolphin-r1", "nonreasoning", "train", "messages", 0.07, False, "chat"),
+    ("bigcode/the-stack-smol", "data/python", "train", "content", 0.03, True, "text"),
+]
+
+CODING_DATASETS = [
+    ("bigcode/the-stack-smol", "data/python", "train", "content", 0.22, True, "text"),
+    ("bigcode/the-stack-smol", "data/rust", "train", "content", 0.15, True, "text"),
+    ("bigcode/the-stack-smol", "data/javascript", "train", "content", 0.10, True, "text"),
+    ("bigcode/the-stack-smol", "data/c", "train", "content", 0.08, True, "text"),
+    ("bigcode/the-stack-smol", "data/go", "train", "content", 0.05, True, "text"),
+    ("teknium/OpenHermes-2.5", None, "train", "conversations", 0.20, False, "chat"),
+    ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text", 0.12, False, "text"),
+    ("cognitivecomputations/dolphin-r1", "nonreasoning", "train", "messages", 0.08, False, "chat"),
+]
+
+
+def dataset_label(name, cfg):
+    return f"{name}:{cfg}" if cfg else name
+
+
+def load_tokenizer():
+    print("Loading tokenizer...", flush=True)
+    try:
+        return Tokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
+    except Exception:
+        if Path("tokenizer.json").exists():
+            return Tokenizer.from_file("tokenizer.json")
+        print("ERROR: No tokenizer found. Run: tinybit download", flush=True)
         sys.exit(1)
 
+
+tokenizer = load_tokenizer()
 EOS_ID = tokenizer.token_to_id("</s>") or 2
 
-# Dataset tables -------------------------------------------------------------
-# (name, config, split, text_field, weight, gated, kind)
-#   kind = "text" → tokenize raw text field
-#          "chat" → field is a list of role/content turns; format with the
-#                   tinybit chat template so training matches inference.
-# General mix for a SMALL model. FineWeb-Edu MUST stay first: the val split is
-# taken from the head of the stream, so val perplexity reflects this clean
-# educational-web distribution. Weights are relative and renormalized over the
-# datasets that actually load (the-stack-smol is gated, see ENABLE_GATED).
-GENERAL_DATASETS = [
-    # Educational web prose — the backbone, and the val-set distribution.
-    ("HuggingFaceFW/fineweb-edu",         "sample-10BT",   "train", "text",          0.33, False, "text"),
-    # Synthetic textbooks/stories/articles. REPLACES raw Wikipedia: clean,
-    # pedagogical, explanatory prose with far fewer rare proper nouns, so the
-    # model learns to explain rather than to hallucinate encyclopedic trivia.
-    ("HuggingFaceTB/smollm-corpus",       "cosmopedia-v2", "train", "text",          0.30, False, "text"),
-    # Short, simple, fully-coherent narratives. Punches above its weight on a
-    # tiny model — teaches it to finish a thought instead of drifting.
-    ("roneneldan/TinyStories",            None,            "train", "text",          0.12, False, "text"),
-    # Instruction/chat, formatted with the canonical tinybit chat template so
-    # training matches what `tinybit chat` feeds the model at inference.
-    ("teknium/OpenHermes-2.5",            None,            "train", "conversations", 0.15, False, "chat"),
-    ("cognitivecomputations/dolphin-r1",  "nonreasoning",  "train", "messages",      0.07, False, "chat"),
-    # A little code so the general model can still read/write simple snippets.
-    ("bigcode/the-stack-smol",            "data/python",   "train", "content",       0.03, True,  "text"),
-]
-# Coding mix: code-heavy across several languages + technical chat, with some
-# natural language retained so the model still writes coherent prose.
-CODING_DATASETS = [
-    ("bigcode/the-stack-smol",            "data/python",     "train", "content",       0.22, True,  "text"),
-    ("bigcode/the-stack-smol",            "data/rust",       "train", "content",       0.15, True,  "text"),
-    ("bigcode/the-stack-smol",            "data/javascript", "train", "content",       0.10, True,  "text"),
-    ("bigcode/the-stack-smol",            "data/c",          "train", "content",       0.08, True,  "text"),
-    ("bigcode/the-stack-smol",            "data/go",         "train", "content",       0.05, True,  "text"),
-    ("teknium/OpenHermes-2.5",            None,              "train", "conversations", 0.20, False, "chat"),
-    ("HuggingFaceFW/fineweb-edu",         "sample-10BT",     "train", "text",          0.12, False, "text"),
-    ("cognitivecomputations/dolphin-r1",  "nonreasoning",    "train", "messages",      0.08, False, "chat"),
-]
-DATASETS = CODING_DATASETS if PROFILE == "coding" else GENERAL_DATASETS
-
-if PROFILE == "coding" and not (HF_TOKEN and ENABLE_GATED):
-    print("WARNING: coding profile selected but HF_TOKEN is missing/disabled — the gated")
-    print("         The Stack code datasets will be skipped and the model will see little")
-    print("         to no code. Set HF_TOKEN for a real coding model.")
-
-def read_jsonl(path):
-    """Yield parsed objects from a JSONL file (one JSON object per line)."""
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except Exception:
-                continue
 
 def normalize_turns(value):
-    """Return a list of (role, content) from a conversations/messages field.
-    Handles OpenHermes ({'from','value'}) and dolphin/ChatML ({'role','content'})."""
     role_map = {
-        "system": "system", "human": "user", "user": "user",
-        "gpt": "assistant", "assistant": "assistant",
+        "system": "system",
+        "human": "user",
+        "user": "user",
+        "gpt": "assistant",
+        "assistant": "assistant",
     }
     turns = []
     if not isinstance(value, list):
@@ -178,8 +151,8 @@ def normalize_turns(value):
             turns.append((role, content))
     return turns
 
+
 def format_chat(turns):
-    """Render role/content turns with the canonical tinybit chat template."""
     parts = []
     for role, content in turns:
         if role == "system":
@@ -190,12 +163,12 @@ def format_chat(turns):
             parts.append(f"{ASST_PREFIX}{content}")
     return "".join(parts)
 
+
 def text_from_example(ex, field, kind):
     val = ex.get(field, "")
     if kind == "chat":
         return format_chat(normalize_turns(val))
     if isinstance(val, list):
-        # Defensive: a "text" field that is unexpectedly a list — join values.
         parts = []
         for item in val:
             if isinstance(item, dict):
@@ -208,221 +181,516 @@ def text_from_example(ex, field, kind):
         return "\n".join(parts)
     return str(val)
 
+
+def read_jsonl(path):
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
+
+
 def load_stream(name, config, split):
     kwargs = {"split": split, "streaming": True}
+    if HF_TOKEN:
+        kwargs["token"] = HF_TOKEN
     if config is not None:
         return load_dataset(name, config, **kwargs)
     return load_dataset(name, **kwargs)
 
-# Hard per-example timeout for streaming datasets ----------------------------
-# See the top-of-file note for WHY socket timeouts + a SIGALRM watchdog were not
-# enough. A daemon producer thread owns the HF iterator (which can block
-# un-interruptibly inside pyarrow/fsspec on a dead connection) and feeds a
-# bounded queue; the consumer pulls with a timeout, so a wedged stream is given
-# up on after MAX_STALLS consecutive misses instead of hanging forever.
-class _StreamErr:
-    __slots__ = ("exc",)
-    def __init__(self, exc):
-        self.exc = exc
 
-_STREAM_DONE = object()
+def stream_worker(name, config, split, start_example, out_q):
+    """
+    Child process: owns the HuggingFace iterator.
 
-def iter_stream_resilient(ds, timeout, max_stalls, label):
-    q = queue_mod.Queue(maxsize=256)
-    stop = threading.Event()
-
-    def _produce():
-        try:
-            for ex in ds:
-                if stop.is_set():
-                    return
-                while True:               # respect backpressure but stay killable
-                    try:
-                        q.put(ex, timeout=1.0)
-                        break
-                    except queue_mod.Full:
-                        if stop.is_set():
-                            return
-            q.put(_STREAM_DONE)
-        except Exception as exc:          # surface, don't die silently
-            try:
-                q.put(_StreamErr(exc), timeout=5.0)
-            except Exception:
-                pass
-
-    threading.Thread(target=_produce, name="stream:" + str(label), daemon=True).start()
+    If this process wedges inside pyarrow/fsspec/aiohttp, the parent can kill it.
+    """
     try:
-        stalls = 0
-        while True:
-            try:
-                item = q.get(timeout=timeout)
-            except queue_mod.Empty:
-                stalls += 1
-                print(f"  [stall] {label}: no example for {timeout}s "
-                      f"(strike {stalls}/{max_stalls})", flush=True)
-                if stalls >= max_stalls:
-                    print(f"  [stall] {label}: giving up — keeping what was "
-                          f"collected so far and moving on", flush=True)
-                    return
+        ds = load_stream(name, config, split)
+        for idx, ex in enumerate(ds):
+            if idx < start_example:
                 continue
-            if item is _STREAM_DONE:
-                return
-            if isinstance(item, _StreamErr):
-                print(f"  [warn] {label}: stream raised {item.exc!r} — keeping "
-                      f"what was collected so far", flush=True)
-                return
-            stalls = 0
-            yield item
-    finally:
-        stop.set()
+            out_q.put(("ex", idx + 1, ex), block=True)
+        out_q.put(("done", None, None), block=True)
+    except Exception as exc:
+        try:
+            out_q.put(("err", None, repr(exc)), block=True)
+        except Exception:
+            pass
 
-# Skip gated datasets if no auth ---------------------------------------------
-active, skipped = [], []
-for entry in DATASETS:
-    name, cfg, split, field, weight, gated, kind = entry
-    if gated and (not HF_TOKEN or not ENABLE_GATED):
-        skipped.append((f"{name}:{cfg}", "gated and HF_TOKEN missing/disabled"))
-        continue
-    active.append(entry)
 
-if skipped:
-    print("Skipping datasets:")
-    for n, reason in skipped:
-        print(f"  - {n}: {reason}")
+def kill_process(proc):
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=5)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=5)
 
-if not active:
-    print("ERROR: no datasets remain active.")
-    sys.exit(2)
 
-# Streaming write to disk ----------------------------------------------------
-# All tokens are written to a single temp file in stream order.
-# We never hold more than FLUSH_EVERY tokens in RAM at once (16 MB peak).
-# After collection, the file is split into val + train without loading it whole.
+def iter_stream_restartable(name, config, split, label, start_example):
+    """
+    Yield (example_count_seen, example) and restart from last example count if
+    the stream stalls. Does not skip the dataset.
+    """
+    ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
+    cursor = int(start_example)
+    restarts = 0
 
-tmp_path = Path(OUTPUT_DIR) / "_tokens_tmp.bin"
-collected = {}
-total_written = 0
+    while True:
+        q = ctx.Queue(maxsize=256)
+        proc = ctx.Process(
+            target=stream_worker,
+            args=(name, config, split, cursor, q),
+            daemon=True,
+        )
+        proc.start()
+
+        print(f"  [stream] {label}: start worker pid={proc.pid} from example offset {cursor:,}", flush=True)
+
+        stalls = 0
+        made_progress = False
+
+        try:
+            while True:
+                try:
+                    kind, seen, payload = q.get(timeout=STREAM_TIMEOUT)
+                except queue_mod.Empty:
+                    stalls += 1
+                    print(
+                        f"  [stall] {label}: no example for {STREAM_TIMEOUT}s "
+                        f"(strike {stalls}/{MAX_STALLS}) at example offset {cursor:,}",
+                        flush=True,
+                    )
+
+                    if stalls >= MAX_STALLS:
+                        kill_process(proc)
+                        restarts += 1
+
+                        if MAX_RESTARTS_PER_DATASET and restarts > MAX_RESTARTS_PER_DATASET:
+                            raise RuntimeError(
+                                f"{label} stalled too many times at example offset {cursor:,}; "
+                                f"raise MAX_RESTARTS_PER_DATASET or use a different data source."
+                            )
+
+                        backoff = min(60, 5 * restarts)
+                        print(
+                            f"  [restart] {label}: restarting same dataset from "
+                            f"example offset {cursor:,} after {backoff}s "
+                            f"(restart #{restarts})",
+                            flush=True,
+                        )
+                        time.sleep(backoff)
+                        break
+
+                    continue
+
+                stalls = 0
+
+                if kind == "ex":
+                    cursor = int(seen)
+                    made_progress = True
+                    yield cursor, payload
+                elif kind == "done":
+                    kill_process(proc)
+                    print(f"  [done] {label}: stream finished at example offset {cursor:,}", flush=True)
+                    return
+                elif kind == "err":
+                    kill_process(proc)
+                    restarts += 1
+                    print(
+                        f"  [warn] {label}: stream error {payload}; restarting "
+                        f"from example offset {cursor:,} (restart #{restarts})",
+                        flush=True,
+                    )
+                    time.sleep(min(60, 5 * restarts))
+                    break
+
+                if not proc.is_alive() and q.empty():
+                    return
+
+        finally:
+            kill_process(proc)
+
+        if not made_progress:
+            print(
+                f"  [note] {label}: restart made no progress; still retrying same dataset, "
+                f"not skipping it.",
+                flush=True,
+            )
+
+
+def get_custom_files():
+    files = []
+    if CUSTOM_CHAT_DIR and Path(CUSTOM_CHAT_DIR).is_dir() and CUSTOM_CHAT_EPOCHS > 0:
+        for fn in sorted(os.listdir(CUSTOM_CHAT_DIR)):
+            if fn.endswith((".jsonl", ".txt")):
+                files.append(str(Path(CUSTOM_CHAT_DIR) / fn))
+    if files:
+        print(
+            f"Custom chat data: {len(files)} file(s) from {CUSTOM_CHAT_DIR}/ "
+            f"x{CUSTOM_CHAT_EPOCHS} epochs (tokenized last): "
+            + ", ".join(Path(f).name for f in files),
+            flush=True,
+        )
+    return files
+
+
+custom_files = get_custom_files()
+
+
+def active_datasets():
+    table = CODING_DATASETS if PROFILE == "coding" else GENERAL_DATASETS
+    active = []
+    skipped = []
+
+    for entry in table:
+        name, cfg, split, field, weight, gated, kind = entry
+        if gated and (not HF_TOKEN or not ENABLE_GATED):
+            skipped.append((dataset_label(name, cfg), "gated and HF_TOKEN missing/disabled"))
+            continue
+        active.append(entry)
+
+    if skipped:
+        print("Skipping datasets:", flush=True)
+        for n, reason in skipped:
+            print(f"  - {n}: {reason}", flush=True)
+
+    if not active:
+        print("ERROR: no datasets remain active.", flush=True)
+        sys.exit(2)
+
+    return active
+
+
+DATASETS = active_datasets()
+
+
+def fresh_progress():
+    return {
+        "version": 2,
+        "profile": PROFILE,
+        "total_tokens_target": TOTAL_TOKENS,
+        "min_tokens": MIN_TOKENS,
+        "total_written": 0,
+        "datasets": {},
+        "current_index": 0,
+        "custom_done": False,
+    }
+
+
+def load_progress():
+    if RESUME_DATA_PREP and PROGRESS_PATH.exists() and TMP_PATH.exists():
+        try:
+            with open(PROGRESS_PATH, encoding="utf-8") as fh:
+                p = json.load(fh)
+            if p.get("version") == 2 and p.get("profile") == PROFILE:
+                expected_bytes = int(p.get("total_written", 0)) * 4
+                actual_bytes = TMP_PATH.stat().st_size
+                if actual_bytes >= expected_bytes:
+                    if actual_bytes != expected_bytes:
+                        print(
+                            f"[resume] truncating temp token file from {actual_bytes} to "
+                            f"{expected_bytes} bytes to match progress",
+                            flush=True,
+                        )
+                        with open(TMP_PATH, "r+b") as fh2:
+                            fh2.truncate(expected_bytes)
+                    print(
+                        f"[resume] loaded progress: {p.get('total_written', 0):,} tokens written",
+                        flush=True,
+                    )
+                    return p
+        except Exception as exc:
+            print(f"[resume] ignored broken progress file: {exc!r}", flush=True)
+
+    if not RESUME_DATA_PREP:
+        print("[resume] RESUME_DATA_PREP=0 — starting clean", flush=True)
+    return fresh_progress()
+
+
+progress = load_progress()
+
+
+def save_progress():
+    tmp = PROGRESS_PATH.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(progress, fh, indent=2, sort_keys=True)
+    os.replace(tmp, PROGRESS_PATH)
+
+
 write_buf = []
 
-def flush_buf(f):
-    global total_written
-    if write_buf:
-        arr = np.array(write_buf, dtype=np.uint32)
-        arr.tofile(f)
-        total_written += len(write_buf)
-        write_buf.clear()
 
-remaining_budget = TOTAL_TOKENS
-remaining_active = list(active)
+def flush_buf(fh):
+    if not write_buf:
+        return
+    arr = np.array(write_buf, dtype=np.uint32)
+    arr.tofile(fh)
+    progress["total_written"] = int(progress.get("total_written", 0)) + len(write_buf)
+    write_buf.clear()
+    fh.flush()
+    os.fsync(fh.fileno())
+    save_progress()
 
-with open(tmp_path, 'wb') as tmp_f:
-    while remaining_active:
-        weight_sum = sum(w for *_, w, _g, _k in remaining_active)
-        name, cfg, split, field, weight, _gated, kind = remaining_active.pop(0)
-        target = int(remaining_budget * (weight / weight_sum)) if weight_sum > 0 else 0
-        if target <= 0:
-            continue
-        label = f"{name}:{cfg}" if cfg else name
-        print(f"  {label}: target {target:,} tokens (kind={kind})")
-        got = 0
-        try:
-            ds = load_stream(name, cfg, split)
-            pbar = tqdm(desc=label, unit="ex", mininterval=2.0, total=max(target // 1024, 100))
-            for ex in iter_stream_resilient(ds, STREAM_TIMEOUT, MAX_STALLS, label):
-                if got >= target:
-                    break
-                pbar.update(1)
-                text = text_from_example(ex, field, kind)
-                if not text or not text.strip():
-                    continue
-                try:
-                    enc = tokenizer.encode(text)
-                except Exception:
-                    continue
-                ids = enc.ids + [EOS_ID]
-                write_buf.extend(ids)
-                got += len(ids)
-                # Flush buffer periodically to keep RAM bounded
-                if len(write_buf) >= FLUSH_EVERY:
-                    flush_buf(tmp_f)
-            pbar.close()
-            # Flush any remaining tokens for this dataset
+
+def tokenize_to_buffer(text):
+    if not text or not text.strip():
+        return 0
+    try:
+        enc = tokenizer.encode(text)
+    except Exception:
+        return 0
+    ids = enc.ids + [EOS_ID]
+    write_buf.extend(ids)
+    return len(ids)
+
+
+def dataset_target(remaining_budget, remaining_active):
+    weight_sum = sum(w for *_, w, _g, _k in remaining_active)
+    if weight_sum <= 0:
+        return 0
+    _name, _cfg, _split, _field, weight, _gated, _kind = remaining_active[0]
+    return int(remaining_budget * (weight / weight_sum))
+
+
+def prepare_weighted_mix():
+    remaining_budget = max(0, TOTAL_TOKENS - int(progress.get("total_written", 0)))
+
+    mode = "ab" if TMP_PATH.exists() else "wb"
+    with open(TMP_PATH, mode) as tmp_f:
+        start_index = int(progress.get("current_index", 0))
+
+        while start_index < len(DATASETS):
+            remaining_active = DATASETS[start_index:]
+            name, cfg, split, field, weight, _gated, kind = remaining_active[0]
+            label = dataset_label(name, cfg)
+
+            ds_state = progress["datasets"].setdefault(
+                label,
+                {
+                    "done": False,
+                    "examples_seen": 0,
+                    "tokens": 0,
+                    "target": None,
+                    "restarts": 0,
+                },
+            )
+
+            if ds_state.get("done"):
+                print(f"  {label}: already done — skipping to next dataset", flush=True)
+                start_index += 1
+                progress["current_index"] = start_index
+                save_progress()
+                continue
+
+            target = ds_state.get("target")
+            if target is None:
+                target = dataset_target(remaining_budget, remaining_active)
+                ds_state["target"] = int(target)
+                save_progress()
+
+            if target <= 0:
+                ds_state["done"] = True
+                start_index += 1
+                progress["current_index"] = start_index
+                save_progress()
+                continue
+
+            print(
+                f"  {label}: target {target:,} tokens (kind={kind}) "
+                f"resume_examples={int(ds_state.get('examples_seen', 0)):,} "
+                f"resume_tokens={int(ds_state.get('tokens', 0)):,}",
+                flush=True,
+            )
+
+            got = int(ds_state.get("tokens", 0))
+            start_example = int(ds_state.get("examples_seen", 0))
+
+            pbar_total = max(target // 1024, 100)
+            pbar = tqdm(
+                desc=label,
+                unit="ex",
+                mininterval=5.0,
+                total=pbar_total,
+                initial=max(0, min(start_example, pbar_total)),
+            )
+
+            try:
+                for examples_seen, ex in iter_stream_restartable(name, cfg, split, label, start_example):
+                    if got >= target:
+                        break
+
+                    text = text_from_example(ex, field, kind)
+                    added = tokenize_to_buffer(text)
+                    got += added
+
+                    ds_state["examples_seen"] = int(examples_seen)
+                    ds_state["tokens"] = int(got)
+
+                    pbar.update(1)
+
+                    if len(write_buf) >= FLUSH_EVERY:
+                        flush_buf(tmp_f)
+
+                flush_buf(tmp_f)
+                pbar.close()
+
+                ds_state["tokens"] = int(got)
+                ds_state["done"] = True
+                remaining_budget = max(0, remaining_budget - got)
+
+                print(
+                    f"    {label}: collected {got:,} tokens "
+                    f"(remaining budget {remaining_budget:,})",
+                    flush=True,
+                )
+
+                start_index += 1
+                progress["current_index"] = start_index
+                save_progress()
+
+            except Exception as exc:
+                pbar.close()
+                flush_buf(tmp_f)
+                save_progress()
+                print(f"ERROR: {label} failed without being skipped: {exc}", flush=True)
+                raise
+
+
+def prepare_custom_chat():
+    if progress.get("custom_done"):
+        print("Custom chat data already done — skipping", flush=True)
+        return
+
+    if not custom_files:
+        progress["custom_done"] = True
+        save_progress()
+        return
+
+    with open(TMP_PATH, "ab") as tmp_f:
+        for fp in custom_files:
+            label = f"custom:{Path(fp).name}"
+            state = progress["datasets"].setdefault(
+                label,
+                {"done": False, "tokens": 0, "examples_seen": 0},
+            )
+
+            if state.get("done"):
+                continue
+
+            got = int(state.get("tokens", 0))
+            seen = int(state.get("examples_seen", 0))
+            global_seen = 0
+
+            print(f"  {label}: tokenizing custom chat x{CUSTOM_CHAT_EPOCHS}", flush=True)
+
+            for _epoch in range(CUSTOM_CHAT_EPOCHS):
+                for obj in read_jsonl(fp):
+                    global_seen += 1
+                    if global_seen <= seen:
+                        continue
+
+                    turns = normalize_turns(obj.get("messages", []))
+                    roles = {r for r, _ in turns}
+                    if "user" not in roles or "assistant" not in roles:
+                        continue
+
+                    text = format_chat(turns)
+                    added = tokenize_to_buffer(text)
+                    got += added
+                    state["tokens"] = int(got)
+                    state["examples_seen"] = int(global_seen)
+
+                    if len(write_buf) >= FLUSH_EVERY:
+                        flush_buf(tmp_f)
+                        save_progress()
+
             flush_buf(tmp_f)
-            collected[label] = got
-            remaining_budget = max(0, remaining_budget - got)
-            print(f"    {label}: collected {got:,} tokens (remaining budget {remaining_budget:,})")
-        except Exception as e:
-            print(f"  WARNING: {label} failed: {e}")
-            flush_buf(tmp_f)
-            collected[label] = 0
-            continue
+            state["done"] = True
+            save_progress()
+            print(f"  {label}: {got:,} tokens", flush=True)
 
-    # ---- Custom curated chat data (your own generated JSONL) ----------------
-    # Appended after the weighted mix (so the val head stays FineWeb-Edu) and
-    # repeated for a few epochs. Tokens are additive on top of TOTAL_TOKENS.
-    for fp in custom_files:
-        label = f"custom:{os.path.basename(fp)}"
-        got = 0
-        for _epoch in range(CUSTOM_CHAT_EPOCHS):
-            for obj in read_jsonl(fp):
-                turns = normalize_turns(obj.get("messages", []))
-                roles = {r for r, _ in turns}
-                if "user" not in roles or "assistant" not in roles:
-                    continue  # skip degenerate entries (no real user/assistant exchange)
-                text = format_chat(turns)
-                if not text or not text.strip():
-                    continue
-                try:
-                    enc = tokenizer.encode(text)
-                except Exception:
-                    continue
-                write_buf.extend(enc.ids + [EOS_ID])
-                got += len(enc.ids) + 1
-                if len(write_buf) >= FLUSH_EVERY:
-                    flush_buf(tmp_f)
-        flush_buf(tmp_f)
-        collected[label] = got
-        print(f"  {label}: {got:,} tokens ({CUSTOM_CHAT_EPOCHS} epochs)")
+    progress["custom_done"] = True
+    save_progress()
 
-total_collected = total_written
-print()
-print("Per-dataset collection:")
-for n, t in collected.items():
-    print(f"  {n}: {t:,}")
-print(f"Total collected: {total_collected:,}  (target {TOTAL_TOKENS:,})")
-
-if total_collected < MIN_TOKENS:
-    tmp_path.unlink(missing_ok=True)
-    print(f"ERROR: only {total_collected:,} tokens collected; MIN_TOKENS={MIN_TOKENS:,}.")
-    sys.exit(3)
-
-# Split into val + train without loading entire dataset into RAM -------------
-# val = first val_size tokens (head of stream = FineWeb-Edu, highest quality).
-# train = everything after val. This ensures val loss reflects the primary
-# distribution, not the last/smallest dataset streamed.
-val_size = max(SEQ_LEN * 100, total_collected // 50)
-val_size = min(val_size, total_collected - SEQ_LEN)  # ensure train has at least seq_len tokens
-train_size = total_collected - val_size
-
-COPY_CHUNK = 1 << 20  # copy 4 MB at a time
 
 def copy_range(src_path, dst_path, start_tok, count_tok):
-    """Copy [start_tok, start_tok+count_tok) u32 tokens from src to dst."""
     Path(dst_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(src_path, 'rb') as src, open(dst_path, 'wb') as dst:
+    copy_chunk_tokens = 1 << 20
+
+    with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
         src.seek(start_tok * 4)
-        remaining = count_tok * 4  # bytes
+        remaining = count_tok * 4
         while remaining > 0:
-            chunk = src.read(min(COPY_CHUNK * 4, remaining))
+            chunk = src.read(min(copy_chunk_tokens * 4, remaining))
             if not chunk:
                 break
             dst.write(chunk)
             remaining -= len(chunk)
-    print(f"  Wrote {count_tok:,} tokens to {dst_path}")
 
-print(f"\nSplitting: val={val_size:,} tokens (head), train={train_size:,} tokens (rest)")
-copy_range(tmp_path, f"{OUTPUT_DIR}/val.bin",   0,        val_size)
-copy_range(tmp_path, f"{OUTPUT_DIR}/train.bin", val_size, train_size)
+    print(f"  Wrote {count_tok:,} tokens to {dst_path}", flush=True)
 
-tmp_path.unlink(missing_ok=True)
-print("Done!")
+
+def split_train_val():
+    total_collected = int(progress.get("total_written", 0))
+
+    print("\nPer-dataset collection:", flush=True)
+    for label, state in progress.get("datasets", {}).items():
+        print(f"  {label}: {int(state.get('tokens', 0)):,}", flush=True)
+
+    print(f"Total collected: {total_collected:,}  (target {TOTAL_TOKENS:,})", flush=True)
+
+    if total_collected < MIN_TOKENS:
+        print(
+            f"ERROR: only {total_collected:,} tokens collected; "
+            f"MIN_TOKENS={MIN_TOKENS:,}. Keeping {TMP_PATH} and {PROGRESS_PATH} "
+            f"so the next run can resume.",
+            flush=True,
+        )
+        sys.exit(3)
+
+    val_size = max(SEQ_LEN * 100, total_collected // 50)
+    val_size = min(val_size, total_collected - SEQ_LEN)
+    train_size = total_collected - val_size
+
+    print(
+        f"\nSplitting: val={val_size:,} tokens (head), "
+        f"train={train_size:,} tokens (rest)",
+        flush=True,
+    )
+
+    copy_range(TMP_PATH, VAL_PATH, 0, val_size)
+    copy_range(TMP_PATH, TRAIN_PATH, val_size, train_size)
+
+    try:
+        TMP_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+    progress["finalized"] = True
+    save_progress()
+    print("Done!", flush=True)
+
+
+def main():
+    if TRAIN_PATH.exists() and VAL_PATH.exists() and TRAIN_PATH.stat().st_size > 0 and VAL_PATH.stat().st_size > 0:
+        print("data/train.bin and data/val.bin already exist — nothing to do.", flush=True)
+        return
+
+    prepare_weighted_mix()
+    prepare_custom_chat()
+    split_train_val()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Interrupted. Progress kept; rerun to resume.", flush=True)
+        sys.exit(130)
+```
