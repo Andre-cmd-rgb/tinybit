@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 # tinybit data preparation — robust HuggingFace streaming version.
 #
@@ -693,4 +692,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Interrupted. Progress kept; rerun to resume.", flush=True)
         sys.exit(130)
-```
