@@ -15,7 +15,9 @@
 # Robust streaming controls:
 #   STREAM_TIMEOUT             seconds without one example before declaring a stall
 #   MAX_STALLS                 consecutive stalls before killing/restarting stream
-#   MAX_RESTARTS_PER_DATASET   0 = unlimited restarts
+#   MAX_RESTARTS_PER_DATASET   0 = unlimited total restarts (final backstop only)
+#   MAX_RESTARTS_NO_PROGRESS   consecutive zero-progress restarts before FAILING loudly
+#   CHECKPOINT_EVERY           ship an HF state_dict every N examples for cheap resume
 #   FLUSH_EVERY                flush token buffer every N tokens
 #   RESUME_DATA_PREP           1 = resume from prepare_progress.json + _tokens_tmp.bin
 #
@@ -57,6 +59,8 @@ export HF_DATASETS_IN_MEMORY_MAX_SIZE="${HF_DATASETS_IN_MEMORY_MAX_SIZE:-0}"
 export STREAM_TIMEOUT="${STREAM_TIMEOUT:-45}"
 export MAX_STALLS="${MAX_STALLS:-2}"
 export MAX_RESTARTS_PER_DATASET="${MAX_RESTARTS_PER_DATASET:-0}"
+export MAX_RESTARTS_NO_PROGRESS="${MAX_RESTARTS_NO_PROGRESS:-8}"
+export CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5000}"
 export FLUSH_EVERY="${FLUSH_EVERY:-500000}"
 export RESUME_DATA_PREP="${RESUME_DATA_PREP:-1}"
 
@@ -66,6 +70,8 @@ echo "MIN_TOKENS=${MIN_TOKENS:-unset}"
 echo "STREAM_TIMEOUT=$STREAM_TIMEOUT"
 echo "MAX_STALLS=$MAX_STALLS"
 echo "MAX_RESTARTS_PER_DATASET=$MAX_RESTARTS_PER_DATASET"
+echo "MAX_RESTARTS_NO_PROGRESS=$MAX_RESTARTS_NO_PROGRESS"
+echo "CHECKPOINT_EVERY=$CHECKPOINT_EVERY"
 echo "FLUSH_EVERY=$FLUSH_EVERY"
 echo "RESUME_DATA_PREP=$RESUME_DATA_PREP"
 echo "HF_TOKEN=$([ -n "${HF_TOKEN:-}" ] && echo set || echo unset)"

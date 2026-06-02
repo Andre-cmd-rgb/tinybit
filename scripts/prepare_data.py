@@ -1,50 +1,79 @@
 #!/usr/bin/env python3
-# tinybit data preparation — robust HuggingFace streaming version.
-#
-# Fixes the FineWeb-Edu ~60% freeze problem by running each HF streaming dataset
-# inside a separate killable process. If the stream hangs, the parent kills the
-# child, saves progress, restarts the same dataset, fast-forwards to the last
-# processed example, and continues.
-#
-# Important reality:
-# HuggingFace streaming does not support true random-access resume inside a
-# remote parquet shard. This script resumes by example offset. That means a
-# restart may need to re-scan already-seen examples until it reaches the saved
-# offset, but it will not duplicate written tokens and it will not silently skip
-# the dataset.
-#
-# Env vars:
-#   TOTAL_TOKENS, MIN_TOKENS, SEQ_LEN, DATA_PROFILE / PROFILE,
-#   HF_TOKEN, ENABLE_GATED, CUSTOM_CHAT_DIR, CUSTOM_CHAT_EPOCHS,
-#   STREAM_TIMEOUT, MAX_STALLS, MAX_RESTARTS_PER_DATASET,
-#   FLUSH_EVERY, RESUME_DATA_PREP
+"""tinybit data preparation — robust, resumable HuggingFace streaming.
 
+Root cause this guards against
+------------------------------
+HuggingFace streaming (fineweb-edu sample-10BT, ~62% in) deterministically
+wedged inside a C-level pyarrow/fsspec/aiohttp read. None of the earlier
+single-process mitigations could recover from it:
+
+  * ``socket.setdefaulttimeout`` does not cover HF's streaming read path.
+  * a SIGALRM watchdog cannot interrupt a thread blocked in a C call (the
+    Python signal handler only runs when the interpreter regains control).
+  * a producer *thread* + bounded queue lets the consumer time out, but the
+    wedged thread cannot be killed — it leaks a CLOSE-WAIT socket and the run
+    freezes at the same shard boundary forever.
+
+The only reliable fix is to own the HF iterator in a separate *process* that
+the parent can ``terminate()``/``kill()``. This module does exactly that and
+adds the operational guarantees a multi-hour, unattended cloud run needs:
+
+  * **Resumability / checkpointing** — the worker periodically ships HF's
+    ``IterableDataset.state_dict()`` back to the parent, which persists it.
+    A restart reloads that state and resumes near the wedge point instead of
+    re-scanning from example 0. If a dataset does not support stateful
+    streaming, it transparently falls back to resume-by-example-offset.
+  * **Timeouts** — socket + HF download/etag timeouts, plus a per-example
+    queue ``get`` timeout that always returns regardless of what the child does.
+  * **Retries / backoff** — a wedged or erroring child is killed and the
+    dataset is restarted with exponential backoff.
+  * **Bounded failure** — if a dataset makes *zero* progress across
+    ``MAX_RESTARTS_NO_PROGRESS`` consecutive restarts it FAILS LOUDLY (writes
+    a failure marker, exits non-zero) instead of looping forever.
+  * **Progress persistence** — token output and per-dataset cursors are
+    fsync'd to ``prepare_progress.json`` + ``_tokens_tmp.bin`` so any restart
+    (preemption, reboot, crash) resumes without re-tokenizing.
+  * **Heartbeat + structured logs** — every event is emitted as one JSON line
+    and a fresh ``heartbeat_unix`` is written to the progress file, so the
+    surrounding orchestration (startup.sh) can sync visibility to the bucket
+    and a watchdog can distinguish "alive and working" from "wedged".
+
+Env vars
+--------
+  TOTAL_TOKENS, MIN_TOKENS, SEQ_LEN, DATA_PROFILE / PROFILE,
+  HF_TOKEN, ENABLE_GATED, CUSTOM_CHAT_DIR, CUSTOM_CHAT_EPOCHS,
+  STREAM_TIMEOUT, MAX_STALLS, MAX_RESTARTS_PER_DATASET,
+  MAX_RESTARTS_NO_PROGRESS, CHECKPOINT_EVERY, FLUSH_EVERY, RESUME_DATA_PREP
+
+Test seam (no network)
+----------------------
+  TINYBIT_FAKE_STREAM=1 swaps the HF loader + tokenizer for deterministic
+  in-memory fakes so the kill/restart/resume machinery can be exercised
+  offline. See scripts/test_prepare_data.py.
+"""
+
+import base64
 import json
 import multiprocessing as mp
 import os
+import pickle
 import queue as queue_mod
-import shutil
 import socket
 import sys
 import time
 from pathlib import Path
 
+# Network hardening. These help *normal* failures fail fast; the killable-child
+# architecture below is what handles the C-level wedge they cannot cover.
 socket.setdefaulttimeout(60)
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
 os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
 os.environ.setdefault("HF_DATASETS_IN_MEMORY_MAX_SIZE", "0")
 
-OUTPUT_DIR = Path(sys.argv[1] if len(sys.argv) > 1 else "data")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-try:
-    import numpy as np
-    from datasets import load_dataset
-    from tokenizers import Tokenizer
-    from tqdm import tqdm
-except ImportError:
-    print("ERROR: Install required packages: pip install datasets tokenizers tqdm numpy", flush=True)
-    sys.exit(1)
+# ---------------------------------------------------------------------------
+# Configuration (cheap, no I/O — safe to evaluate at import on every spawn).
+# ---------------------------------------------------------------------------
+FAKE_STREAM = os.environ.get("TINYBIT_FAKE_STREAM", "") not in ("", "0")
 
 SEQ_LEN = int(os.environ.get("SEQ_LEN", "1024"))
 TOTAL_TOKENS = int(os.environ.get("TOTAL_TOKENS", "500000000"))
@@ -55,38 +84,24 @@ PROFILE = (os.environ.get("DATA_PROFILE") or os.environ.get("PROFILE") or "gener
 
 STREAM_TIMEOUT = int(os.environ.get("STREAM_TIMEOUT", "45"))
 MAX_STALLS = int(os.environ.get("MAX_STALLS", "2"))
-MAX_RESTARTS_PER_DATASET = int(os.environ.get("MAX_RESTARTS_PER_DATASET", "0"))  # 0 = unlimited
+# Hard cap on TOTAL restarts for one dataset (0 = unlimited). The meaningful
+# guard is MAX_RESTARTS_NO_PROGRESS below; this is just a final backstop.
+MAX_RESTARTS_PER_DATASET = int(os.environ.get("MAX_RESTARTS_PER_DATASET", "0"))
+# Consecutive restarts that yield ZERO new examples before we give up and FAIL.
+# This is what kills a deterministic dead-shard stall instead of looping forever.
+MAX_RESTARTS_NO_PROGRESS = int(os.environ.get("MAX_RESTARTS_NO_PROGRESS", "8"))
+# How often (in examples) the worker ships an IterableDataset.state_dict() back
+# to the parent for cheap resume. 0 disables stateful checkpointing.
+CHECKPOINT_EVERY = int(os.environ.get("CHECKPOINT_EVERY", "5000"))
 FLUSH_EVERY = int(os.environ.get("FLUSH_EVERY", "500000"))
 RESUME_DATA_PREP = os.environ.get("RESUME_DATA_PREP", "1") == "1"
 
 CUSTOM_CHAT_DIR = os.environ.get("CUSTOM_CHAT_DIR", "datasets")
 CUSTOM_CHAT_EPOCHS = int(os.environ.get("CUSTOM_CHAT_EPOCHS", "10"))
 
-if PROFILE not in ("general", "coding"):
-    print(f"ERROR: DATA_PROFILE must be 'general' or 'coding' (got {PROFILE!r})", flush=True)
-    sys.exit(1)
-
-print(
-    f"PROFILE={PROFILE}  TOTAL_TOKENS={TOTAL_TOKENS:,}  MIN_TOKENS={MIN_TOKENS:,}  "
-    f"HF_TOKEN={'set' if HF_TOKEN else 'unset'}",
-    flush=True,
-)
-print(
-    f"STREAM_TIMEOUT={STREAM_TIMEOUT}s  MAX_STALLS={MAX_STALLS}  "
-    f"MAX_RESTARTS_PER_DATASET={MAX_RESTARTS_PER_DATASET or 'unlimited'}  "
-    f"FLUSH_EVERY={FLUSH_EVERY:,}",
-    flush=True,
-)
-
 SYS_PREFIX = "system:\n"
 USER_PREFIX = "\nuser:\n"
 ASST_PREFIX = "\nassistant:\n"
-
-PROGRESS_PATH = OUTPUT_DIR / "prepare_progress.json"
-TMP_PATH = OUTPUT_DIR / "_tokens_tmp.bin"
-TRAIN_PATH = OUTPUT_DIR / "train.bin"
-VAL_PATH = OUTPUT_DIR / "val.bin"
-
 
 GENERAL_DATASETS = [
     ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text", 0.33, False, "text"),
@@ -109,23 +124,25 @@ CODING_DATASETS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Structured logging.
+# ---------------------------------------------------------------------------
+def now_unix():
+    return int(time.time())
+
+
+def log_event(event, **fields):
+    """Emit one structured JSON line (machine-parseable) + flush immediately."""
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event}
+    rec.update(fields)
+    print("EVENT " + json.dumps(rec, sort_keys=True), flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (text/chat normalization) — no I/O, import-safe.
+# ---------------------------------------------------------------------------
 def dataset_label(name, cfg):
     return f"{name}:{cfg}" if cfg else name
-
-
-def load_tokenizer():
-    print("Loading tokenizer...", flush=True)
-    try:
-        return Tokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
-    except Exception:
-        if Path("tokenizer.json").exists():
-            return Tokenizer.from_file("tokenizer.json")
-        print("ERROR: No tokenizer found. Run: tinybit download", flush=True)
-        sys.exit(1)
-
-
-tokenizer = load_tokenizer()
-EOS_ID = tokenizer.token_to_id("</s>") or 2
 
 
 def normalize_turns(value):
@@ -193,7 +210,63 @@ def read_jsonl(path):
                 continue
 
 
+# ---------------------------------------------------------------------------
+# HF stream loading + the killable worker process.
+# These live at module scope so they are importable and picklable for the
+# "spawn" start method (Windows / macOS); on Linux "fork" is used.
+# ---------------------------------------------------------------------------
+def _fake_stream():
+    """Deterministic in-memory stand-in for an HF IterableDataset (test seam).
+
+    Driven by env vars so a spawned child reconstructs the same behavior:
+      TINYBIT_FAKE_N       total examples (default 30000)
+      TINYBIT_FAKE_HANG_AT example index at which the FIRST incarnation wedges
+      TINYBIT_FAKE_HANG_FLAG  file path used to make the wedge happen only once
+                              (first run creates it then hangs; a restart sees
+                              it and runs clean, simulating a transient stall)
+    """
+    n = int(os.environ.get("TINYBIT_FAKE_N", "30000"))
+    hang_at = int(os.environ.get("TINYBIT_FAKE_HANG_AT", "-1"))
+    flag = os.environ.get("TINYBIT_FAKE_HANG_FLAG", "")
+
+    class _Fake:
+        def __init__(self):
+            self._pos = 0
+
+        def state_dict(self):
+            return {"pos": self._pos}
+
+        def load_state_dict(self, state):
+            self._pos = int(state.get("pos", 0))
+
+        def __iter__(self):
+            i = self._pos
+            while i < n:
+                if hang_at >= 0 and i == hang_at:
+                    do_hang = True
+                    if flag:
+                        if os.path.exists(flag):
+                            do_hang = False
+                        else:
+                            try:
+                                Path(flag).write_text("hung")
+                            except Exception:
+                                pass
+                    if do_hang:
+                        while True:  # simulate an un-interruptible C-level wedge
+                            time.sleep(3600)
+                self._pos = i + 1
+                yield {"text": f"fake example number {i} " + ("lorem ipsum " * 8)}
+                i += 1
+
+    return _Fake()
+
+
 def load_stream(name, config, split):
+    if FAKE_STREAM:
+        return _fake_stream()
+    from datasets import load_dataset  # imported lazily so the test seam needs no deps
+
     kwargs = {"split": split, "streaming": True}
     if HF_TOKEN:
         kwargs["token"] = HF_TOKEN
@@ -202,20 +275,61 @@ def load_stream(name, config, split):
     return load_dataset(name, **kwargs)
 
 
-def stream_worker(name, config, split, start_example, out_q):
-    """
-    Child process: owns the HuggingFace iterator.
+def _try_load_state(ds, state_b64):
+    """Best-effort: position `ds` at a saved state_dict. Returns True on success."""
+    if not state_b64 or not hasattr(ds, "load_state_dict"):
+        return False
+    try:
+        state = pickle.loads(base64.b64decode(state_b64.encode("ascii")))
+        ds.load_state_dict(state)
+        return True
+    except Exception as exc:  # noqa: BLE001 — any failure falls back to offset re-scan
+        log_event("resume_state_failed", error=repr(exc))
+        return False
 
-    If this process wedges inside pyarrow/fsspec/aiohttp, the parent can kill it.
+
+def stream_worker(name, config, split, resume_state_b64, resume_base, start_example, ckpt_every, out_q):
+    """Child process: owns the HF iterator and ships examples to the parent.
+
+    Messages put on the queue (always blocking, so backpressure is honored):
+      ("ckpt", global_idx, state_b64)  periodic resume checkpoint
+      ("scan", global_idx, None)       progress heartbeat while skipping
+      ("ex",   global_idx+1, example)  a real example to tokenize
+      ("done", None, None)             stream exhausted
+      ("err",  None, repr(exc))        the iterator raised
     """
     try:
         ds = load_stream(name, config, split)
-        for idx, ex in enumerate(ds):
-            if idx < start_example:
+
+        base = 0
+        if _try_load_state(ds, resume_state_b64):
+            base = int(resume_base)
+            out_q.put(("scan", base, None), block=True)
+        elif start_example > 0:
+            # No usable checkpoint: we must re-scan from 0 to start_example.
+            out_q.put(("rescan", start_example, None), block=True)
+
+        for local_idx, ex in enumerate(ds):
+            global_idx = base + local_idx
+
+            if global_idx < start_example:
+                if (global_idx % 5000) == 0:
+                    out_q.put(("scan", global_idx, None), block=True)
                 continue
-            out_q.put(("ex", idx + 1, ex), block=True)
+
+            if ckpt_every and (global_idx % ckpt_every == 0) and hasattr(ds, "state_dict"):
+                try:
+                    # state_dict() here reflects "consumed through global_idx", so a
+                    # reload resumes at global_idx + 1 — that is the resume base.
+                    st = base64.b64encode(pickle.dumps(ds.state_dict())).decode("ascii")
+                    out_q.put(("ckpt", global_idx + 1, st), block=True)
+                except Exception:  # noqa: BLE001 — checkpointing is best-effort
+                    pass
+
+            out_q.put(("ex", global_idx + 1, ex), block=True)
+
         out_q.put(("done", None, None), block=True)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         try:
             out_q.put(("err", None, repr(exc)), block=True)
         except Exception:
@@ -231,464 +345,533 @@ def kill_process(proc):
         proc.join(timeout=5)
 
 
-def iter_stream_restartable(name, config, split, label, start_example):
-    """
-    Yield (example_count_seen, example) and restart from last example count if
-    the stream stalls. Does not skip the dataset.
-    """
-    ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
-    cursor = int(start_example)
-    restarts = 0
+# ---------------------------------------------------------------------------
+# DataPrep — owns progress, the temp token file, and the restartable streams.
+# ---------------------------------------------------------------------------
+class DataPrep:
+    def __init__(self, output_dir):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    while True:
-        q = ctx.Queue(maxsize=256)
-        proc = ctx.Process(
-            target=stream_worker,
-            args=(name, config, split, cursor, q),
-            daemon=True,
-        )
-        proc.start()
+        self.PROGRESS_PATH = self.output_dir / "prepare_progress.json"
+        self.TMP_PATH = self.output_dir / "_tokens_tmp.bin"
+        self.TRAIN_PATH = self.output_dir / "train.bin"
+        self.VAL_PATH = self.output_dir / "val.bin"
+        self.FAILED_PATH = self.output_dir / "prepare_FAILED.json"
 
-        print(f"  [stream] {label}: start worker pid={proc.pid} from example offset {cursor:,}", flush=True)
+        self.mp_ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
 
-        stalls = 0
-        made_progress = False
+        import numpy as np  # local import keeps the test seam dependency-light
 
+        self.np = np
+        self.write_buf = []
+        self._last_hb = 0
+        # Cheap setup only. Load progress and write a heartbeat IMMEDIATELY so the
+        # orchestration watchdog sees liveness before the (network-bound, possibly
+        # slow) tokenizer load — a hang there then trips the heartbeat check.
+        self.progress = self.load_progress()
+        self.save_progress(phase="starting", last_event="init")
+        self.tokenizer = None
+        self.eos_id = 2
+        self.custom_files = []
+        self.datasets = []
+
+    def _setup(self):
+        """Heavy initialization (tokenizer + dataset selection). Deferred out of
+        __init__ so the heartbeat file exists first."""
+        self.tokenizer = self.load_tokenizer()
+        self.eos_id = self.tokenizer.token_to_id("</s>") or 2
+        self.custom_files = self.get_custom_files()
+        self.datasets = self.active_datasets()
+
+    # ---- tokenizer -------------------------------------------------------
+    def load_tokenizer(self):
+        if FAKE_STREAM:
+            class _FakeTok:
+                class _Enc:
+                    def __init__(self, ids):
+                        self.ids = ids
+
+                def encode(self, text):
+                    return _FakeTok._Enc([1] * (len(text.split()) + 1))
+
+                def token_to_id(self, _):
+                    return 2
+
+            return _FakeTok()
+
+        from tokenizers import Tokenizer
+
+        log_event("tokenizer_loading")
         try:
-            while True:
-                try:
-                    kind, seen, payload = q.get(timeout=STREAM_TIMEOUT)
-                except queue_mod.Empty:
-                    stalls += 1
-                    print(
-                        f"  [stall] {label}: no example for {STREAM_TIMEOUT}s "
-                        f"(strike {stalls}/{MAX_STALLS}) at example offset {cursor:,}",
-                        flush=True,
-                    )
+            tok = Tokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
+        except Exception:
+            if Path("tokenizer.json").exists():
+                tok = Tokenizer.from_file("tokenizer.json")
+            else:
+                log_event("fatal", reason="no tokenizer; run: tinybit download")
+                sys.exit(1)
+        log_event("tokenizer_loaded")
+        return tok
 
-                    if stalls >= MAX_STALLS:
+    # ---- dataset selection ----------------------------------------------
+    def get_custom_files(self):
+        files = []
+        if CUSTOM_CHAT_DIR and Path(CUSTOM_CHAT_DIR).is_dir() and CUSTOM_CHAT_EPOCHS > 0:
+            for fn in sorted(os.listdir(CUSTOM_CHAT_DIR)):
+                if fn.endswith((".jsonl", ".txt")):
+                    files.append(str(Path(CUSTOM_CHAT_DIR) / fn))
+        if files:
+            log_event("custom_chat_found", count=len(files), epochs=CUSTOM_CHAT_EPOCHS,
+                      files=[Path(f).name for f in files])
+        return files
+
+    def active_datasets(self):
+        if FAKE_STREAM:
+            # A single fake dataset is enough to exercise the machinery offline.
+            return [("fake/dataset", None, "train", "text", 1.0, False, "text")]
+
+        table = CODING_DATASETS if PROFILE == "coding" else GENERAL_DATASETS
+        active, skipped = [], []
+        for entry in table:
+            name, cfg, _split, _field, _weight, gated, _kind = entry
+            if gated and (not HF_TOKEN or not ENABLE_GATED):
+                skipped.append(dataset_label(name, cfg))
+                continue
+            active.append(entry)
+        if skipped:
+            log_event("datasets_skipped", reason="gated and HF_TOKEN missing/disabled", datasets=skipped)
+        if not active:
+            log_event("fatal", reason="no datasets remain active")
+            sys.exit(2)
+        log_event("datasets_active", count=len(active),
+                  datasets=[dataset_label(e[0], e[1]) for e in active])
+        return active
+
+    # ---- progress persistence -------------------------------------------
+    def fresh_progress(self):
+        return {
+            "version": 3,
+            "profile": PROFILE,
+            "total_tokens_target": TOTAL_TOKENS,
+            "min_tokens": MIN_TOKENS,
+            "total_written": 0,
+            "datasets": {},
+            "current_index": 0,
+            "custom_done": False,
+            "heartbeat_unix": now_unix(),
+            "phase": "init",
+            "last_event": "fresh",
+        }
+
+    def load_progress(self):
+        if RESUME_DATA_PREP and self.PROGRESS_PATH.exists() and self.TMP_PATH.exists():
+            try:
+                with open(self.PROGRESS_PATH, encoding="utf-8") as fh:
+                    p = json.load(fh)
+                if p.get("version") == 3 and p.get("profile") == PROFILE:
+                    expected_bytes = int(p.get("total_written", 0)) * 4
+                    actual_bytes = self.TMP_PATH.stat().st_size
+                    if actual_bytes >= expected_bytes:
+                        if actual_bytes != expected_bytes:
+                            log_event("resume_truncate", from_bytes=actual_bytes, to_bytes=expected_bytes)
+                            with open(self.TMP_PATH, "r+b") as fh2:
+                                fh2.truncate(expected_bytes)
+                        log_event("resume_loaded", total_written=int(p.get("total_written", 0)))
+                        return p
+                    log_event("resume_rejected", reason="temp file shorter than progress",
+                              actual_bytes=actual_bytes, expected_bytes=expected_bytes)
+            except Exception as exc:  # noqa: BLE001
+                log_event("resume_broken", error=repr(exc))
+        if not RESUME_DATA_PREP:
+            log_event("resume_disabled")
+        return self.fresh_progress()
+
+    def save_progress(self, phase=None, last_event=None):
+        if phase is not None:
+            self.progress["phase"] = phase
+        if last_event is not None:
+            self.progress["last_event"] = last_event
+        self.progress["heartbeat_unix"] = now_unix()
+        tmp = self.PROGRESS_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self.progress, fh, indent=2, sort_keys=True)
+        os.replace(tmp, self.PROGRESS_PATH)
+
+    def heartbeat(self, phase=None, last_event=None):
+        """Cheap liveness update — does NOT rewrite the whole file every call."""
+        # Rewriting the JSON a few times per second would be wasteful; throttle.
+        last = getattr(self, "_last_hb", 0)
+        t = now_unix()
+        if t - last >= 5 or phase is not None or last_event is not None:
+            self._last_hb = t
+            self.save_progress(phase=phase, last_event=last_event)
+
+    # ---- token buffer ----------------------------------------------------
+    def flush_buf(self, fh):
+        if not self.write_buf:
+            return
+        arr = self.np.array(self.write_buf, dtype=self.np.uint32)
+        arr.tofile(fh)
+        self.progress["total_written"] = int(self.progress.get("total_written", 0)) + len(self.write_buf)
+        self.write_buf.clear()
+        fh.flush()
+        os.fsync(fh.fileno())
+        self.save_progress()
+
+    def tokenize_to_buffer(self, text):
+        if not text or not text.strip():
+            return 0
+        try:
+            enc = self.tokenizer.encode(text)
+        except Exception:
+            return 0
+        ids = enc.ids + [self.eos_id]
+        self.write_buf.extend(ids)
+        return len(ids)
+
+    # ---- restartable stream ---------------------------------------------
+    def iter_stream_restartable(self, name, config, split, label, ds_state):
+        """Yield (examples_seen, example), restarting the killable child on stall.
+
+        Resume strategy, in order of preference:
+          1. HF state_dict (cheap): reload exact shard/row position.
+          2. example-offset re-scan (always correct, slower).
+        Fails loudly if the dataset makes zero progress across
+        MAX_RESTARTS_NO_PROGRESS consecutive restarts.
+        """
+        cursor = int(ds_state.get("examples_seen", 0))
+        state_b64 = ds_state.get("hf_state_b64") or ""
+        state_base = int(ds_state.get("hf_state_base", 0))
+        restarts = 0
+        restarts_no_progress = 0
+
+        while True:
+            q = self.mp_ctx.Queue(maxsize=256)
+            proc = self.mp_ctx.Process(
+                target=stream_worker,
+                args=(name, config, split, state_b64, state_base, cursor, CHECKPOINT_EVERY, q),
+                daemon=True,
+            )
+            proc.start()
+            log_event("stream_start", dataset=label, pid=proc.pid, cursor=cursor,
+                      has_checkpoint=bool(state_b64))
+
+            stalls = 0
+            progressed_this_run = False
+            try:
+                while True:
+                    try:
+                        kind, seen, payload = q.get(timeout=STREAM_TIMEOUT)
+                    except queue_mod.Empty:
+                        stalls += 1
+                        self.heartbeat(last_event=f"stall:{label}:{stalls}")
+                        log_event("stall", dataset=label, strike=stalls, max=MAX_STALLS, cursor=cursor)
+                        if stalls >= MAX_STALLS:
+                            kill_process(proc)
+                            restarts += 1
+                            if not progressed_this_run:
+                                restarts_no_progress += 1
+                            else:
+                                restarts_no_progress = 0
+                            self._check_restart_budget(label, restarts, restarts_no_progress, cursor)
+                            backoff = min(60, 5 * restarts)
+                            log_event("restart", dataset=label, restart=restarts,
+                                      no_progress=restarts_no_progress, backoff_s=backoff, cursor=cursor)
+                            self.heartbeat(last_event=f"restart:{label}:{restarts}")
+                            time.sleep(backoff)
+                            break
+                        continue
+
+                    stalls = 0
+
+                    if kind == "ex":
+                        cursor = int(seen)
+                        progressed_this_run = True
+                        restarts_no_progress = 0
+                        yield cursor, payload
+                    elif kind == "ckpt":
+                        state_b64 = payload
+                        state_base = int(seen)
+                        ds_state["hf_state_b64"] = state_b64
+                        ds_state["hf_state_base"] = state_base
+                        self.heartbeat()
+                    elif kind in ("scan", "rescan"):
+                        if kind == "rescan":
+                            log_event("rescan", dataset=label, to_example=int(seen),
+                                      note="no usable checkpoint; re-scanning from 0")
+                        self.heartbeat(last_event=f"scan:{label}:{seen}")
+                    elif kind == "done":
+                        kill_process(proc)
+                        log_event("stream_done", dataset=label, cursor=cursor)
+                        return
+                    elif kind == "err":
                         kill_process(proc)
                         restarts += 1
-
-                        if MAX_RESTARTS_PER_DATASET and restarts > MAX_RESTARTS_PER_DATASET:
-                            raise RuntimeError(
-                                f"{label} stalled too many times at example offset {cursor:,}; "
-                                f"raise MAX_RESTARTS_PER_DATASET or use a different data source."
-                            )
-
-                        backoff = min(60, 5 * restarts)
-                        print(
-                            f"  [restart] {label}: restarting same dataset from "
-                            f"example offset {cursor:,} after {backoff}s "
-                            f"(restart #{restarts})",
-                            flush=True,
-                        )
-                        time.sleep(backoff)
+                        if not progressed_this_run:
+                            restarts_no_progress += 1
+                        else:
+                            restarts_no_progress = 0
+                        log_event("stream_error", dataset=label, error=payload,
+                                  restart=restarts, no_progress=restarts_no_progress, cursor=cursor)
+                        self._check_restart_budget(label, restarts, restarts_no_progress, cursor)
+                        self.heartbeat(last_event=f"error_restart:{label}:{restarts}")
+                        time.sleep(min(60, 5 * restarts))
                         break
 
-                    continue
+                    if not proc.is_alive() and q.empty():
+                        return
+            finally:
+                kill_process(proc)
 
-                stalls = 0
-
-                if kind == "ex":
-                    cursor = int(seen)
-                    made_progress = True
-                    yield cursor, payload
-                elif kind == "done":
-                    kill_process(proc)
-                    print(f"  [done] {label}: stream finished at example offset {cursor:,}", flush=True)
-                    return
-                elif kind == "err":
-                    kill_process(proc)
-                    restarts += 1
-                    print(
-                        f"  [warn] {label}: stream error {payload}; restarting "
-                        f"from example offset {cursor:,} (restart #{restarts})",
-                        flush=True,
-                    )
-                    time.sleep(min(60, 5 * restarts))
-                    break
-
-                if not proc.is_alive() and q.empty():
-                    return
-
-        finally:
-            kill_process(proc)
-
-        if not made_progress:
-            print(
-                f"  [note] {label}: restart made no progress; still retrying same dataset, "
-                f"not skipping it.",
-                flush=True,
+    def _check_restart_budget(self, label, restarts, restarts_no_progress, cursor):
+        if restarts_no_progress >= MAX_RESTARTS_NO_PROGRESS:
+            raise RuntimeError(
+                f"{label}: {restarts_no_progress} consecutive restarts made no progress "
+                f"at example offset {cursor:,}; the source appears permanently stalled. "
+                f"Raise MAX_RESTARTS_NO_PROGRESS or change the data source."
+            )
+        if MAX_RESTARTS_PER_DATASET and restarts > MAX_RESTARTS_PER_DATASET:
+            raise RuntimeError(
+                f"{label}: exceeded MAX_RESTARTS_PER_DATASET={MAX_RESTARTS_PER_DATASET} "
+                f"at example offset {cursor:,}."
             )
 
+    # ---- weighted mix ----------------------------------------------------
+    def dataset_target(self, remaining_budget, remaining_active):
+        weight_sum = sum(w for *_, w, _g, _k in remaining_active)
+        if weight_sum <= 0:
+            return 0
+        weight = remaining_active[0][4]
+        return int(remaining_budget * (weight / weight_sum))
 
-def get_custom_files():
-    files = []
-    if CUSTOM_CHAT_DIR and Path(CUSTOM_CHAT_DIR).is_dir() and CUSTOM_CHAT_EPOCHS > 0:
-        for fn in sorted(os.listdir(CUSTOM_CHAT_DIR)):
-            if fn.endswith((".jsonl", ".txt")):
-                files.append(str(Path(CUSTOM_CHAT_DIR) / fn))
-    if files:
-        print(
-            f"Custom chat data: {len(files)} file(s) from {CUSTOM_CHAT_DIR}/ "
-            f"x{CUSTOM_CHAT_EPOCHS} epochs (tokenized last): "
-            + ", ".join(Path(f).name for f in files),
-            flush=True,
-        )
-    return files
+    def prepare_weighted_mix(self):
+        remaining_budget = max(0, TOTAL_TOKENS - int(self.progress.get("total_written", 0)))
+        mode = "ab" if self.TMP_PATH.exists() else "wb"
+        with open(self.TMP_PATH, mode) as tmp_f:
+            start_index = int(self.progress.get("current_index", 0))
 
+            while start_index < len(self.datasets):
+                remaining_active = self.datasets[start_index:]
+                name, cfg, split, field, _weight, _gated, kind = remaining_active[0]
+                label = dataset_label(name, cfg)
+                self.save_progress(phase=f"stream:{label}")
 
-custom_files = get_custom_files()
-
-
-def active_datasets():
-    table = CODING_DATASETS if PROFILE == "coding" else GENERAL_DATASETS
-    active = []
-    skipped = []
-
-    for entry in table:
-        name, cfg, split, field, weight, gated, kind = entry
-        if gated and (not HF_TOKEN or not ENABLE_GATED):
-            skipped.append((dataset_label(name, cfg), "gated and HF_TOKEN missing/disabled"))
-            continue
-        active.append(entry)
-
-    if skipped:
-        print("Skipping datasets:", flush=True)
-        for n, reason in skipped:
-            print(f"  - {n}: {reason}", flush=True)
-
-    if not active:
-        print("ERROR: no datasets remain active.", flush=True)
-        sys.exit(2)
-
-    return active
-
-
-DATASETS = active_datasets()
-
-
-def fresh_progress():
-    return {
-        "version": 2,
-        "profile": PROFILE,
-        "total_tokens_target": TOTAL_TOKENS,
-        "min_tokens": MIN_TOKENS,
-        "total_written": 0,
-        "datasets": {},
-        "current_index": 0,
-        "custom_done": False,
-    }
-
-
-def load_progress():
-    if RESUME_DATA_PREP and PROGRESS_PATH.exists() and TMP_PATH.exists():
-        try:
-            with open(PROGRESS_PATH, encoding="utf-8") as fh:
-                p = json.load(fh)
-            if p.get("version") == 2 and p.get("profile") == PROFILE:
-                expected_bytes = int(p.get("total_written", 0)) * 4
-                actual_bytes = TMP_PATH.stat().st_size
-                if actual_bytes >= expected_bytes:
-                    if actual_bytes != expected_bytes:
-                        print(
-                            f"[resume] truncating temp token file from {actual_bytes} to "
-                            f"{expected_bytes} bytes to match progress",
-                            flush=True,
-                        )
-                        with open(TMP_PATH, "r+b") as fh2:
-                            fh2.truncate(expected_bytes)
-                    print(
-                        f"[resume] loaded progress: {p.get('total_written', 0):,} tokens written",
-                        flush=True,
-                    )
-                    return p
-        except Exception as exc:
-            print(f"[resume] ignored broken progress file: {exc!r}", flush=True)
-
-    if not RESUME_DATA_PREP:
-        print("[resume] RESUME_DATA_PREP=0 — starting clean", flush=True)
-    return fresh_progress()
-
-
-progress = load_progress()
-
-
-def save_progress():
-    tmp = PROGRESS_PATH.with_suffix(".json.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(progress, fh, indent=2, sort_keys=True)
-    os.replace(tmp, PROGRESS_PATH)
-
-
-write_buf = []
-
-
-def flush_buf(fh):
-    if not write_buf:
-        return
-    arr = np.array(write_buf, dtype=np.uint32)
-    arr.tofile(fh)
-    progress["total_written"] = int(progress.get("total_written", 0)) + len(write_buf)
-    write_buf.clear()
-    fh.flush()
-    os.fsync(fh.fileno())
-    save_progress()
-
-
-def tokenize_to_buffer(text):
-    if not text or not text.strip():
-        return 0
-    try:
-        enc = tokenizer.encode(text)
-    except Exception:
-        return 0
-    ids = enc.ids + [EOS_ID]
-    write_buf.extend(ids)
-    return len(ids)
-
-
-def dataset_target(remaining_budget, remaining_active):
-    weight_sum = sum(w for *_, w, _g, _k in remaining_active)
-    if weight_sum <= 0:
-        return 0
-    _name, _cfg, _split, _field, weight, _gated, _kind = remaining_active[0]
-    return int(remaining_budget * (weight / weight_sum))
-
-
-def prepare_weighted_mix():
-    remaining_budget = max(0, TOTAL_TOKENS - int(progress.get("total_written", 0)))
-
-    mode = "ab" if TMP_PATH.exists() else "wb"
-    with open(TMP_PATH, mode) as tmp_f:
-        start_index = int(progress.get("current_index", 0))
-
-        while start_index < len(DATASETS):
-            remaining_active = DATASETS[start_index:]
-            name, cfg, split, field, weight, _gated, kind = remaining_active[0]
-            label = dataset_label(name, cfg)
-
-            ds_state = progress["datasets"].setdefault(
-                label,
-                {
-                    "done": False,
-                    "examples_seen": 0,
-                    "tokens": 0,
-                    "target": None,
-                    "restarts": 0,
-                },
-            )
-
-            if ds_state.get("done"):
-                print(f"  {label}: already done — skipping to next dataset", flush=True)
-                start_index += 1
-                progress["current_index"] = start_index
-                save_progress()
-                continue
-
-            target = ds_state.get("target")
-            if target is None:
-                target = dataset_target(remaining_budget, remaining_active)
-                ds_state["target"] = int(target)
-                save_progress()
-
-            if target <= 0:
-                ds_state["done"] = True
-                start_index += 1
-                progress["current_index"] = start_index
-                save_progress()
-                continue
-
-            print(
-                f"  {label}: target {target:,} tokens (kind={kind}) "
-                f"resume_examples={int(ds_state.get('examples_seen', 0)):,} "
-                f"resume_tokens={int(ds_state.get('tokens', 0)):,}",
-                flush=True,
-            )
-
-            got = int(ds_state.get("tokens", 0))
-            start_example = int(ds_state.get("examples_seen", 0))
-
-            pbar_total = max(target // 1024, 100)
-            pbar = tqdm(
-                desc=label,
-                unit="ex",
-                mininterval=5.0,
-                total=pbar_total,
-                initial=max(0, min(start_example, pbar_total)),
-            )
-
-            try:
-                for examples_seen, ex in iter_stream_restartable(name, cfg, split, label, start_example):
-                    if got >= target:
-                        break
-
-                    text = text_from_example(ex, field, kind)
-                    added = tokenize_to_buffer(text)
-                    got += added
-
-                    ds_state["examples_seen"] = int(examples_seen)
-                    ds_state["tokens"] = int(got)
-
-                    pbar.update(1)
-
-                    if len(write_buf) >= FLUSH_EVERY:
-                        flush_buf(tmp_f)
-
-                flush_buf(tmp_f)
-                pbar.close()
-
-                ds_state["tokens"] = int(got)
-                ds_state["done"] = True
-                remaining_budget = max(0, remaining_budget - got)
-
-                print(
-                    f"    {label}: collected {got:,} tokens "
-                    f"(remaining budget {remaining_budget:,})",
-                    flush=True,
+                ds_state = self.progress["datasets"].setdefault(
+                    label,
+                    {"done": False, "examples_seen": 0, "tokens": 0, "target": None, "restarts": 0},
                 )
 
-                start_index += 1
-                progress["current_index"] = start_index
-                save_progress()
+                if ds_state.get("done"):
+                    log_event("dataset_skip_done", dataset=label)
+                    start_index += 1
+                    self.progress["current_index"] = start_index
+                    self.save_progress()
+                    continue
 
-            except Exception as exc:
-                pbar.close()
-                flush_buf(tmp_f)
-                save_progress()
-                print(f"ERROR: {label} failed without being skipped: {exc}", flush=True)
-                raise
+                target = ds_state.get("target")
+                if target is None:
+                    target = self.dataset_target(remaining_budget, remaining_active)
+                    ds_state["target"] = int(target)
+                    self.save_progress()
 
+                if target <= 0:
+                    ds_state["done"] = True
+                    start_index += 1
+                    self.progress["current_index"] = start_index
+                    self.save_progress()
+                    continue
 
-def prepare_custom_chat():
-    if progress.get("custom_done"):
-        print("Custom chat data already done — skipping", flush=True)
-        return
+                log_event("dataset_begin", dataset=label, target_tokens=int(target), kind=kind,
+                          resume_examples=int(ds_state.get("examples_seen", 0)),
+                          resume_tokens=int(ds_state.get("tokens", 0)))
 
-    if not custom_files:
-        progress["custom_done"] = True
-        save_progress()
-        return
+                got = int(ds_state.get("tokens", 0))
+                try:
+                    for examples_seen, ex in self.iter_stream_restartable(name, cfg, split, label, ds_state):
+                        if got >= target:
+                            break
+                        got += self.tokenize_to_buffer(text_from_example(ex, field, kind))
+                        ds_state["examples_seen"] = int(examples_seen)
+                        ds_state["tokens"] = int(got)
+                        if len(self.write_buf) >= FLUSH_EVERY:
+                            self.flush_buf(tmp_f)
+                            log_event("progress", dataset=label, tokens=got, target=int(target),
+                                      total_written=int(self.progress["total_written"]),
+                                      examples=int(examples_seen))
 
-    with open(TMP_PATH, "ab") as tmp_f:
-        for fp in custom_files:
-            label = f"custom:{Path(fp).name}"
-            state = progress["datasets"].setdefault(
-                label,
-                {"done": False, "tokens": 0, "examples_seen": 0},
+                    self.flush_buf(tmp_f)
+                    ds_state["tokens"] = int(got)
+                    ds_state["done"] = True
+                    # Free the (now useless) resume checkpoint.
+                    ds_state.pop("hf_state_b64", None)
+                    ds_state.pop("hf_state_base", None)
+                    remaining_budget = max(0, remaining_budget - got)
+                    log_event("dataset_done", dataset=label, tokens=got, remaining_budget=remaining_budget)
+                    start_index += 1
+                    self.progress["current_index"] = start_index
+                    self.save_progress()
+                except Exception:
+                    self.flush_buf(tmp_f)
+                    self.save_progress(last_event=f"dataset_failed:{label}")
+                    raise
+
+    # ---- custom chat -----------------------------------------------------
+    def prepare_custom_chat(self):
+        if self.progress.get("custom_done"):
+            log_event("custom_skip_done")
+            return
+        if not self.custom_files:
+            self.progress["custom_done"] = True
+            self.save_progress()
+            return
+
+        self.save_progress(phase="custom")
+        with open(self.TMP_PATH, "ab") as tmp_f:
+            for fp in self.custom_files:
+                label = f"custom:{Path(fp).name}"
+                state = self.progress["datasets"].setdefault(
+                    label, {"done": False, "tokens": 0, "examples_seen": 0}
+                )
+                if state.get("done"):
+                    continue
+
+                got = int(state.get("tokens", 0))
+                seen = int(state.get("examples_seen", 0))
+                global_seen = 0
+                log_event("custom_begin", file=label, epochs=CUSTOM_CHAT_EPOCHS)
+
+                for _epoch in range(CUSTOM_CHAT_EPOCHS):
+                    for obj in read_jsonl(fp):
+                        global_seen += 1
+                        if global_seen <= seen:
+                            continue
+                        turns = normalize_turns(obj.get("messages", []))
+                        roles = {r for r, _ in turns}
+                        if "user" not in roles or "assistant" not in roles:
+                            continue
+                        got += self.tokenize_to_buffer(format_chat(turns))
+                        state["tokens"] = int(got)
+                        state["examples_seen"] = int(global_seen)
+                        if len(self.write_buf) >= FLUSH_EVERY:
+                            self.flush_buf(tmp_f)
+
+                self.flush_buf(tmp_f)
+                state["done"] = True
+                self.save_progress()
+                log_event("custom_done_file", file=label, tokens=got)
+
+        self.progress["custom_done"] = True
+        self.save_progress()
+
+    # ---- finalize --------------------------------------------------------
+    def copy_range(self, src_path, dst_path, start_tok, count_tok):
+        Path(dst_path).parent.mkdir(parents=True, exist_ok=True)
+        copy_chunk_tokens = 1 << 20
+        with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
+            src.seek(start_tok * 4)
+            remaining = count_tok * 4
+            while remaining > 0:
+                chunk = src.read(min(copy_chunk_tokens * 4, remaining))
+                if not chunk:
+                    break
+                dst.write(chunk)
+                remaining -= len(chunk)
+        log_event("wrote_split", path=str(dst_path), tokens=int(count_tok))
+
+    def split_train_val(self):
+        self.save_progress(phase="splitting")
+        total_collected = int(self.progress.get("total_written", 0))
+        per_dataset = {k: int(v.get("tokens", 0)) for k, v in self.progress.get("datasets", {}).items()}
+        log_event("collection_summary", total=total_collected, target=TOTAL_TOKENS, per_dataset=per_dataset)
+
+        if total_collected < MIN_TOKENS:
+            self.write_failed(
+                f"only {total_collected:,} tokens collected; MIN_TOKENS={MIN_TOKENS:,}. "
+                f"Temp file + progress kept so the next run resumes.",
+                fatal=False,
             )
+            log_event("fatal", reason="below MIN_TOKENS", collected=total_collected, min_tokens=MIN_TOKENS)
+            sys.exit(3)
 
-            if state.get("done"):
-                continue
+        val_size = max(SEQ_LEN * 100, total_collected // 50)
+        val_size = min(val_size, total_collected - SEQ_LEN)
+        train_size = total_collected - val_size
+        log_event("splitting", val_tokens=val_size, train_tokens=train_size)
 
-            got = int(state.get("tokens", 0))
-            seen = int(state.get("examples_seen", 0))
-            global_seen = 0
+        self.copy_range(self.TMP_PATH, self.VAL_PATH, 0, val_size)
+        self.copy_range(self.TMP_PATH, self.TRAIN_PATH, val_size, train_size)
 
-            print(f"  {label}: tokenizing custom chat x{CUSTOM_CHAT_EPOCHS}", flush=True)
+        try:
+            self.TMP_PATH.unlink()
+        except FileNotFoundError:
+            pass
 
-            for _epoch in range(CUSTOM_CHAT_EPOCHS):
-                for obj in read_jsonl(fp):
-                    global_seen += 1
-                    if global_seen <= seen:
-                        continue
+        self.progress["finalized"] = True
+        self.save_progress(phase="done", last_event="finalized")
+        try:
+            self.FAILED_PATH.unlink()
+        except FileNotFoundError:
+            pass
+        log_event("done", train=str(self.TRAIN_PATH), val=str(self.VAL_PATH), total_tokens=total_collected)
 
-                    turns = normalize_turns(obj.get("messages", []))
-                    roles = {r for r, _ in turns}
-                    if "user" not in roles or "assistant" not in roles:
-                        continue
+    # ---- failure reporting ----------------------------------------------
+    def write_failed(self, reason, fatal=True):
+        rec = {
+            "result": "FAILED" if fatal else "INCOMPLETE",
+            "reason": reason,
+            "profile": PROFILE,
+            "total_written": int(self.progress.get("total_written", 0)),
+            "target": TOTAL_TOKENS,
+            "min_tokens": MIN_TOKENS,
+            "phase": self.progress.get("phase"),
+            "current_index": self.progress.get("current_index"),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        try:
+            with open(self.FAILED_PATH, "w", encoding="utf-8") as fh:
+                json.dump(rec, fh, indent=2, sort_keys=True)
+        except Exception:
+            pass
 
-                    text = format_chat(turns)
-                    added = tokenize_to_buffer(text)
-                    got += added
-                    state["tokens"] = int(got)
-                    state["examples_seen"] = int(global_seen)
+    # ---- entrypoint ------------------------------------------------------
+    def run(self):
+        if (
+            self.TRAIN_PATH.exists()
+            and self.VAL_PATH.exists()
+            and self.TRAIN_PATH.stat().st_size > 0
+            and self.VAL_PATH.stat().st_size > 0
+        ):
+            log_event("already_done", train=str(self.TRAIN_PATH), val=str(self.VAL_PATH))
+            return
 
-                    if len(write_buf) >= FLUSH_EVERY:
-                        flush_buf(tmp_f)
-                        save_progress()
-
-            flush_buf(tmp_f)
-            state["done"] = True
-            save_progress()
-            print(f"  {label}: {got:,} tokens", flush=True)
-
-    progress["custom_done"] = True
-    save_progress()
-
-
-def copy_range(src_path, dst_path, start_tok, count_tok):
-    Path(dst_path).parent.mkdir(parents=True, exist_ok=True)
-    copy_chunk_tokens = 1 << 20
-
-    with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
-        src.seek(start_tok * 4)
-        remaining = count_tok * 4
-        while remaining > 0:
-            chunk = src.read(min(copy_chunk_tokens * 4, remaining))
-            if not chunk:
-                break
-            dst.write(chunk)
-            remaining -= len(chunk)
-
-    print(f"  Wrote {count_tok:,} tokens to {dst_path}", flush=True)
-
-
-def split_train_val():
-    total_collected = int(progress.get("total_written", 0))
-
-    print("\nPer-dataset collection:", flush=True)
-    for label, state in progress.get("datasets", {}).items():
-        print(f"  {label}: {int(state.get('tokens', 0)):,}", flush=True)
-
-    print(f"Total collected: {total_collected:,}  (target {TOTAL_TOKENS:,})", flush=True)
-
-    if total_collected < MIN_TOKENS:
-        print(
-            f"ERROR: only {total_collected:,} tokens collected; "
-            f"MIN_TOKENS={MIN_TOKENS:,}. Keeping {TMP_PATH} and {PROGRESS_PATH} "
-            f"so the next run can resume.",
-            flush=True,
-        )
-        sys.exit(3)
-
-    val_size = max(SEQ_LEN * 100, total_collected // 50)
-    val_size = min(val_size, total_collected - SEQ_LEN)
-    train_size = total_collected - val_size
-
-    print(
-        f"\nSplitting: val={val_size:,} tokens (head), "
-        f"train={train_size:,} tokens (rest)",
-        flush=True,
-    )
-
-    copy_range(TMP_PATH, VAL_PATH, 0, val_size)
-    copy_range(TMP_PATH, TRAIN_PATH, val_size, train_size)
-
-    try:
-        TMP_PATH.unlink()
-    except FileNotFoundError:
-        pass
-
-    progress["finalized"] = True
-    save_progress()
-    print("Done!", flush=True)
+        self.save_progress(phase="starting", last_event="setup")
+        self._setup()
+        log_event("start", profile=PROFILE, total_tokens=TOTAL_TOKENS, min_tokens=MIN_TOKENS,
+                  hf_token=bool(HF_TOKEN), stream_timeout=STREAM_TIMEOUT, max_stalls=MAX_STALLS,
+                  max_restarts_no_progress=MAX_RESTARTS_NO_PROGRESS, checkpoint_every=CHECKPOINT_EVERY,
+                  flush_every=FLUSH_EVERY, resume=RESUME_DATA_PREP)
+        try:
+            self.prepare_weighted_mix()
+            self.prepare_custom_chat()
+            self.split_train_val()
+        except Exception as exc:  # noqa: BLE001
+            self.write_failed(f"{type(exc).__name__}: {exc}")
+            log_event("failed", error=repr(exc))
+            raise
 
 
 def main():
-    if TRAIN_PATH.exists() and VAL_PATH.exists() and TRAIN_PATH.stat().st_size > 0 and VAL_PATH.stat().st_size > 0:
-        print("data/train.bin and data/val.bin already exist — nothing to do.", flush=True)
-        return
-
-    prepare_weighted_mix()
-    prepare_custom_chat()
-    split_train_val()
+    output_dir = sys.argv[1] if len(sys.argv) > 1 else "data"
+    if PROFILE not in ("general", "coding"):
+        log_event("fatal", reason=f"DATA_PROFILE must be general|coding (got {PROFILE!r})")
+        sys.exit(1)
+    DataPrep(output_dir).run()
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("Interrupted. Progress kept; rerun to resume.", flush=True)
+        log_event("interrupted", note="progress kept; rerun to resume")
         sys.exit(130)

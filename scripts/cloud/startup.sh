@@ -76,8 +76,18 @@ WORKDIR=/workspace/tinybit
 GCS_RUN_PREFIX="$GCS_BUCKET/runs/$RUN_ID"
 BOOTSTRAP_LOG=/var/log/tinybit-bootstrap.log
 TRAINING_LOG=/var/log/tinybit-training.log
+DATAPREP_LOG=/var/log/tinybit-dataprep.log
 STATUS_PATH=/var/log/tinybit-status.json
 STAGE_CURRENT="boot"
+
+# Data-prep watchdog thresholds. prepare_data.py is self-healing (it kills and
+# restarts a wedged HF stream), so these are the OUTER backstop that guarantees
+# the run can never sit silently: if the prep stops updating its heartbeat, or
+# stops writing new tokens for too long, the watchdog kills it and FAILS the run
+# loudly (FAILED.json + shutdown) instead of burning GPU-hours doing nothing.
+PREP_WATCH_INTERVAL="${PREP_WATCH_INTERVAL:-30}"     # how often to sync + check
+PREP_HEARTBEAT_LIMIT="${PREP_HEARTBEAT_LIMIT:-900}"  # 15 min: heartbeat frozen => wedged parent
+PREP_PROGRESS_LIMIT="${PREP_PROGRESS_LIMIT:-2700}"   # 45 min: no new tokens => stuck
 
 mkdir -p "$WORKDIR" /var/log
 : > "$BOOTSTRAP_LOG"
@@ -143,6 +153,76 @@ sync_checkpoints() {
   if [ -d "$WORKDIR/checkpoints" ]; then
     gs -m -q rsync -r "$WORKDIR/checkpoints/" "$GCS_RUN_PREFIX/checkpoints/" || true
   fi
+}
+
+# Push data-prep visibility (log + structured progress + failure marker) to the
+# bucket so a long prep is observable in real time and a failure is recorded.
+sync_dataprep() {
+  [ -f "$DATAPREP_LOG" ] && gs -q cp "$DATAPREP_LOG" "$GCS_RUN_PREFIX/logs/dataprep.log" || true
+  [ -f "$WORKDIR/data/prepare_progress.json" ] && \
+    gs -q cp "$WORKDIR/data/prepare_progress.json" "$GCS_RUN_PREFIX/data/prepare_progress.json" || true
+  [ -f "$WORKDIR/data/prepare_FAILED.json" ] && \
+    gs -q cp "$WORKDIR/data/prepare_FAILED.json" "$GCS_RUN_PREFIX/data/prepare_FAILED.json" || true
+}
+
+# Run data preparation under a watchdog. prepare_data.py self-heals stalls, but
+# this guarantees the run can NEVER hang silently (the failure mode that froze
+# the 2026-06-02 run): it streams logs+progress to the bucket continuously and,
+# if the prep wedges (heartbeat frozen) or stops producing tokens for too long,
+# kills the whole prep process group and returns non-zero so the run fails loudly.
+# Returns: 0 = prep succeeded, non-zero = prep failed or was declared wedged.
+run_data_prep_watched() {
+  : > "$DATAPREP_LOG"
+  # New session/process group so the watchdog can kill python + its mp workers.
+  setsid bash -c '
+    set -Eeuo pipefail
+    cd "'"$WORKDIR"'"
+    [ -n "'"$HF_TOKEN_VAL"'" ] && export HF_TOKEN="'"$HF_TOKEN_VAL"'"
+    export TOTAL_TOKENS="'"$DATA_TOKENS"'" MIN_TOKENS="'"$MIN_TOKENS"'" DATA_PROFILE="'"$DATA_PROFILE"'"
+    export CUSTOM_CHAT_EPOCHS="'"${CUSTOM_CHAT_EPOCHS:-10}"'"
+    exec bash ./scripts/prepare_data.sh data/
+  ' </dev/null >>"$DATAPREP_LOG" 2>&1 &
+  local prep_pid=$!
+  local pgid="$prep_pid"
+  log "data prep pid=$prep_pid (heartbeat limit ${PREP_HEARTBEAT_LIMIT}s, progress limit ${PREP_PROGRESS_LIMIT}s, log=$DATAPREP_LOG)"
+
+  local progress="$WORKDIR/data/prepare_progress.json"
+  local last_tw=-1
+  local last_tw_change; last_tw_change="$(date +%s)"
+
+  while kill -0 "$prep_pid" 2>/dev/null; do
+    sleep "$PREP_WATCH_INTERVAL"
+    local now; now="$(date +%s)"
+    sync_dataprep
+    sync_logs
+
+    if [ -f "$progress" ]; then
+      local hb tw
+      hb="$(jq -r '.heartbeat_unix // 0' "$progress" 2>/dev/null || echo 0)"
+      tw="$(jq -r '.total_written // 0' "$progress" 2>/dev/null || echo 0)"
+      LAST_STEP=0
+      write_status "prepare_data" ", \"data_tokens_written\": ${tw:-0}, \"data_heartbeat_age_s\": $(( now - ${hb:-0} ))"
+
+      if [ "${hb:-0}" -gt 0 ] && [ "$(( now - hb ))" -gt "$PREP_HEARTBEAT_LIMIT" ]; then
+        log "[watchdog] FATAL: data-prep heartbeat stale $(( now - hb ))s > ${PREP_HEARTBEAT_LIMIT}s — prep is WEDGED, killing"
+        kill -TERM -- "-$pgid" 2>/dev/null || true; sleep 5; kill -KILL -- "-$pgid" 2>/dev/null || true
+        return 124
+      fi
+      if [ "${tw:-0}" != "$last_tw" ]; then
+        last_tw="${tw:-0}"; last_tw_change="$now"
+      elif [ "$(( now - last_tw_change ))" -gt "$PREP_PROGRESS_LIMIT" ]; then
+        log "[watchdog] FATAL: data-prep wrote no new tokens for $(( now - last_tw_change ))s (stuck at ${tw} tokens) — killing"
+        kill -TERM -- "-$pgid" 2>/dev/null || true; sleep 5; kill -KILL -- "-$pgid" 2>/dev/null || true
+        return 124
+      fi
+    fi
+  done
+
+  local rc=0
+  wait "$prep_pid" || rc=$?   # capture prep exit code without tripping set -e
+  sync_dataprep
+  log "data prep finished rc=$rc"
+  return "$rc"
 }
 
 write_marker() {
@@ -342,12 +422,10 @@ else
     log "Preparing data from scratch (no usable cache)…"
     python3 -m pip install --break-system-packages --quiet datasets tokenizers tqdm \
       || python3 -m pip install --user --quiet datasets tokenizers tqdm
-    if [ -n "$HF_TOKEN_VAL" ]; then
-      export HF_TOKEN="$HF_TOKEN_VAL"
-    fi
-    TOTAL_TOKENS="$DATA_TOKENS" MIN_TOKENS="$MIN_TOKENS" DATA_PROFILE="$DATA_PROFILE" \
-    CUSTOM_CHAT_EPOCHS="${CUSTOM_CHAT_EPOCHS:-10}" \
-      bash ./scripts/prepare_data.sh data/
+    # Watched, resumable prep. Returns non-zero on failure OR if the watchdog
+    # declares the prep wedged — either way the ERR trap fires, FAILED.json is
+    # written, and the VM shuts down instead of hanging forever (the 06-02 bug).
+    run_data_prep_watched
     # Cache for future relaunches of this run (best-effort; never fatal).
     log "Caching prepared data to $GCS_RUN_PREFIX/data/ …"
     gs -q cp data/train.bin "$GCS_RUN_PREFIX/data/train.bin" || true
