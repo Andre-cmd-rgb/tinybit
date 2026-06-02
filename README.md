@@ -77,6 +77,12 @@ cargo build --release --workspace
 > tinybit V1.0 ships **no pretrained weights** — you train your own. The 50M
 > `micro` run is the documented target (see [TRAINING.md](TRAINING.md)).
 
+> **Windows:** the same commands work in PowerShell — use
+> `.\target\release\tinybit.exe` and `.\scripts\*.ps1` (e.g.
+> `.\scripts\prepare_data.ps1`, `.\scripts\gcp_launch.ps1`). Every `scripts/*.sh`
+> has a `.ps1` sibling; only the in-VM `scripts/cloud/startup.sh` stays bash
+> (it runs on the Linux training VM). No WSL or Git Bash required.
+
 ---
 
 ## Commands
@@ -149,6 +155,15 @@ DATA_PROFILE=general TOTAL_TOKENS=1500000000 ./scripts/prepare_data.sh data/
 # Train locally or launch an L4 on GCP
 DATA_TOKENS=1500000000 TRAIN_CONFIG=configs/train-micro-l4.toml \
   ./scripts/gcp_launch.sh micro
+```
+
+```powershell
+# Windows / PowerShell equivalents
+$env:DATA_PROFILE = "general"; $env:TOTAL_TOKENS = "1500000000"
+.\scripts\prepare_data.ps1 data
+
+$env:DATA_TOKENS = "1500000000"; $env:TRAIN_CONFIG = "configs/train-micro-l4.toml"
+.\scripts\gcp_launch.ps1 micro
 ```
 
 - **Optimizer**: AdamW by default (validated). Muon is opt-in (`optimizer =
@@ -226,8 +241,6 @@ Gate tests (must pass before any real run):
 - **Tool calling needs fine-tuning to be reliable.** The detect/execute/inject
   loop is complete and tested; a base-pretrained model still emits tool calls
   only loosely.
-- **`small`/`base` are inference-only on the supported hardware** — they don't
-  fit a single L4 for training.
 - **Quantized export is a disk-size win, not yet a speed win** (loads as f32).
 - **GGUF export is not implemented.**
 - **Muon optimizer is experimental** — mechanically correct, quality-at-scale
@@ -245,8 +258,8 @@ crates/
   tinybit-train/   — trainer, optimizer, scheduler, loss, checkpoint, data
   tinybit-cli/     — CLI (chat, eval, train, convert, download)
 tests/             — integration tests (workspace member)
-configs/           — model + training TOML configs (8 model variants)
-scripts/           — data prep + GCP L4 launcher
+configs/           — model + training TOML configs (6 model variants)
+scripts/           — data prep + GCP L4 launcher (Bash *.sh + PowerShell *.ps1)
 ```
 
 ---

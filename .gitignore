@@ -13,4 +13,7 @@
 *.gguf
 .env
 .tinybit.env
+.tinybit.env.ps1
 /tokenizer.json
+__pycache__/
+*.pyc

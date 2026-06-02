@@ -4,7 +4,22 @@ All notable changes to tinybit are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Full Windows support for the helper scripts.** Every user-facing `scripts/*.sh`
+  now has a PowerShell sibling (`prepare_data.ps1`, `eval.ps1`, `preflight.ps1`,
+  and `gcp_{launch,status,tail_logs,sync_now,stop_vm,delete_vm}.ps1`) so the
+  project can be built, trained, and launched on Windows without WSL or Git Bash.
+  The Rust CLI was already cross-platform (the `x86_64-pc-windows-msvc` target is
+  in `rust-toolchain.toml`); these scripts close the tooling gap. GCP PowerShell
+  scripts read settings from `$env:` vars or an optional git-ignored
+  `.tinybit.env.ps1` (mirrors the bash `.tinybit.env`).
+
 ### Changed
+- **Data-prep Python extracted to `scripts/prepare_data.py`.** It was previously
+  a heredoc inside `prepare_data.sh`; both `prepare_data.sh` and the new
+  `prepare_data.ps1` now invoke the shared file, so the two platforms can never
+  drift. `scripts/cloud/startup.sh` (which runs only on the Linux VM) is
+  unchanged and still bash.
 - **General data mix retuned for small models.** Dropped raw **Wikipedia** (was
   30%) — at ~50M params the model could not store encyclopedic facts and only
   learned Wikipedia's proper-noun register, hallucinating band/album/biography
@@ -23,8 +38,8 @@ small, fast, tool-aware, measurable, and honest about its limits.
 - **`tinybit eval`** — measures perplexity over a token file and runs greedy
   generation-sanity prompts (with tok/s), so model quality is *measured*, not
   guessed.
-- **Two model families** — *general* (`nano`/`micro`/`small`/`base`) and
-  *coding* (`*-coding`). New `configs/*-coding.toml` for all four sizes and a
+- **Two model families** — *general* (`micro`/`bit`/`qbit`) and
+  *coding* (`*-coding`). New `configs/*-coding.toml` for all three sizes and a
   `DATA_PROFILE=general|coding` data mix in `scripts/prepare_data.sh`. See
   [MODELS.md](MODELS.md).
 - **`--profile general|coding`** on `chat`/`eval` to select the default system
