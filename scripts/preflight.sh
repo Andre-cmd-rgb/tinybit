@@ -101,7 +101,7 @@ else
 fi
 
 step "scripts"
-for f in gcp_launch.sh prepare_data.sh gcp_status.sh gcp_tail_logs.sh gcp_sync_now.sh gcp_stop_vm.sh gcp_delete_vm.sh; do
+for f in gcp_launch.sh prepare_data.sh prepare_data.py gcp_status.sh gcp_tail_logs.sh gcp_sync_now.sh gcp_stop_vm.sh gcp_delete_vm.sh; do
   if [ -r "$REPO_ROOT/scripts/$f" ]; then
     ok "scripts/$f readable"
   else

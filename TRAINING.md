@@ -34,6 +34,18 @@ installs CUDA 12.8, prepares the data, compiles with the `cuda` feature, and
 starts training — unattended. Checkpoints sync to
 `$GCP_BUCKET/runs/<run_id>/checkpoints/` every 120 s.
 
+> **Windows / PowerShell.** Every script below has a `.ps1` sibling. Set config
+> via `$env:` vars (or a git-ignored `.tinybit.env.ps1`) and call the `.ps1`:
+>
+> ```powershell
+> $env:GCP_PROJECT = "your-project-id"; $env:GCP_BUCKET = "gs://your-bucket"
+> $env:DATA_TOKENS = "1500000000"; $env:TRAIN_CONFIG = "configs/train-micro-l4.toml"
+> $env:PROVISIONING_MODEL = "STANDARD,SPOT"
+> .\scripts\gcp_launch.ps1 micro
+> ```
+>
+> You need the Google Cloud SDK (`gcloud`/`gsutil`) on `PATH`, same as on Linux.
+
 ---
 
 ## Hardware and cost
@@ -48,8 +60,9 @@ bf16) on a live L4 — ~1.9 days. This is **2.33× faster** than the pre-optimiz
 on-demand price but a multi-day run is preempted repeatedly; checkpoints resume
 from GCS, so SPOT works, but on-demand is the realistic single-run baseline.
 
-`small` (258M) and `base` (501M) are inference-only on an L4 — they need
-A100/H100-class hardware to train, which the launcher does not support.
+All three sizes (`micro` 50M / `bit` 100M / `qbit` 150M) train on a single L4.
+Larger models would need A100/H100-class hardware, which the launcher does not
+support — L4 is the only supported training target.
 
 ---
 
