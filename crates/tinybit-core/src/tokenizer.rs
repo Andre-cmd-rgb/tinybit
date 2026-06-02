@@ -158,22 +158,6 @@ impl Tokenizer {
         Self::build(inner, vocab_size)
     }
 
-    /// Download from HuggingFace hub (vocab_size = tokenizer's own).
-    pub async fn from_hub(model_id: &str) -> anyhow::Result<Self> {
-        let api = hf_hub::api::tokio::Api::new()?;
-        let repo = api.model(model_id.to_string());
-        let tokenizer_path = repo.get("tokenizer.json").await?;
-        Self::from_file(&tokenizer_path)
-    }
-
-    /// Download from HuggingFace hub, capping vocab.
-    pub async fn from_hub_with_vocab(model_id: &str, vocab_size: usize) -> anyhow::Result<Self> {
-        let api = hf_hub::api::tokio::Api::new()?;
-        let repo = api.model(model_id.to_string());
-        let tokenizer_path = repo.get("tokenizer.json").await?;
-        Self::from_file_with_vocab(&tokenizer_path, vocab_size)
-    }
-
     /// Encode `text` to token ids. Any id ≥ `vocab_size` is dropped — this
     /// protects callers from out-of-range index_select crashes when user input
     /// happens to contain a literal special-token string the model wasn't

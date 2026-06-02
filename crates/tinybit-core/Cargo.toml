@@ -18,6 +18,4 @@ safetensors  = { workspace = true }
 anyhow       = { workspace = true }
 thiserror    = { workspace = true }
 tracing      = { workspace = true }
-hf-hub       = { workspace = true }
 half         = { workspace = true }
-tokio        = { workspace = true }

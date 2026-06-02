@@ -25,4 +25,4 @@ tokio          = { workspace = true }
 anyhow         = { workspace = true }
 tracing        = { workspace = true }
 tracing-subscriber = { workspace = true }
-hf-hub         = { workspace = true }
+reqwest        = { workspace = true }

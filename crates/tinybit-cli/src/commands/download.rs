@@ -14,14 +14,39 @@ pub struct DownloadArgs {
 }
 
 pub async fn run(args: DownloadArgs) -> anyhow::Result<()> {
-    println!("Downloading tokenizer from HuggingFace: {}", args.tokenizer_id);
-    let api = hf_hub::api::tokio::Api::new()?;
-    let repo = api.model(args.tokenizer_id.clone());
-    let tokenizer_path = repo.get("tokenizer.json").await?;
+    // Direct HTTPS GET from the HF "resolve" endpoint. We used to go through
+    // hf-hub, but its tokio Api built a malformed URL in some environments
+    // ("relative URL without a base"), which broke `tinybit download` outright.
+    // A plain request is simpler, robust, and removes the dependency.
+    let url = format!(
+        "https://huggingface.co/{}/resolve/main/tokenizer.json",
+        args.tokenizer_id
+    );
+    println!("Downloading tokenizer.json from {url}");
+
+    let bytes = reqwest::Client::new()
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, "tinybit-cli")
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|e| anyhow::anyhow!("download failed for {}: {e}", args.tokenizer_id))?
+        .bytes()
+        .await?;
+
+    // Guard against silently saving an HTML error page as tokenizer.json.
+    if bytes.len() < 1024 {
+        anyhow::bail!(
+            "downloaded tokenizer.json is suspiciously small ({} bytes) — \
+             check that --tokenizer-id is a correct, public repo",
+            bytes.len()
+        );
+    }
+
     std::fs::create_dir_all(&args.output)?;
     let dest = args.output.join("tokenizer.json");
-    std::fs::copy(&tokenizer_path, &dest)?;
-    println!("Saved {}", dest.display());
+    std::fs::write(&dest, &bytes)?;
+    println!("Saved {} ({:.1} KiB)", dest.display(), bytes.len() as f64 / 1024.0);
     println!();
     println!("tinybit V1.0 does not ship pretrained weights — train your own:");
     println!("  • local smoke test:  tinybit train --smoke-test");

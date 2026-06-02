@@ -34,7 +34,7 @@ safetensors    = "0.4.5"
 # CLI
 clap           = { version = "4.5", features = ["derive", "env"] }
 
-# Async runtime — used only by the tokenizer/model download path (hf-hub).
+# Async runtime — used by the CLI entrypoint and the `download` command.
 # tinybit V1.0 is local-CLI-first: there is no HTTP server.
 tokio          = { version = "1.40", features = ["rt-multi-thread", "macros"] }
 
@@ -56,8 +56,10 @@ chrono         = { version = "0.4", features = ["serde"] }
 evalexpr       = "11.3"
 rusqlite       = { version = "0.31", features = ["bundled"] }
 
-# HuggingFace Hub for downloading tokenizers
-hf-hub         = { version = "0.3", features = ["tokio"] }
+# Direct HTTPS client for `tinybit download` (fetches tokenizer.json).
+# Replaced hf-hub, whose tokio Api built a malformed URL in some environments
+# ("relative URL without a base") and broke the download outright.
+reqwest        = { version = "0.11" }
 
 [profile.release]
 opt-level      = 3
