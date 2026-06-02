@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     tinybit GCP launcher — L4 only (Windows / PowerShell).
 
@@ -44,7 +44,11 @@ param(
     [string]$ModelSize = "micro"
 )
 
-$ErrorActionPreference = "Stop"
+# Native tools (gcloud/gsutil/git/cargo/python) write normal output to stderr;
+# under 'Stop', Windows PowerShell 5.1 turns that into a spurious terminating
+# NativeCommandError even on success. Use 'Continue' and judge success by
+# $LASTEXITCODE (which every native call below already checks).
+$ErrorActionPreference = "Continue"
 . (Join-Path $PSScriptRoot "_tinybit_env.ps1")
 
 $RepoRoot = Get-RepoRoot
@@ -191,10 +195,27 @@ Write-Host "[ok] bucket reachable and writable"
 if ($SkipUpload -eq "1") {
     Write-Host "[info] SKIP_UPLOAD=1 — assuming $GcpBucket/$GcsRepoPrefix is current"
 } else {
-    Write-Host "Uploading repo to $GcpBucket/$GcsRepoPrefix (excluding target/, data/, checkpoints*/) ..."
-    $excl = '(^|.*/)target/.*$|(^|.*/)data/.*\.bin$|(^|.*/)checkpoints.*/.*$|^\.git/.*$|.*\.safetensors$'
-    & gsutil -m -q rsync -r -d -x $excl "$RepoRoot/" "$GcpBucket/$GcsRepoPrefix/"
-    if ($LASTEXITCODE -ne 0) { Write-Error "[FATAL] repo upload failed"; exit 1 }
+    Write-Host "Uploading repo to $GcpBucket/$GcsRepoPrefix (excluding target/, .git/, data/, checkpoints*/, *.safetensors) ..."
+    # NOTE: gsutil on Windows is a .cmd batch wrapper, so an rsync exclude regex
+    # with '|' is mangled by cmd.exe ("... was unexpected at this time"). Upload
+    # per top-level entry with plain paths instead, skipping the heavy/never-needed
+    # dirs. (The bash launcher keeps the single-regex rsync; this is the Windows
+    # equivalent.)
+    $dest = "$GcpBucket/$GcsRepoPrefix"
+    $topFiles = Get-ChildItem -File -Force $RepoRoot |
+        Where-Object { $_.Extension -ne '.safetensors' -and $_.Name -notlike '.tinybit.env*' } |
+        ForEach-Object { $_.FullName }
+    if ($topFiles) {
+        & gsutil -m -q cp $topFiles "$dest/"
+        if ($LASTEXITCODE -ne 0) { Write-Error "[FATAL] upload of top-level files failed"; exit 1 }
+    }
+    $skipDirs = @('target', '.git', 'data')
+    Get-ChildItem -Directory -Force $RepoRoot |
+        Where-Object { $skipDirs -notcontains $_.Name -and $_.Name -notlike 'checkpoints*' } |
+        ForEach-Object {
+            & gsutil -m -q rsync -r -d -x '.*\.safetensors$' $_.FullName "$dest/$($_.Name)"
+            if ($LASTEXITCODE -ne 0) { Write-Error ("[FATAL] upload of {0}/ failed" -f $_.Name); exit 1 }
+        }
     Write-Host "[ok] repo uploaded"
 }
 
@@ -331,32 +352,18 @@ $runMetaFile = New-TemporaryFile
 $RunId | & gsutil -q cp - "$GcpBucket/latest_run.txt" 2>$null
 Remove-Item -Force $runMetaFile.FullName -ErrorAction SilentlyContinue
 
-@"
-
-============================================================
- LAUNCHED
-   instance:     $instanceName
-   zone:         $selectedZone
-   hardware:     L4 ($MachineType + $AcceleratorType)
-   provisioning: $selectedProvisioning
-   run_id:       $RunId
-   bucket:       $GcpBucket/runs/$RunId/
-   image:        $ImageFamily ($ImageProject)
-============================================================
-
- Tail bootstrap log (serial console):
-   gcloud compute instances get-serial-port-output $instanceName --zone=$selectedZone --project=$GcpProject | Select-Object -Last 200
-
- SSH in:
-   gcloud compute ssh $instanceName --zone=$selectedZone --project=$GcpProject
-
- Watch status:
-   .\scripts\gcp_status.ps1 $RunId
-
- Tail GCS-side training log:
-   .\scripts\gcp_tail_logs.ps1 $RunId
-
- Stop / delete the VM when needed:
-   .\scripts\gcp_stop_vm.ps1   $instanceName $selectedZone
-   .\scripts\gcp_delete_vm.ps1 $instanceName $selectedZone
-"@ | Write-Host
+@(
+  "",
+  "============================================================",
+  " LAUNCHED",
+  "   instance     : $instanceName",
+  "   zone         : $selectedZone",
+  "   provisioning : $selectedProvisioning",
+  "   run_id       : $RunId",
+  "   bucket       : $GcpBucket/runs/$RunId/",
+  "============================================================",
+  " status : .\scripts\gcp_status.ps1 $RunId",
+  " logs   : .\scripts\gcp_tail_logs.ps1 $RunId",
+  " stop   : .\scripts\gcp_stop_vm.ps1 $instanceName $selectedZone",
+  " delete : .\scripts\gcp_delete_vm.ps1 $instanceName $selectedZone"
+) | ForEach-Object { Write-Host $_ }

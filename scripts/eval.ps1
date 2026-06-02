@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Run the tinybit test/evaluation suite (Windows / PowerShell).
 
@@ -16,7 +16,11 @@ param(
     [string]$ConfigPath = "configs/micro.toml"
 )
 
-$ErrorActionPreference = "Stop"
+# Native tools (gcloud/gsutil/git/cargo/python) write normal output to stderr;
+# under 'Stop', Windows PowerShell 5.1 turns that into a spurious terminating
+# NativeCommandError even on success. Use 'Continue' and judge success by
+# $LASTEXITCODE (which every native call below already checks).
+$ErrorActionPreference = "Continue"
 
 Write-Host "Running cargo tests..."
 cargo test --workspace

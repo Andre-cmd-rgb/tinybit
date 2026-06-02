@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     tinybit data preparation (Windows / PowerShell).
 
@@ -30,7 +30,11 @@ param(
     [string]$OutputDir = "data"
 )
 
-$ErrorActionPreference = "Stop"
+# Native tools (gcloud/gsutil/git/cargo/python) write normal output to stderr;
+# under 'Stop', Windows PowerShell 5.1 turns that into a spurious terminating
+# NativeCommandError even on success. Use 'Continue' and judge success by
+# $LASTEXITCODE (which every native call below already checks).
+$ErrorActionPreference = "Continue"
 
 $OutputDir = $OutputDir.TrimEnd('/', '\')
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
