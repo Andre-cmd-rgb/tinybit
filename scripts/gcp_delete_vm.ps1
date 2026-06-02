@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Delete a tinybit training VM and its boot disk (Windows / PowerShell).
 
@@ -21,7 +21,11 @@ param(
     [switch]$Force
 )
 
-$ErrorActionPreference = "Stop"
+# Native tools (gcloud/gsutil/git/cargo/python) write normal output to stderr;
+# under 'Stop', Windows PowerShell 5.1 turns that into a spurious terminating
+# NativeCommandError even on success. Use 'Continue' and judge success by
+# $LASTEXITCODE (which every native call below already checks).
+$ErrorActionPreference = "Continue"
 . (Join-Path $PSScriptRoot "_tinybit_env.ps1")
 
 $GcpProject = Require-Env "GCP_PROJECT"

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Local preflight checks before paying for a GCP GPU VM (Windows / PowerShell).
 

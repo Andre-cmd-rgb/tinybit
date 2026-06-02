@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Continuously fetch and tail the bootstrap/training log for a run (Windows / PowerShell).
 
@@ -18,7 +18,11 @@ param(
     [string]$Which = "training"
 )
 
-$ErrorActionPreference = "Stop"
+# Native tools (gcloud/gsutil/git/cargo/python) write normal output to stderr;
+# under 'Stop', Windows PowerShell 5.1 turns that into a spurious terminating
+# NativeCommandError even on success. Use 'Continue' and judge success by
+# $LASTEXITCODE (which every native call below already checks).
+$ErrorActionPreference = "Continue"
 . (Join-Path $PSScriptRoot "_tinybit_env.ps1")
 
 $GcpBucket = Trim-Bucket (Require-Env "GCP_BUCKET")
