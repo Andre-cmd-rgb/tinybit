@@ -186,6 +186,21 @@ cargo test --workspace
     `scripts/test_prepare_data.py` (offline, `TINYBIT_FAKE_STREAM=1`): run it after
     touching prepare_data.py.
 
+22. Quantization is a STORAGE format, not a speed feature — and at tinybit's sizes
+    (50–150M) it's usually the wrong trade. `convert --quantize` packs 2D matrices
+    to ternary (5/byte, base-3, ~1.6 bit/weight; tied embedding kept f32) and
+    `TinyBit::load` DEQUANTIZES back to f32 and runs the SAME path — so there is NO
+    inference-speed win, only smaller on-disk size, and post-training ternary on an
+    f32-trained model (ternary_ffn=false, e.g. micro) is LOSSY (measured micro
+    perplexity ~83 → ~590, val.bin). For SPEED prefer full-precision weights + the
+    GPU (build `--features cuda`; eval/chat/train auto-select cuda via
+    `InferenceEngine::auto_device` / `Trainer::auto_device`) — RWKV-7 is O(1)
+    inference (no KV cache), so spending more RAM/VRAM buys throughput cleanly.
+    Only `--quantize` a model trained quantization-aware (bit/qbit,
+    ternary_ffn=true), where ternary is near-lossless. The packer is base-3
+    (`quantize.rs`, 5 trits/byte) — a true ternary-MATMUL runtime (the real speed
+    payoff of BitLinear) is unbuilt; do NOT claim a speed win until it exists.
+
 ## Common mistakes to avoid
 
 - Do NOT use .unwrap() in library code — propagate with anyhow::Result + ?

@@ -53,6 +53,9 @@ V1.0 is **local CLI inference first**: `chat`, `eval`, `train`, `convert`,
 # Prerequisites: Rust stable (see rust-toolchain.toml)
 git clone <this-repo> && cd tinybit
 cargo build --release --workspace
+# GPU (faster inference + training): add --features cuda (needs the CUDA 12.8
+# toolkit). eval/chat/train auto-detect and use the GPU when built with it.
+#   cargo build --release --workspace --features cuda
 
 # 1. Get the tokenizer
 ./target/release/tinybit download --output .
@@ -197,6 +200,13 @@ perplexity rises ~83 → ~590 on the micro checkpoint. Near-lossless ternary nee
 quantization-aware training — the `bit`/`qbit` configs with `ternary_ffn = true`,
 trained from scratch so the STE learns ternary-friendly weights.
 
+**When to use it (rarely, at these sizes):** at 50–150M params the f32 file is
+already small and quantizing gives **no speed win** while costing quality — so for
+deployment, don't bother. To go *faster*, build `--features cuda` and run on a GPU
+with **full-precision** weights: RWKV-7 is O(1)-memory inference (no KV cache), so
+spending more RAM/VRAM buys throughput cleanly. Reach for `--quantize` only to ship
+a `bit`/`qbit` model that was trained ternary-aware.
+
 ---
 
 ## Architecture
@@ -249,7 +259,10 @@ Gate tests (must pass before any real run):
 - **Tool calling needs fine-tuning to be reliable.** The detect/execute/inject
   loop is complete and tested; a base-pretrained model still emits tool calls
   only loosely.
-- **Quantized export is a disk-size win, not yet a speed win** (loads as f32).
+- **Quantization is storage-only and usually not worth it at these sizes.** The
+  packed file loads back as f32 (no speed gain), and post-hoc ternary on an
+  f32-trained model is lossy. For speed, run on a GPU (`--features cuda`) with
+  full-precision weights; a true ternary-*matmul* runtime is future work.
 - **No GGUF / llama.cpp export.** tinybit's custom RWKV-7 + BitLinear architecture
   isn't a llama.cpp architecture, so a GGUF file couldn't be loaded there — the
   stub was removed rather than left as a dead option.
