@@ -86,9 +86,13 @@ small, fast, tool-aware, measurable, and honest about its limits.
   is *post-training*, so it is lossy on f32-trained models (micro perplexity
   ~83 → ~590) — use `ternary_ffn` quantization-aware training for near-lossless
   ternary. At tinybit's sizes (50–150M) quantizing is usually the wrong trade:
-  the f32 file is already small and there's no speed gain — for speed, run
-  full-precision on a GPU (`--features cuda`). No GGUF/llama.cpp export
-  (incompatible architecture).
+  the f32 file is already small and there's no speed gain. No GGUF/llama.cpp
+  export (incompatible architecture).
+- GPU helps throughput, not tiny-model decode (measured on an A2000): batched
+  `eval`/training ~31× faster on GPU (15-batch perplexity 330 s → 10.6 s), but
+  single-token `chat` ~3.5× *slower* than CPU (~21 vs ~75 tok/s) — launch-bound at
+  50M. Build `--features cuda` for the GPU; on Windows build from a VS dev shell so
+  nvcc finds `cl.exe` (CLAUDE.md decision 12). Force CPU with `CUDA_VISIBLE_DEVICES=-1`.
 - The Muon optimizer is experimental; AdamW is the validated default.
 - Measured throughput: 50M `micro` trains at ~6.5 s/step on an L4 (~1.9 days /
   ~$32 for 25k steps), 2.33× faster than before the WKV-backward fix.

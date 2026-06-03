@@ -77,6 +77,20 @@ cargo test --workspace
     appear to work in debug while a fresh/release build fails — `cargo clean -p`
     candle-kernels if the cache lies.)
 
+    Local CUDA build (Windows / MSVC): nvcc needs the MSVC host compiler `cl.exe`
+    on PATH, which a plain PowerShell/cmd does NOT have (rustup drives the MSVC
+    *linker* directly but never puts cl.exe on PATH) → `nvcc fatal: Cannot find
+    compiler 'cl.exe' in PATH` and the candle-kernels build dies. Fix: build from
+    the "x64 Native Tools Command Prompt for VS", OR load the dev env into
+    PowerShell first:
+        $vs = "C:\Program Files\Microsoft Visual Studio\2022\Community"
+        Import-Module (Join-Path $vs "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+        Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
+        cargo build --release -p tinybit-cli --features cuda
+    At RUN time the toolkit's bin (e.g. `C:\Program Files\NVIDIA GPU Computing
+    Toolkit\CUDA\v12.8\bin`) must be on PATH so cudart/cublas DLLs load. Verified
+    on an RTX A2000 (sm_86): builds clean and `eval`/`chat` report `device: cuda`.
+
 13. prepare_data.sh streams tokens directly to disk with numpy uint32 (4 bytes/token).
     Never store tokens in a Python list — at 1B tokens that is ~28 GB of RAM.
     The script writes to a temp file, then copies the tail as val.bin and the head as
@@ -200,6 +214,18 @@ cargo test --workspace
     ternary_ffn=true), where ternary is near-lossless. The packer is base-3
     (`quantize.rs`, 5 trits/byte) — a true ternary-MATMUL runtime (the real speed
     payoff of BitLinear) is unbuilt; do NOT claim a speed win until it exists.
+
+23. MEASURED GPU vs CPU for inference — do NOT assume the GPU is always faster.
+    On an RTX A2000 with the 50M micro model: BATCHED work (training, `eval`
+    perplexity) is ~31x faster on GPU (15-batch perplexity 330 s CPU → 10.6 s GPU),
+    but single-token interactive DECODE (`chat`) is ~3.5x SLOWER on GPU (~21 tok/s
+    vs ~75 tok/s CPU) — at 50M the per-token work is tiny so GPU kernel-launch
+    latency dominates. Guidance: use the GPU for training and `eval`; for
+    interactive `chat` of a tiny model CPU is fine or better. `auto_device` picks
+    CUDA whenever a cuda-built binary sees a GPU — force CPU with
+    `CUDA_VISIBLE_DEVICES=-1`. (Bigger models or batched decode tilt back to GPU.)
+    This is why quantization-for-speed (decision 22) is doubly pointless here: the
+    bottleneck for small-model decode is launch latency, not weight bandwidth.
 
 ## Common mistakes to avoid
 

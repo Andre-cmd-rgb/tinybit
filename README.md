@@ -53,8 +53,11 @@ V1.0 is **local CLI inference first**: `chat`, `eval`, `train`, `convert`,
 # Prerequisites: Rust stable (see rust-toolchain.toml)
 git clone <this-repo> && cd tinybit
 cargo build --release --workspace
-# GPU (faster inference + training): add --features cuda (needs the CUDA 12.8
-# toolkit). eval/chat/train auto-detect and use the GPU when built with it.
+# GPU build — add --features cuda (needs the CUDA 12.8 toolkit; on Windows build
+# from a VS dev shell so nvcc finds cl.exe — see CLAUDE.md decision 12). Big win
+# for TRAINING and `eval` (batched: ~30x on an A2000); eval/chat/train auto-detect
+# the GPU. Interactive `chat` of a tiny model is launch-bound — often FASTER on CPU
+# (force CPU on a cuda build with CUDA_VISIBLE_DEVICES=-1).
 #   cargo build --release --workspace --features cuda
 
 # 1. Get the tokenizer
@@ -202,10 +205,11 @@ trained from scratch so the STE learns ternary-friendly weights.
 
 **When to use it (rarely, at these sizes):** at 50–150M params the f32 file is
 already small and quantizing gives **no speed win** while costing quality — so for
-deployment, don't bother. To go *faster*, build `--features cuda` and run on a GPU
-with **full-precision** weights: RWKV-7 is O(1)-memory inference (no KV cache), so
-spending more RAM/VRAM buys throughput cleanly. Reach for `--quantize` only to ship
-a `bit`/`qbit` model that was trained ternary-aware.
+deployment, don't bother. For *throughput* (training, batched `eval`) build
+`--features cuda` and use a GPU (measured ~30× over CPU on an A2000); keep weights
+**full-precision**. Note interactive `chat` (single-token decode) of a tiny model
+is launch-bound and is often *faster on CPU* — see the speed note below. Reach for
+`--quantize` only to ship a `bit`/`qbit` model trained ternary-aware.
 
 ---
 
@@ -261,8 +265,11 @@ Gate tests (must pass before any real run):
   only loosely.
 - **Quantization is storage-only and usually not worth it at these sizes.** The
   packed file loads back as f32 (no speed gain), and post-hoc ternary on an
-  f32-trained model is lossy. For speed, run on a GPU (`--features cuda`) with
-  full-precision weights; a true ternary-*matmul* runtime is future work.
+  f32-trained model is lossy. A true ternary-*matmul* runtime is future work.
+- **GPU helps throughput, not tiny-model decode (measured).** On an A2000, batched
+  `eval`/training is ~30× faster on GPU, but single-token `chat` is ~3.5× *slower*
+  than CPU (~21 vs ~75 tok/s) — launch-latency bound at 50M. Use GPU for
+  train/`eval`; CPU is fine (often faster) for interactive chat.
 - **No GGUF / llama.cpp export.** tinybit's custom RWKV-7 + BitLinear architecture
   isn't a llama.cpp architecture, so a GGUF file couldn't be loaded there — the
   stub was removed rather than left as a dead option.
