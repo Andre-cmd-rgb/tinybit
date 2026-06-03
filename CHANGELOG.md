@@ -81,8 +81,11 @@ small, fast, tool-aware, measurable, and honest about its limits.
 - No pretrained weights ship — you train your own (see TRAINING.md).
 - Tool *calling* needs instruction/tool fine-tuning to be reliable; the
   detect→execute→inject loop is complete and tested.
-- Quantized export is a disk-size win, not yet a speed win (loads as f32). GGUF
-  export is not implemented.
+- Quantized export packs ternary at ~1.6 bits/weight (5/byte, base-3) → ~3.2×
+  smaller on disk for micro. Loads back as f32 (storage win, not a speed win) and
+  is *post-training*, so it is lossy on f32-trained models (micro perplexity
+  ~83 → ~590) — use `ternary_ffn` quantization-aware training for near-lossless
+  ternary. No GGUF/llama.cpp export (incompatible architecture).
 - The Muon optimizer is experimental; AdamW is the validated default.
 - Measured throughput: 50M `micro` trains at ~6.5 s/step on an L4 (~1.9 days /
   ~$32 for 25k steps), 2.33× faster than before the WKV-backward fix.

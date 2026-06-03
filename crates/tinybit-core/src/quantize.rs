@@ -5,8 +5,9 @@ use candle_core::{Device, DType, Tensor};
 pub const QUANT_MARKER: &str = "__tinybit_quant__";
 
 /// Quantize a 2D weight matrix to packed ternary for export.
-/// Returns (packed_bytes, scale, rows, cols). Two ternary values per byte, so
-/// the packed payload is ~1/16 the size of the original f32 matrix.
+/// Returns (packed_bytes, scale, rows, cols). Five ternary values are packed
+/// per byte (base-3: 3^5 = 243 ≤ 256) → ~1.6 bits/weight, i.e. the packed
+/// payload is ~1/20 the size of the original f32 matrix.
 pub fn quantize_pack_2d(w: &Tensor) -> anyhow::Result<(Vec<u8>, f32, usize, usize)> {
     let (rows, cols) = w.dims2()?;
     let (tern, scale) = quantize_ternary(w)?;
@@ -83,16 +84,22 @@ pub fn dequantize(
     Ok((result.to_dtype(DType::F32)? * factor)?)
 }
 
-/// Pack two ternary values into one byte.
-/// Maps: -1→0, 0→1, +1→2; packs two into a byte: high=val[2i], low=val[2i+1]
+/// Pack ternary values into bytes, FIVE per byte using base-3 (3^5 = 243 ≤ 256).
+/// Each value is encoded -1→0, 0→1, +1→2, then a group of five trits is combined
+/// low-order-first: t0 + 3·t1 + 9·t2 + 27·t3 + 81·t4. This is ~1.6 bits/weight —
+/// 2.5× denser than the old 4-bit nibble packing.
 pub fn pack_ternary(weights: &[i8]) -> Vec<u8> {
-    let mut packed = Vec::with_capacity(weights.len().div_ceil(2));
-    let mut i = 0;
-    while i < weights.len() {
-        let hi = encode_ternary(weights[i]);
-        let lo = if i + 1 < weights.len() { encode_ternary(weights[i + 1]) } else { 1 };
-        packed.push((hi << 4) | lo);
-        i += 2;
+    let mut packed = Vec::with_capacity(weights.len().div_ceil(5));
+    for chunk in weights.chunks(5) {
+        let mut byte: u16 = 0;
+        let mut mult: u16 = 1;
+        for &w in chunk {
+            byte += encode_ternary(w) as u16 * mult;
+            mult *= 3;
+        }
+        // A short final chunk leaves the high-order trits at 0 (which decode to
+        // -1), but those sit beyond `count` on unpack and are truncated away.
+        packed.push(byte as u8);
     }
     packed
 }
@@ -100,9 +107,9 @@ pub fn pack_ternary(weights: &[i8]) -> Vec<u8> {
 fn encode_ternary(v: i8) -> u8 {
     match v {
         -1 => 0,
-        0  => 1,
-        1  => 2,
-        _  => 1,
+        0 => 1,
+        1 => 2,
+        _ => 1,
     }
 }
 
@@ -115,15 +122,18 @@ fn decode_ternary(v: u8) -> i8 {
     }
 }
 
-/// Unpack from packed ternary bytes back to i8 slice.
+/// Unpack base-3-packed ternary bytes (five trits/byte, low-order first) back to
+/// an i8 slice, truncated to `count`. Inverse of [`pack_ternary`].
 pub fn unpack_ternary(packed: &[u8], count: usize) -> Vec<i8> {
     let mut out = Vec::with_capacity(count);
     for &byte in packed {
-        if out.len() < count {
-            out.push(decode_ternary((byte >> 4) & 0x0F));
-        }
-        if out.len() < count {
-            out.push(decode_ternary(byte & 0x0F));
+        let mut v = byte as u16;
+        for _ in 0..5 {
+            if out.len() >= count {
+                return out;
+            }
+            out.push(decode_ternary((v % 3) as u8));
+            v /= 3;
         }
     }
     out
@@ -137,9 +147,17 @@ mod tests {
     fn pack_unpack_roundtrip_even_and_odd() {
         let even = [-1i8, 0, 1, 1, 0, -1];
         assert_eq!(unpack_ternary(&pack_ternary(&even), even.len()), even);
-        // Odd length: the dangling nibble is padded but `count` truncates it.
+        // Length not a multiple of 5: the dangling trits are padded but `count`
+        // truncates them.
         let odd = [1i8, -1, 0];
         assert_eq!(unpack_ternary(&pack_ternary(&odd), odd.len()), odd);
+        // Longer sequence spanning several base-3 bytes, length not a multiple of 5.
+        let long = [1i8, -1, 0, 1, 1, -1, 0, 0, 1, -1, 1, 0, -1];
+        assert_eq!(long.len(), 13);
+        assert_eq!(unpack_ternary(&pack_ternary(&long), long.len()), long);
+        // Density: five trits fit in exactly one byte (3^5 = 243 ≤ 256).
+        assert_eq!(pack_ternary(&[1i8, 1, 1, 1, 1]).len(), 1);
+        assert_eq!(pack_ternary(&[1i8, 1, 1, 1, 1, -1]).len(), 2);
     }
 
     #[test]

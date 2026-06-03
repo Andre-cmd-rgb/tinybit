@@ -142,8 +142,8 @@ impl TinyBit {
 
         if is_quantized {
             // Quantized export: rebuild full-precision tensors in memory and run
-            // the normal f32 path. The win is on-disk size (~16x smaller for the
-            // quantized matrices); a true ternary-matmul runtime is future work.
+            // the normal f32 path. The win is on-disk size (~20x smaller for the
+            // packed ternary matrices); a true ternary-matmul runtime is future work.
             let tensors = load_quantized_tensors(path, device)?;
             let vb = candle_nn::VarBuilder::from_tensors(tensors, DType::F32, device);
             return Self::new(config, vb);

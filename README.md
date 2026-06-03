@@ -180,14 +180,22 @@ $env:DATA_TOKENS = "1500000000"; $env:TRAIN_CONFIG = "configs/train-micro-l4.tom
 # Re-save as safetensors (identity copy)
 tinybit convert --input ckpt.safetensors --output model.safetensors
 
-# Pack 2D weight matrices to ternary (smaller on disk; ~2 weights/byte)
+# Pack 2D weight matrices to ternary (smaller on disk; ~5 weights/byte, base-3)
 tinybit convert --input ckpt.safetensors --output model.q.safetensors --quantize
 ```
 
-The quantized export shrinks the on-disk file substantially. Loading it
-currently **dequantizes back to f32** and runs the normal path — a true
-ternary-matmul runtime is future work, so the quantized file is a storage/format
-win, not yet an inference-speed win. GGUF export is stubbed (not implemented).
+`--quantize` packs every 2D weight matrix to ternary {−1, 0, +1} at ~1.6
+bits/weight (five values per byte, base-3); the tied embedding/LM-head stays f32.
+On the 50M `micro` checkpoint that is **~3.2× smaller on disk** (the f32 embedding
+is the floor). Loading **dequantizes back to f32** and runs the normal path — a
+true ternary-matmul runtime is future work, so it's a storage/format win, not an
+inference-speed win.
+
+**Caveat — this is *post-training* quantization.** For an f32-trained model (e.g.
+`micro`, `ternary_ffn = false`) ternarizing the weights is **lossy**: measured
+perplexity rises ~83 → ~590 on the micro checkpoint. Near-lossless ternary needs
+quantization-aware training — the `bit`/`qbit` configs with `ternary_ffn = true`,
+trained from scratch so the STE learns ternary-friendly weights.
 
 ---
 
@@ -242,7 +250,9 @@ Gate tests (must pass before any real run):
   loop is complete and tested; a base-pretrained model still emits tool calls
   only loosely.
 - **Quantized export is a disk-size win, not yet a speed win** (loads as f32).
-- **GGUF export is not implemented.**
+- **No GGUF / llama.cpp export.** tinybit's custom RWKV-7 + BitLinear architecture
+  isn't a llama.cpp architecture, so a GGUF file couldn't be loaded there — the
+  stub was removed rather than left as a dead option.
 - **Muon optimizer is experimental** — mechanically correct, quality-at-scale
   unverified. AdamW is the validated default.
 

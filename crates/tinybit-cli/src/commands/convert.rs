@@ -1,63 +1,54 @@
-use clap::{Args, ValueEnum};
+use clap::Args;
 use std::collections::HashMap;
 use candle_core::{Device, Tensor};
 use tinybit_core::quantize::{quantize_pack_2d, QUANT_MARKER};
 
 #[derive(Args)]
 pub struct ConvertArgs {
+    /// Input checkpoint (safetensors).
     #[arg(long)]
     pub input: std::path::PathBuf,
 
-    #[arg(long, value_enum, default_value = "safetensors")]
-    pub format: ExportFormat,
-
+    /// Output path (safetensors).
     #[arg(long)]
     pub output: std::path::PathBuf,
 
-    /// Quantize 2D weight matrices to packed ternary before export.
+    /// Quantize 2D weight matrices to packed ternary before export. Much smaller
+    /// on disk; the file loads back as f32 and runs the normal path, so it is a
+    /// storage/format win, not (yet) an inference-speed win.
     #[arg(long)]
     pub quantize: bool,
 }
 
-#[derive(ValueEnum, Clone)]
-pub enum ExportFormat {
-    Safetensors,
-    /// GGUF format for llama.cpp compatibility
-    Gguf,
-}
-
 pub fn run(args: ConvertArgs) -> anyhow::Result<()> {
     let device = Device::Cpu;
+    anyhow::ensure!(args.input.exists(), "input not found: {}", args.input.display());
 
-    match args.format {
-        ExportFormat::Safetensors => {
-            let raw = candle_core::safetensors::load(&args.input, &device)?;
-            let out = if args.quantize {
-                build_quantized(&raw, &device)?
-            } else {
-                raw
-            };
-            candle_core::safetensors::save(&out, &args.output)?;
+    let raw = candle_core::safetensors::load(&args.input, &device)?;
+    let out = if args.quantize {
+        build_quantized(&raw, &device)?
+    } else {
+        raw
+    };
+    candle_core::safetensors::save(&out, &args.output)?;
 
-            let in_sz = std::fs::metadata(&args.input)?.len();
-            let out_sz = std::fs::metadata(&args.output)?.len();
-            println!(
-                "wrote {} — {:.1} MiB (input {:.1} MiB, {:.2}x smaller)",
-                args.output.display(),
-                mib(out_sz),
-                mib(in_sz),
-                in_sz as f64 / out_sz.max(1) as f64,
-            );
-        }
-        ExportFormat::Gguf => anyhow::bail!("GGUF export not yet implemented"),
-    }
+    let in_sz = std::fs::metadata(&args.input)?.len();
+    let out_sz = std::fs::metadata(&args.output)?.len();
+    println!(
+        "wrote {} — {:.1} MiB (input {:.1} MiB, {:.2}x smaller)",
+        args.output.display(),
+        mib(out_sz),
+        mib(in_sz),
+        in_sz as f64 / out_sz.max(1) as f64,
+    );
     Ok(())
 }
 
 /// Quantize every 2D weight matrix (except the full-precision tied embedding /
 /// LM-head table) to packed ternary, leaving norms, biases, and the embedding
-/// untouched. Emits `<name>.qweight` (packed u8) plus `<name>.qscale/.qrows/
-/// .qcols` sidecars and a marker tensor so `TinyBit::load` can rebuild it.
+/// untouched. Emits `<name>.qweight` (packed ternary, 5 weights/byte) plus
+/// `<name>.qscale/.qrows/.qcols` sidecars and a marker tensor so `TinyBit::load`
+/// can rebuild it.
 fn build_quantized(
     raw: &HashMap<String, Tensor>,
     device: &Device,
@@ -82,7 +73,7 @@ fn build_quantized(
     }
     out.insert(QUANT_MARKER.to_string(), Tensor::from_vec(vec![1i64], (1,), device)?);
 
-    println!("quantized {quantized} matrices to packed ternary (2 weights/byte)");
+    println!("quantized {quantized} matrices to packed ternary (5 weights/byte, ~20x smaller than f32; embedding kept f32)");
     Ok(out)
 }
 
