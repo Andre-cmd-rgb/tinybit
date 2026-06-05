@@ -4,23 +4,38 @@ use candle_core::{DType, Tensor};
 use std::time::Instant;
 use tinybit_core::state::InferenceState;
 use tinybit_core::tokenizer::STOP_STRING_USER_TURN;
-use tinybit_tools::parser::{format_tool_result, parse_tool_call};
+use tinybit_tools::parser::{
+    format_tool_result, parse_tool_call, strip_tool_markers, ToolCall, CALL_END,
+};
+use tinybit_tools::ToolOutput;
 
 const MAX_TOOL_ROUNDS: usize = 8;
 
 /// Given the visible text decoded so far and how many chars were already
 /// streamed, return the next chunk safe to emit and the new emitted count.
-/// `holdback` trailing chars are withheld so a partial stop string (`\nuser:`)
-/// is never streamed before we get a chance to detect and truncate it; pass
+/// `strip_tool_markers` removes the tool protocol — a started tool call (and
+/// everything after it, rendered separately by `render_tool_use`) plus any
+/// malformed marker the model echoes — so `emitted` is counted against that
+/// cleaned, monotonic stream. The last `holdback` chars are withheld so a
+/// partial stop string (`\nuser:`) isn't streamed before we detect it; pass
 /// `holdback = 0` to flush the remainder once the text is final.
 fn next_chunk(visible: &str, emitted: usize, holdback: usize) -> (String, usize) {
-    let chars: Vec<char> = visible.chars().collect();
+    let cleaned = strip_tool_markers(visible);
+    let chars: Vec<char> = cleaned.chars().collect();
     let safe = chars.len().saturating_sub(holdback);
     if safe > emitted {
         (chars[emitted..safe].iter().collect(), safe)
     } else {
         (String::new(), emitted)
     }
+}
+
+/// Human-facing rendering of an executed tool call (also what lands in the saved
+/// transcript). The raw `<|tool_call|>…<|tool_result|>…` protocol is internal and
+/// never shown; this is the clean affordance, e.g. `[calculator {"expr":"1+2"} -> 3]`.
+fn render_tool_use(call: &ToolCall, output: &ToolOutput) -> String {
+    let status = if output.is_error { "error: " } else { "" };
+    format!(" [{} {} -> {}{}] ", call.tool, call.args, status, output.content.trim())
 }
 
 pub struct ToolProcessor<'a> {
@@ -48,6 +63,9 @@ impl<'a> ToolProcessor<'a> {
         // back the length of the stop string so a partial `\nuser:` is never
         // emitted before the loop detects it and stops.
         let streaming = on_token.is_some();
+        // Withhold a partial stop string from the tail until we can detect it.
+        // (Tool markers don't need holdback — `strip_tool_markers` removes them
+        // at any length, so streaming stays low-latency.)
         let holdback = STOP_STRING_USER_TURN.chars().count();
 
         // Prefill every prompt token EXCEPT the last; the last token's forward
@@ -82,7 +100,8 @@ impl<'a> ToolProcessor<'a> {
                 stats.gen_tokens += 1;
 
                 if next_id == eng.tokenizer.eos_token_id {
-                    let text = eng.tokenizer.decode(&round_tokens, true)?;
+                    let text =
+                        strip_tool_markers(&eng.tokenizer.decode(&round_tokens, true)?).into_owned();
                     let trimmed = text.trim_end();
                     if streaming {
                         let (chunk, _) = next_chunk(trimmed, emitted, 0);
@@ -116,27 +135,32 @@ impl<'a> ToolProcessor<'a> {
                         eng.tokenizer.decode(&round_tokens, false).unwrap_or_default();
 
                     // Complete tool call?
-                    if partial.contains("<|end_tool_call|>") {
+                    if partial.contains(CALL_END) {
                         if let Some((call, before, _after)) = parse_tool_call(&partial) {
+                            // Flush any text that preceded the call.
                             if streaming {
                                 let (chunk, _) = next_chunk(before, emitted, 0);
                                 if let Some(cb) = on_token.as_deref_mut() {
                                     cb(&chunk);
                                 }
                             }
-                            full_output.push_str(before);
+                            full_output.push_str(&strip_tool_markers(before));
                             let result = eng.tools.execute(&call).unwrap_or_else(|e| {
-                                tinybit_tools::ToolOutput::err(e.to_string())
+                                ToolOutput::err(e.to_string())
                             });
-                            let result_str = format_tool_result(&result);
-                            full_output.push_str(&result_str);
+                            // Show only a clean rendering; the raw protocol below
+                            // is fed to the model but never displayed or saved.
+                            let rendered = render_tool_use(&call, &result);
+                            full_output.push_str(&rendered);
                             if streaming {
                                 if let Some(cb) = on_token.as_deref_mut() {
-                                    cb(&result_str);
+                                    cb(&rendered);
                                 }
                             }
-                            // Inject result tokens back into context (encode is
-                            // vocab-safe and drops any overflow ids).
+                            // Inject the marker-wrapped result back into context —
+                            // the format the model was trained on. (encode is
+                            // vocab-safe and drops any overflow ids.)
+                            let result_str = format_tool_result(&result);
                             let result_ids = eng.tokenizer.encode(&result_str, false)?;
                             for &rid in &result_ids {
                                 let tid = Tensor::from_vec(vec![rid], (1, 1), &eng.device)?
@@ -159,7 +183,8 @@ impl<'a> ToolProcessor<'a> {
             }
 
             if !round_tokens.is_empty() {
-                let mut text = eng.tokenizer.decode(&round_tokens, true)?;
+                let mut text =
+                    strip_tool_markers(&eng.tokenizer.decode(&round_tokens, true)?).into_owned();
                 if let Some(idx) = text.find(STOP_STRING_USER_TURN) {
                     text.truncate(idx);
                 }
