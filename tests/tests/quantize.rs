@@ -44,7 +44,7 @@ fn test_pack_unpack_roundtrip() {
 fn test_pack_even_count() {
     let vals: Vec<i8> = vec![1, -1, 0, 1];
     let packed = pack_ternary(&vals);
-    assert_eq!(packed.len(), 2); // 4 values → 2 bytes
+    assert_eq!(packed.len(), 1); // 4 values → 1 byte (base-3, 5 trits/byte)
     let unpacked = unpack_ternary(&packed, 4);
     assert_eq!(unpacked, vals);
 }
@@ -53,7 +53,7 @@ fn test_pack_even_count() {
 fn test_pack_odd_count() {
     let vals: Vec<i8> = vec![1, -1, 0];
     let packed = pack_ternary(&vals);
-    assert_eq!(packed.len(), 2); // 3 values → 2 bytes (last padded)
+    assert_eq!(packed.len(), 1); // 3 values → 1 byte (base-3, 5 trits/byte)
     let unpacked = unpack_ternary(&packed, 3);
     assert_eq!(unpacked, vals);
 }
