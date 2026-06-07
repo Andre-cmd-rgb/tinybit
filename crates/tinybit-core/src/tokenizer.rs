@@ -69,11 +69,13 @@ impl Profile {
     }
 }
 
-/// Tool-call markers. These are *only* installed as actual special tokens when
-/// the model's vocabulary has room for them (vocab_size > base LLaMA vocab).
-/// When that's not the case, the same markers can still be emitted/parsed as
-/// plain text — they just tokenize to several normal tokens each, which is fine
-/// because `parse_tool_call` matches on decoded text.
+/// Tool-call markers. tinybit treats these as ordinary text: data prep
+/// tokenizes them as BPE pieces and the model learns that multi-token spelling,
+/// so `parse_tool_call` matches on the DECODED text and works regardless of how
+/// many tokens a marker spans. They are NOT added to the inference vocabulary
+/// (adding them would mint single token ids whose embeddings the model never
+/// trained — see `resolve_marker`). The `tool_*_id` fields below are populated
+/// only if a tokenizer.json already defines a marker as a real token.
 pub const TOOL_CALL_START_STR:   &str = "<|tool_call|>";
 pub const TOOL_CALL_END_STR:     &str = "<|end_tool_call|>";
 pub const TOOL_RESULT_START_STR: &str = "<|tool_result|>";
@@ -90,8 +92,10 @@ pub struct Tokenizer {
     pub bos_token_id: u32,
     pub eos_token_id: u32,
     pub pad_token_id: u32,
-    /// Tool-call markers as token ids — `Some(id)` only when the marker was
-    /// installable as a single special token *and* fits below vocab_size.
+    /// Tool-call markers as token ids — `Some(id)` only when the tokenizer file
+    /// already defines the marker as a single token below vocab_size (the
+    /// shipped LLaMA tokenizer does not, so these are all `None`). See
+    /// `resolve_marker` for why we never mint them ourselves.
     pub tool_call_start_id:   Option<u32>,
     pub tool_call_end_id:     Option<u32>,
     pub tool_result_start_id: Option<u32>,
@@ -99,34 +103,37 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
-    fn try_add_special(
-        tok: &mut tokenizers::Tokenizer,
+    /// Resolve a tool marker to a single token id — but ONLY if the tokenizer
+    /// file already defines it as a real token below `max_id_exclusive`. We must
+    /// NOT *add* it: data prep (`scripts/prepare_data.py`) tokenizes the markers
+    /// as ordinary BPE pieces, so the model is trained on that multi-token
+    /// spelling and the embedding rows for any freshly-added special id are
+    /// untrained noise. (The shipped LLaMA tokenizer has no marker tokens, so
+    /// this returns None for all four and encode/decode use the trained BPE
+    /// spelling.) A future checkpoint whose tokenizer.json *defines* the markers
+    /// — and whose embedding was trained on them — picks up the single-token
+    /// fast path automatically. See the regression note below.
+    fn resolve_marker(
+        tok: &tokenizers::Tokenizer,
         text: &str,
         max_id_exclusive: u32,
     ) -> Option<u32> {
-        if let Some(id) = tok.token_to_id(text) {
-            return if id < max_id_exclusive { Some(id) } else { None };
-        }
-        let _added = tok.add_special_tokens(&[tokenizers::AddedToken::from(
-            text.to_string(),
-            true,
-        )]);
         match tok.token_to_id(text) {
             Some(id) if id < max_id_exclusive => Some(id),
             _ => None,
         }
     }
 
-    fn build(mut inner: tokenizers::Tokenizer, vocab_size: usize) -> anyhow::Result<Self> {
+    fn build(inner: tokenizers::Tokenizer, vocab_size: usize) -> anyhow::Result<Self> {
         let max_id = vocab_size as u32;
         let bos = inner.token_to_id("<s>").unwrap_or(1);
         let eos = inner.token_to_id("</s>").unwrap_or(2);
         let pad = inner.token_to_id("<pad>").unwrap_or(0);
 
-        let tool_call_start   = Self::try_add_special(&mut inner, TOOL_CALL_START_STR,   max_id);
-        let tool_call_end     = Self::try_add_special(&mut inner, TOOL_CALL_END_STR,     max_id);
-        let tool_result_start = Self::try_add_special(&mut inner, TOOL_RESULT_START_STR, max_id);
-        let tool_result_end   = Self::try_add_special(&mut inner, TOOL_RESULT_END_STR,   max_id);
+        let tool_call_start   = Self::resolve_marker(&inner, TOOL_CALL_START_STR,   max_id);
+        let tool_call_end     = Self::resolve_marker(&inner, TOOL_CALL_END_STR,     max_id);
+        let tool_result_start = Self::resolve_marker(&inner, TOOL_RESULT_START_STR, max_id);
+        let tool_result_end   = Self::resolve_marker(&inner, TOOL_RESULT_END_STR,   max_id);
 
         Ok(Self {
             inner,

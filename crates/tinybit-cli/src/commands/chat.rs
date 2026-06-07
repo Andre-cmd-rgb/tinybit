@@ -39,9 +39,19 @@ pub struct ChatArgs {
     #[arg(long)]
     pub profile: Option<String>,
 
-    /// Sampling temperature (0.0 = greedy/deterministic).
-    #[arg(long, default_value_t = 0.7)]
+    /// Sampling temperature (0.0 = greedy/deterministic). Kept low by default:
+    /// at tinybit's size a hot temperature samples into low-probability tails
+    /// and derails (incoherent text, spurious tool calls). 0.3–0.4 stays
+    /// coherent; raise toward 0.7 only if you want more variety.
+    #[arg(long, default_value_t = 0.4)]
     pub temperature: f64,
+
+    /// When the model may call a built-in tool: `auto` (only when the message
+    /// looks like it needs one — the default; stops the tiny model firing tools
+    /// on greetings), `always` (let the raw model decide — it over-fires), or
+    /// `never` (pure conversation, no tools).
+    #[arg(long, default_value = "auto")]
+    pub tools: String,
 }
 
 pub fn run(args: ChatArgs) -> anyhow::Result<()> {
@@ -67,6 +77,8 @@ pub fn run(args: ChatArgs) -> anyhow::Result<()> {
         );
     }
 
+    let tool_mode = tinybit_infer::processor::ToolMode::parse(&args.tools)?;
+
     let device = InferenceEngine::auto_device();
     let mut engine = InferenceEngine::new(
         &args.model,
@@ -89,6 +101,7 @@ pub fn run(args: ChatArgs) -> anyhow::Result<()> {
     }
 
     print_banner(&engine, &device, profile);
+    println!("tools: {} (change with --tools auto|always|never)", args.tools.to_ascii_lowercase());
 
     let stdin = io::stdin();
     loop {
@@ -137,7 +150,7 @@ pub fn run(args: ChatArgs) -> anyhow::Result<()> {
             print!("{chunk}");
             let _ = io::stdout().flush();
         };
-        let (_response, stats) = engine.chat_turn(input, &mut session, Some(&mut sink))?;
+        let (_response, stats) = engine.chat_turn(input, &mut session, tool_mode, Some(&mut sink))?;
         println!(); // end the streamed line
         print_stats(&stats, &device);
     }

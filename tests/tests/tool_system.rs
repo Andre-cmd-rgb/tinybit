@@ -4,6 +4,7 @@ use tinybit_tools::{
     },
     parse_tool_call,
     tool::Tool,
+    ToolRegistry,
 };
 
 #[test]
@@ -76,6 +77,29 @@ fn test_time_tool_returns_date() {
     let result = tool.execute("{}").unwrap();
     assert!(!result.content.is_empty());
     assert!(result.content.contains("202"), "should contain year 202x: {}", result.content);
+}
+
+/// End-to-end: a model-style `<|tool_call|>` for the lookup tool must parse,
+/// route through the full registry (proving lookup is registered in
+/// `with_builtins`), execute, and return the correct fact. This is the path the
+/// inference loop drives once the model is trained to emit lookup calls.
+#[test]
+fn test_lookup_through_registry() {
+    let reg = ToolRegistry::with_builtins(&tempdir()).unwrap();
+
+    let text = r#"<|tool_call|>{"tool":"lookup","args":{"query":"what is the capital of italy?"}}<|end_tool_call|>"#;
+    let (call, _before, _after) = parse_tool_call(text).expect("should parse a lookup call");
+    assert_eq!(call.tool, "lookup");
+
+    let out = reg.execute(&call).unwrap();
+    assert!(!out.is_error);
+    assert!(out.content.contains("Rome"), "lookup returned: {}", out.content);
+
+    // A fact not in the KB must come back as a clear "not found", never a bluff.
+    let miss = r#"<|tool_call|>{"tool":"lookup","args":{"query":"who won the 2031 lunar marathon"}}<|end_tool_call|>"#;
+    let (call, _, _) = parse_tool_call(miss).unwrap();
+    let out = reg.execute(&call).unwrap();
+    assert!(out.content.starts_with("No local entry"), "got: {}", out.content);
 }
 
 fn tempdir() -> std::path::PathBuf {

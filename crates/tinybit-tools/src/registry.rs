@@ -1,6 +1,6 @@
 use crate::builtin::{
-    calc_tool::CalcTool, calendar_tool::CalendarTool, notes_tool::NotesTool,
-    time_tool::TimeTool, todos_tool::TodosTool,
+    calc_tool::CalcTool, calendar_tool::CalendarTool, lookup_tool::LookupTool,
+    notes_tool::NotesTool, time_tool::TimeTool, todos_tool::TodosTool,
 };
 use crate::parser::ToolCall;
 use crate::tool::{Tool, ToolOutput};
@@ -56,6 +56,7 @@ impl ToolRegistry {
         let mut reg = Self::new();
         reg.register(Box::new(TimeTool));
         reg.register(Box::new(CalcTool));
+        reg.register(Box::new(LookupTool::new(data_dir)?));
         reg.register(Box::new(TodosTool::new(data_dir)?));
         reg.register(Box::new(NotesTool::new(data_dir)?));
         reg.register(Box::new(CalendarTool::new(data_dir)?));

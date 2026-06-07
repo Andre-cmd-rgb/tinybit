@@ -5,6 +5,65 @@ All notable changes to tinybit are documented here.
 ## [Unreleased]
 
 ### Added
+- **`lookup` tool — local fact retrieval (RAG-lite for a tiny model).** A 50M model
+  can't reliably *store* facts, so it can learn to *fetch* them. `lookup` answers
+  factual questions (capitals, geography, space, science, definitions) from a local,
+  editable knowledge base — `crates/tinybit-tools/data/knowledge.json` (bundled) plus
+  an optional `data/knowledge.json` you can extend. Matching is IDF-weighted token
+  overlap with light prefix-stemming, so a generic shared word ("capital") can't
+  wrong-match (france≠italy) and misses return a clear "No local entry" instead of a
+  bluff. Registered in `with_builtins`; armed by the tool gate for factual (non-self)
+  questions; taught by `datasets/chat-lookup-05.jsonl`. Goes live after a retrain (the
+  current weights were never trained to emit it).
+- **Tool gate for `tinybit chat` (`--tools auto|always|never`, default `auto`).**
+  The current weights over-fire tools (they fired `todos` on "hi" — a data-balance
+  artifact baked into training). `auto` suppresses tool emission unless the user's
+  message plausibly needs one (`processor::message_needs_tools`) by banning the
+  token that begins `<|tool_call|>` at sampling time; `always` is the raw model;
+  `never` is pure conversation. A stopgap until a retrain on the rebalanced data
+  fixes emission at the source. `eval` uses `always` (raw quality gate).
+
+### Fixed
+- **Tool-result injection no longer derails generation (train/inference tokenizer
+  mismatch).** Data prep tokenizes the `<|tool_*|>` markers as ordinary BPE
+  pieces, but the inference tokenizer was calling `add_special_tokens` to mint
+  single ids (32000-32003) whose embedding rows the model never trained. So every
+  injected `<|tool_result|>…<|end_tool_result|>` fed the model untrained
+  embeddings, tipping it into HTML/code garbage right after any tool call.
+  `Tokenizer` now resolves a marker to a single id ONLY if the tokenizer file
+  already defines one (`resolve_marker`), matching training. Visible effect:
+  `1+324` → `[calculator … -> 64] 64.` instead of a wall of `</time><ul>…`.
+- **Tool-call detection scans every token.** `ToolProcessor` checked for
+  `<|end_tool_call|>` only every 4 tokens, so 1-3 of the model's own post-call
+  tokens were stepped into the recurrent state before the real result was
+  injected. It now detects per token (the streaming path already decodes per
+  token, so no added cost).
+
+### Changed
+- **Chat default temperature lowered 0.7 → 0.4.** At tinybit's size a hot
+  temperature samples into low-probability tails and derails (incoherent text,
+  spurious tool calls); 0.3-0.4 stays coherent. Affects `tinybit chat` and the
+  `SamplingParams` default.
+- **General data mix retuned to language-first (no code).** Goal: the best small
+  *assistant* — English fluency, comprehension, summarising, and instruction
+  following — with facts delegated to the `lookup` tool instead of memorised.
+  Removed the-stack (Python code) entirely; bumped OpenHermes (0.15→0.20) and
+  dolphin (0.07→0.08) for instruction/summarising/Q&A; bumped TinyStories
+  (0.12→0.15) for clean simple English; trimmed Cosmopedia (0.30→0.25, still the
+  reasoning/English source but not optimised for fact recall); FineWeb-Edu stays
+  the backbone (0.33→0.32). Added `datasets/chat-summary-06.jsonl` (41
+  summarise/explain/paraphrase examples) to reinforce the headline skill. Takes
+  effect on the next re-train.
+- **Curated chat data rebalanced to stop tool over-firing.** The
+  `identity-tools-*` set is ~54% tool calls and the first definitive run repeated
+  it at `CUSTOM_CHAT_EPOCHS=50`, teaching the model that a tool call is the
+  default reply (it fired tools on greetings and plain questions). Added
+  `datasets/chat-notools-04.jsonl` (90 no-tool examples), rewrote
+  `prompts/tinybit-identity-tools-dataset.md` to generate ~15% tools (was ~45%)
+  with a new "tool-shaped but answer directly" category, and lowered the
+  recommended `CUSTOM_CHAT_EPOCHS` to ~8. Takes effect on the next re-train.
+
+### Added
 - **Full Windows support for the helper scripts.** Every user-facing `scripts/*.sh`
   now has a PowerShell sibling (`prepare_data.ps1`, `eval.ps1`, `preflight.ps1`,
   and `gcp_{launch,status,tail_logs,sync_now,stop_vm,delete_vm}.ps1`) so the

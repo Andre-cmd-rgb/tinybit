@@ -8,7 +8,14 @@
 #   improving well past Chinchilla; cf. SmolLM). Scaled to fit a hard <€100
 #   on-demand-L4 budget (~6.5 s/step → ~5.3 days → ~€85 STANDARD). A 5B-token run
 #   would be ~148k steps / ~11 days / ~€185 — over budget — so it was scaled down.
-#   Pair with DATA_TOKENS=2400000000 and CUSTOM_CHAT_EPOCHS=50 (identity/tool data).
+#   Pair with DATA_TOKENS=2400000000 and CUSTOM_CHAT_EPOCHS=8 (identity/tool data).
+#   NOTE (2026-06-07): the first definitive run used CUSTOM_CHAT_EPOCHS=50. That
+#   repeated the narrow ~1.3k-example custom set 50× and burned tool-calling in as
+#   a reflex — the model fired tools on almost any prompt (incl. greetings) with
+#   garbage args. Keep this LOW (≈8–10): the base mix already carries ~22% diverse
+#   no-tool instruction data (OpenHermes/dolphin) that is NOT repeated, so the
+#   custom set only needs a few passes to teach identity + the tool protocol.
+#   Also keep the custom set's tool/no-tool ratio balanced — see datasets/README.md.
 #
 # Throughput tuning (2026-05-28): bf16 mixed precision + a larger microbatch.
 # The fused WKV kernel launches one block per (batch, head); at batch 6 that is

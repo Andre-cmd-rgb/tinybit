@@ -27,15 +27,45 @@ cargo test --workspace
 
 4. Tool calls use the marker protocol <|tool_call|>JSON<|end_tool_call|>, NOT a
    separate classifier. `parse_tool_call` (tools/parser.rs) detects them in the
-   DECODED text, so they work whether or not the markers are single special
-   tokens. The detect→execute→inject→continue loop (infer/processor.rs) is
-   complete and tested, but the base-pretraining data contains no tool-call
-   demonstrations, so reliable EMISSION needs instruction/tool fine-tuning —
-   treat tool calling as experimental and document it as such.
+   DECODED text, so they work regardless of how many tokens a marker spans. The
+   detect→execute→inject→continue loop (infer/processor.rs) scans for the
+   markers EVERY token (not every Nth): the markers are multi-token BPE here, so
+   a periodic scan detected `<|end_tool_call|>` up to N-1 tokens late and
+   forward-stepped the model's own half-written `<|tool_result|>` into the
+   recurrent state before the real result was injected — corrupting state and
+   tipping the model into post-call garbage. The base-pretraining data contains
+   no tool-call demonstrations, so reliable EMISSION needs instruction/tool
+   fine-tuning — treat tool calling as experimental. NOTE: even with the
+   custom chat data, tool EMISSION over-fires unless the data is balanced and
+   `CUSTOM_CHAT_EPOCHS` is low (see datasets/README.md / decision 17). As an
+   inference-side stopgap, `chat` has a TOOL GATE (`--tools auto|always|never`,
+   default auto): `ToolMode`/`message_needs_tools` (processor.rs) decide per turn
+   whether a tool is plausibly needed, and if not the sampler bans the token(s)
+   that begin `<|tool_call|>` (`InferenceEngine::tool_start_ban`) so the model
+   can't emit one. The ban set must include BOTH the bare `<` and space-prefixed
+   `▁<` ids — SentencePiece encodes `<` differently by preceding char and the
+   model emits the bare form after `assistant:\n`. `eval` runs `always` (raw).
+   Built-in tools (tinybit-tools/src/builtin/): time, calculator, lookup, todos,
+   notes, calendar. `lookup` is local fact retrieval over a knowledge base
+   (`tinybit-tools/data/knowledge.json` bundled via include_str! + an optional
+   `data/knowledge.json` user extension) with IDF-weighted token matching — the
+   tiny-model answer to factual recall (fetch, don't memorize). The gate arms it
+   for factual non-self questions. It only becomes useful after a retrain that
+   includes `datasets/chat-lookup-05.jsonl`; the base + current micro checkpoint
+   never saw lookup, so they don't emit it.
 
-5. Tokenizer is LLaMA format (32k vocab + 8 reserved slots = 32008). Four of the
-   reserved slots are the <|tool_*|> markers the tokenizer installs when vocab
-   has room; the rest are spare. IDs are deterministic — do not change.
+5. Tokenizer is LLaMA format: 32000 BPE tokens; the model embedding is 32008 rows
+   (8 spare slots). The <|tool_*|> markers are NOT installed as special tokens —
+   data prep (prepare_data.py) tokenizes them as ordinary BPE pieces, so the
+   model trains on that multi-token spelling. Inference MUST match: `resolve_marker`
+   (core/tokenizer.rs) only treats a marker as a single id if the tokenizer file
+   ALREADY defines one (the shipped LLaMA tokenizer does not, so `tool_*_id` are
+   all None and `supports_tool_tokens()` is false). Do NOT call `add_special_tokens`
+   to mint them — minting ids 32000-32003 feeds the model UNTRAINED embedding rows
+   when a tool result is encoded back into context, which derailed generation (the
+   2026-06-07 fix). The 8 spare embedding rows are currently untrained. A future
+   checkpoint that trains marker tokens (data prep would have to add them too)
+   picks up the single-token fast path automatically. IDs are deterministic.
 
 6. All configs are in configs/*.toml. No magic numbers in model code.
    Everything reads from ModelConfig.

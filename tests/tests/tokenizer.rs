@@ -30,23 +30,29 @@ fn test_encode_decode_roundtrip() {
     assert!(decoded.contains("Hello"), "decoded: {decoded}");
 }
 
-/// With a generous vocab (default), tool-call special tokens *should* be
-/// installable and distinct. (This is the "new training" scenario.)
+/// The shipped LLaMA tokenizer does NOT define the `<|tool_*|>` markers, and we
+/// deliberately do not mint them: data prep trains the model on the markers'
+/// ordinary BPE spelling, so minting single token ids here would inject
+/// untrained embeddings when a tool result is encoded back into context. The
+/// contract is therefore: `supports_tool_tokens()` is false, but the markers
+/// still round-trip through encode/decode as text (that is how `parse_tool_call`
+/// finds them) and never produce an out-of-range id.
 #[test]
-fn test_tool_tokens_when_vocab_has_room() {
+fn test_tool_markers_round_trip_as_plain_text() {
     let Some(tok) = load_tokenizer() else { return };
-    assert!(tok.supports_tool_tokens(), "tool tokens should fit when vocab_size is unconstrained");
-    let ids = [
-        tok.tool_call_start_id.unwrap(),
-        tok.tool_call_end_id.unwrap(),
-        tok.tool_result_start_id.unwrap(),
-        tok.tool_result_end_id.unwrap(),
-    ];
-    let unique: std::collections::HashSet<u32> = ids.iter().cloned().collect();
-    assert_eq!(unique.len(), ids.len(), "tool token ids are not unique: {ids:?}");
+    assert!(
+        !tok.supports_tool_tokens(),
+        "shipped tokenizer must not mint tool tokens — the model trains on the BPE spelling"
+    );
+    let marker = "<|tool_call|>{\"tool\":\"x\"}<|end_tool_call|>";
+    let ids = tok.encode(marker, false).unwrap();
+    assert!(!ids.is_empty());
     for &id in &ids {
-        assert!((id as usize) < tok.vocab_size(), "tool token id {id} exceeds vocab {}", tok.vocab_size());
+        assert!((id as usize) < tok.vocab_size(), "marker token id {id} exceeds vocab {}", tok.vocab_size());
     }
+    let decoded = tok.decode(&ids, false).unwrap();
+    assert!(decoded.contains("<|tool_call|>"),     "marker did not round-trip: {decoded}");
+    assert!(decoded.contains("<|end_tool_call|>"), "marker did not round-trip: {decoded}");
 }
 
 /// With a tight vocab cap (e.g. an older checkpoint trained on 32000 vocab),

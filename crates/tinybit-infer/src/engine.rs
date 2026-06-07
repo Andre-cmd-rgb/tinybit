@@ -10,6 +10,10 @@ pub struct InferenceEngine {
     pub tools:     ToolRegistry,
     pub device:    Device,
     pub params:    SamplingParams,
+    /// Token id(s) that begin a `<|tool_call|>` marker. The tool gate bans these
+    /// at sampling time to stop the model emitting a tool call on a turn that
+    /// doesn't warrant one. Precomputed from the tokenizer once at load.
+    pub tool_start_ban: Vec<u32>,
 }
 
 /// Timing and token counts for a single generation, surfaced to the CLI.
@@ -56,7 +60,28 @@ impl InferenceEngine {
         let model = TinyBit::load(model_path, config, &device)?;
         let tokenizer = Tokenizer::from_file_with_vocab(tokenizer_path, model.config.vocab_size)?;
         let tools = ToolRegistry::with_builtins(data_dir)?;
-        Ok(Self { model, tokenizer, tools, device, params: SamplingParams::default() })
+        // The `<|tool_call|>` marker is BPE text starting with `<`; banning that
+        // leading token blocks the whole marker (see processor::ToolMode). But
+        // SentencePiece encodes `<` with a DIFFERENT id by context: a
+        // space-prefixed `▁<` when it follows a space (or stands alone), and a
+        // bare `<` when it follows another char — and the model emits the bare
+        // form because it starts right after `assistant:\n`. Ban both, or the
+        // gate silently misses (it did at first).
+        let call_start = tinybit_tools::parser::CALL_START;
+        let mut tool_start_ban: Vec<u32> = Vec::new();
+        if let Ok(ids) = tokenizer.encode(call_start, false) {
+            if let Some(&id) = ids.first() {
+                tool_start_ban.push(id); // ▁< (space-prefixed / standalone)
+            }
+        }
+        if let Ok(ids) = tokenizer.encode(&format!("x{call_start}"), false) {
+            if let Some(&id) = ids.get(1) {
+                tool_start_ban.push(id); // < (bare, as emitted after a newline)
+            }
+        }
+        tool_start_ban.sort_unstable();
+        tool_start_ban.dedup();
+        Ok(Self { model, tokenizer, tools, device, params: SamplingParams::default(), tool_start_ban })
     }
 
     /// Auto-detect best device: Metal on Apple Silicon, CUDA if available, else CPU.
@@ -102,7 +127,7 @@ impl InferenceEngine {
         for _ in 0..self.params.max_new_tokens {
             let tid = Tensor::from_vec(vec![prev_id], (1, 1), &self.device)?.to_dtype(DType::U32)?;
             let logits = self.model.forward_step(&tid, state)?;
-            let next_id = sample(&logits, &self.params, &history)?;
+            let next_id = sample(&logits, &self.params, &history, &[])?;
 
             if next_id == self.tokenizer.eos_token_id {
                 break;
@@ -127,20 +152,29 @@ impl InferenceEngine {
         Ok(out.trim_end().to_string())
     }
 
-    /// Process a single chat turn.
+    /// Process a single chat turn. `tool_mode` gates whether the model may emit
+    /// a tool call this turn (see `ToolMode`).
     pub fn chat_turn(
         &self,
         user_message: &str,
         session: &mut Session,
+        tool_mode: crate::processor::ToolMode,
         on_token: Option<&mut dyn FnMut(&str)>,
     ) -> anyhow::Result<(String, GenStats)> {
-        use crate::processor::ToolProcessor;
+        use crate::processor::{message_needs_tools, ToolMode, ToolProcessor};
         let prompt = self.tokenizer.apply_chat_template(
             Some(&session.system_prompt),
             user_message,
         )?;
+        // Decide whether to suppress tool emission for this turn.
+        let armed = match tool_mode {
+            ToolMode::Always => true,
+            ToolMode::Never => false,
+            ToolMode::Auto => message_needs_tools(user_message),
+        };
+        let tool_ban: &[u32] = if armed { &[] } else { &self.tool_start_ban };
         let processor = ToolProcessor::new(self);
-        let (response, stats) = processor.run(&prompt, &mut session.state, on_token)?;
+        let (response, stats) = processor.run(&prompt, &mut session.state, tool_ban, on_token)?;
         session.history.push(crate::session::ChatMessage {
             role: crate::session::Role::User,
             content: user_message.to_string(),

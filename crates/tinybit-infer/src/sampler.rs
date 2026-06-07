@@ -12,7 +12,9 @@ pub struct SamplingParams {
 impl Default for SamplingParams {
     fn default() -> Self {
         Self {
-            temperature: 0.7,
+            // Low default temperature: tinybit-scale models derail when sampled
+            // hot (see ChatArgs::temperature). 0.4 stays coherent.
+            temperature: 0.4,
             top_p: 0.9,
             top_k: 0,
             max_new_tokens: 512,
@@ -22,10 +24,16 @@ impl Default for SamplingParams {
 }
 
 /// Sample the next token from logits (1, vocab_size).
+///
+/// `banned` token ids are forced to probability zero (logit −∞) before greedy
+/// or stochastic selection. The tool gate uses this to suppress the token that
+/// begins `<|tool_call|>` when a turn shouldn't call a tool (see
+/// `processor::message_needs_tools`).
 pub fn sample(
     logits: &Tensor,
     params: &SamplingParams,
     token_history: &[u32],
+    banned: &[u32],
 ) -> anyhow::Result<u32> {
     use candle_core::DType;
     let mut logits_v = logits.squeeze(0)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
@@ -41,6 +49,15 @@ pub fn sample(
                     logits_v[idx] *= params.repetition_penalty as f32;
                 }
             }
+        }
+    }
+
+    // Banned tokens (tool gate): make them unselectable. −∞ is never the greedy
+    // max and contributes 0 mass to the softmax.
+    for &id in banned {
+        let idx = id as usize;
+        if idx < logits_v.len() {
+            logits_v[idx] = f32::NEG_INFINITY;
         }
     }
 

@@ -103,13 +103,23 @@ SYS_PREFIX = "system:\n"
 USER_PREFIX = "\nuser:\n"
 ASST_PREFIX = "\nassistant:\n"
 
+# General mix, retuned 2026-06-07 for a language-first ~50M assistant:
+# English fluency + comprehension + summarising + instruction-following, NO code,
+# and facts handled by the `lookup` tool rather than memorised (a tiny model
+# can't store facts reliably — see the lookup tool / datasets/chat-lookup-05).
+#   - the-stack (Python code) REMOVED — this build is not a coding model.
+#   - OpenHermes + dolphin bumped (instruction following, summarising, Q&A,
+#     rewriting — the skills we actually want).
+#   - TinyStories bumped (clean, simple English — punches above its weight at 50M).
+#   - FineWeb-Edu stays the English backbone and the val-set head.
+#   - Cosmopedia kept but trimmed: great for coherent English/reasoning, but it's
+#     textbook-dense, and we're deliberately not optimising for fact recall.
 GENERAL_DATASETS = [
-    ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text", 0.33, False, "text"),
-    ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text", 0.30, False, "text"),
-    ("roneneldan/TinyStories", None, "train", "text", 0.12, False, "text"),
-    ("teknium/OpenHermes-2.5", None, "train", "conversations", 0.15, False, "chat"),
-    ("cognitivecomputations/dolphin-r1", "nonreasoning", "train", "messages", 0.07, False, "chat"),
-    ("bigcode/the-stack-smol", "data/python", "train", "content", 0.03, True, "text"),
+    ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text", 0.32, False, "text"),
+    ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text", 0.25, False, "text"),
+    ("roneneldan/TinyStories", None, "train", "text", 0.15, False, "text"),
+    ("teknium/OpenHermes-2.5", None, "train", "conversations", 0.20, False, "chat"),
+    ("cognitivecomputations/dolphin-r1", "nonreasoning", "train", "messages", 0.08, False, "chat"),
 ]
 
 CODING_DATASETS = [

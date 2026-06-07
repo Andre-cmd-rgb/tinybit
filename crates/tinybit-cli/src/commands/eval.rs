@@ -182,7 +182,14 @@ pub fn run(args: EvalArgs) -> anyhow::Result<()> {
         for prompt in prompts {
             let mut session = Session::new(&engine.model.config, &device)?;
             session.system_prompt = profile.default_system_prompt().to_string();
-            let (response, stats) = engine.chat_turn(prompt, &mut session, None)?;
+            // Eval is a raw-model quality gate — don't let the tool gate mask
+            // what the model actually emits.
+            let (response, stats) = engine.chat_turn(
+                prompt,
+                &mut session,
+                tinybit_infer::processor::ToolMode::Always,
+                None,
+            )?;
             let one_line: String = response.split_whitespace().collect::<Vec<_>>().join(" ");
             println!("  > {prompt}");
             println!("    {}", if one_line.is_empty() { "(empty response)" } else { &one_line });

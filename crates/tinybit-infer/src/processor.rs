@@ -11,6 +11,127 @@ use tinybit_tools::ToolOutput;
 
 const MAX_TOOL_ROUNDS: usize = 8;
 
+/// How the chat loop decides whether the model is allowed to emit a tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolMode {
+    /// Allow a tool call only when the user's message plausibly needs one
+    /// (`message_needs_tools`). This is the default: a tiny model otherwise
+    /// fires tools reflexively on greetings and chit-chat.
+    #[default]
+    Auto,
+    /// Never gate — the raw model decides (it over-fires; useful for eval/debug).
+    Always,
+    /// Never allow a tool call — pure conversation.
+    Never,
+}
+
+impl ToolMode {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(ToolMode::Auto),
+            "always" | "on" => Ok(ToolMode::Always),
+            "never" | "off" => Ok(ToolMode::Never),
+            other => anyhow::bail!("unknown tool mode '{other}' (expected: auto | always | never)"),
+        }
+    }
+}
+
+/// Cheap, deliberately conservative heuristic: does this user message plausibly
+/// call for one of the built-in tools? Biased toward `false` — over-firing is
+/// the failure mode we're guarding against, so when in doubt we suppress and let
+/// the model answer in words. Matches on the lowercased message.
+pub fn message_needs_tools(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+
+    // Greetings / acknowledgements are never tool turns, even though some start
+    // with "what's…" (which the factual-lookup rule below would otherwise arm).
+    let bare = m.trim().trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+    if [
+        "hi", "hey", "hello", "yo", "sup", "whats up", "what's up", "what up",
+        "whatsup", "hiya", "good morning", "good afternoon", "good evening",
+        "goodnight", "good night", "thanks", "thank you", "ty", "ok", "okay",
+        "cool", "nice", "lol", "bye", "goodbye",
+    ]
+    .contains(&bare)
+    {
+        return false;
+    }
+
+    let has_digit = m.bytes().any(|b| b.is_ascii_digit());
+
+    // calculator: an explicit `digit op digit` (ignoring spaces) or an `=`, or a
+    // number paired with an arithmetic word.
+    let compact: Vec<u8> = m.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let arithmetic = m.contains('=')
+        || compact.windows(3).any(|w| {
+            w[0].is_ascii_digit()
+                && matches!(w[1], b'+' | b'-' | b'*' | b'/' | b'^' | b'x')
+                && w[2].is_ascii_digit()
+        });
+    let math_word = ["calculat", "comput", "plus", "minus", "times", "multipl",
+                     "divid", "sqrt", "square root", "percent"]
+        .iter().any(|w| m.contains(w));
+    if arithmetic || (has_digit && math_word) {
+        return true;
+    }
+
+    // time / date — cover the common natural phrasings without matching
+    // incidental uses of "time" ("a long time", "do you have time").
+    if ["what time", "what day", "time is it", "current time", "the time today",
+        "time today", "time right now", "time now", "what is the time",
+        "what's the time", "whats the time", "tell me the time",
+        "today's date", "date today", "what is the date", "what's the date",
+        "whats the date", "what date"]
+        .iter().any(|w| m.contains(w)) {
+        return true;
+    }
+
+    // todos — require an action verb, not just the word "list" (so "write a
+    // to-do list …" is answered in prose, not by calling the tool).
+    let todo_word = m.contains("todo") || m.contains("to-do") || m.contains(" task");
+    let todo_action = ["add ", "remove", "delete", "complete", "mark ", "finish",
+                       "cross off", "show my", "list my", "what's on", "whats on"]
+        .iter().any(|w| m.contains(w));
+    if (todo_word && todo_action) || m.contains("remind me") {
+        return true;
+    }
+
+    // notes
+    if (m.contains("note")
+        && ["save", "take", "write", "add", "show", "find", "search", "read", "recall"]
+            .iter().any(|w| m.contains(w)))
+        || m.contains("write down") || m.contains("make a note")
+    {
+        return true;
+    }
+
+    // calendar
+    if ["calendar", "schedule", "appointment", "my events", "add event",
+        "meeting on", "remind me on"]
+        .iter().any(|w| m.contains(w)) {
+        return true;
+    }
+
+    // lookup — general factual questions ("what is the capital of france",
+    // "who invented the telephone", "how many planets"), but NOT questions about
+    // tinybit itself (those are identity, answered directly, not looked up).
+    let about_self = m.contains("you") || m.contains("your") || m.contains("tinybit");
+    let factual = [
+        "what is", "what's", "whats", "what are", "what was", "what does",
+        "who is", "who was", "who invented", "who wrote", "who discovered",
+        "who painted", "who created", "who built", "when did", "when was",
+        "where is", "where are", "how many", "how tall", "how big", "how far",
+        "how old", "how deep", "how high", "how fast", "capital of",
+        "tell me about", "define ",
+    ]
+    .iter().any(|w| m.contains(w));
+    if factual && !about_self {
+        return true;
+    }
+
+    false
+}
+
 /// Given the visible text decoded so far and how many chars were already
 /// streamed, return the next chunk safe to emit and the new emitted count.
 /// `strip_tool_markers` removes the tool protocol — a started tool call (and
@@ -48,10 +169,15 @@ impl<'a> ToolProcessor<'a> {
         Self { engine, max_rounds: MAX_TOOL_ROUNDS }
     }
 
+    /// `tool_ban` is the set of token ids the sampler must never emit this turn.
+    /// The tool gate passes the token that begins `<|tool_call|>` here (and so
+    /// blocks the whole marker) when the turn shouldn't use a tool; pass `&[]` to
+    /// let the model emit tool calls freely.
     pub fn run(
         &self,
         encoded_prompt: &[u32],
         state: &mut InferenceState,
+        tool_ban: &[u32],
         mut on_token: Option<&mut dyn FnMut(&str)>,
     ) -> anyhow::Result<(String, GenStats)> {
         let eng = self.engine;
@@ -96,7 +222,7 @@ impl<'a> ToolProcessor<'a> {
                 let tid =
                     Tensor::from_vec(vec![prev_id], (1, 1), &eng.device)?.to_dtype(DType::U32)?;
                 let logits = eng.model.forward_step(&tid, state)?;
-                let next_id = sample(&logits, &eng.params, &current_ids)?;
+                let next_id = sample(&logits, &eng.params, &current_ids, tool_ban)?;
                 stats.gen_tokens += 1;
 
                 if next_id == eng.tokenizer.eos_token_id {
@@ -129,8 +255,18 @@ impl<'a> ToolProcessor<'a> {
                     }
                 }
 
-                // Decode periodically to look for completion conditions.
-                if round_tokens.len().is_multiple_of(4) || round_tokens.len() < 8 {
+                // Check completion conditions EVERY token. tinybit's `<|tool_*|>`
+                // markers are ordinary multi-token BPE text (not single vocab
+                // ids — see tokenizer::resolve_marker), so only a per-token scan
+                // catches `<|end_tool_call|>` the instant it completes. The old
+                // every-4-tokens scan detected it up to 3 tokens late, and those
+                // 1–3 extra tokens — the model's own start of a `<|tool_result|>`
+                // — were forward_step'd into the recurrent state BEFORE we
+                // injected the real result, corrupting the state and tipping the
+                // model into post-call garbage. The streaming path already
+                // decodes every token, so this adds no cost there; the eval path
+                // generates few tokens.
+                {
                     let partial =
                         eng.tokenizer.decode(&round_tokens, false).unwrap_or_default();
 
@@ -205,5 +341,51 @@ impl<'a> ToolProcessor<'a> {
         }
         stats.decode_secs = t_decode.elapsed().as_secs_f64();
         Ok((full_output, stats))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gate_suppresses_chitchat_and_identity() {
+        for m in [
+            "hi", "hello there", "wtf bro", "df", "oh come on", "thanks",
+            "who are you?", "what can you do?", "tell me a fun fact about dogs",
+            "i have 3 cats, any tips?",
+            "write a short to-do list for moving house", // 'list' alone must NOT arm
+            "i exercise and read", "name a few hobbies",
+            "do you have time to help?", "i had a great time", // incidental "time"
+            "what's up", "whats up", "what can you do?", // identity / greeting, not lookup
+            "what is your name?", "what are you?",        // about tinybit → not lookup
+        ] {
+            assert!(!message_needs_tools(m), "should NOT arm tools: {m:?}");
+        }
+    }
+
+    #[test]
+    fn gate_allows_genuine_tool_requests() {
+        for m in [
+            "1+324", "213-134", "15*8", "what is 15 times 8?", "calculate 99/3",
+            "what time is it?", "what day is it today?",
+            "what is the time today", "what's the date?", "tell me the time",
+            "add milk to my todos", "remind me to call the dentist",
+            "save a note about the meeting", "what's on my calendar?",
+            // factual lookup
+            "what is the capital of france?", "who invented the telephone",
+            "how many planets are there", "tell me about the great wall of china",
+            "what is the largest ocean?", "what's the third planet?",
+        ] {
+            assert!(message_needs_tools(m), "SHOULD arm tools: {m:?}");
+        }
+    }
+
+    #[test]
+    fn tool_mode_parses() {
+        assert_eq!(ToolMode::parse("auto").unwrap(), ToolMode::Auto);
+        assert_eq!(ToolMode::parse("ALWAYS").unwrap(), ToolMode::Always);
+        assert_eq!(ToolMode::parse("never").unwrap(), ToolMode::Never);
+        assert!(ToolMode::parse("bogus").is_err());
     }
 }

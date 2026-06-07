@@ -11,6 +11,7 @@ VALID_ROLES = {"system", "user", "assistant"}
 TOOLS = {
     "time":       set(),                                   # {}
     "calculator": {"expr"},
+    "lookup":     {"query"},
     "todos":      {"action", "text", "id"},
     "notes":      {"action", "title", "content", "query", "id"},
     "calendar":   {"action", "title", "date", "time", "notes", "from", "to", "id"},
