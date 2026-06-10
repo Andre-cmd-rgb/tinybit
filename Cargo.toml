@@ -8,6 +8,9 @@ members = [
     "crates/tinybit-cli",
     "tests",
 ]
+# Standalone example clients of the data API (INTEGRATIONS.md) — built on
+# their own (`cd examples/rust_client && cargo run`), not with the workspace.
+exclude = ["examples/rust_client"]
 
 [workspace.package]
 version    = "1.0.0"

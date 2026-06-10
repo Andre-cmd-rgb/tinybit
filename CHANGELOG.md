@@ -5,6 +5,20 @@ All notable changes to tinybit are documented here.
 ## [Unreleased]
 
 ### Added (this branch)
+- **The tinybit data API — file-based integrations + `tinybit ingest` +
+  `user_data` tool.** Apps in any language push user data (smartwatch, scale,
+  app counters) into `data/integrations/<source>/` as JSONL events
+  (`{"ts","metric","value","unit"?,"tags"?}`); `tinybit ingest` is the
+  validating front door (stdin/file; object, array, or JSONL; atomic
+  `latest.json` snapshot; 10 MB log rotation), and direct appends are an
+  explicitly supported part of the contract (readers skip+count malformed
+  lines). The new `user_data` builtin gives the model `latest` / `range`
+  (count/min/max/mean over RFC3339 or `today`/`yesterday`/`7d` windows) /
+  `sources`, with honest `No data for "…"` misses. Gate arms on metric word +
+  inquiry cue ("what's my heart rate"). Spec: INTEGRATIONS.md; client
+  examples: `examples/python_client.py`, `examples/rust_client/`. Reliable
+  model EMISSION of the tool needs the next retrain
+  (`datasets/chat-userdata-08.jsonl`).
 - **`lookup` searches your local documents.** Drop `.md`/`.txt` files into
   `data/docs/` and `lookup` falls back to a BM25 search over paragraph chunks
   (markdown headings folded in as matching context) when the curated knowledge

@@ -1,0 +1,11 @@
+# Example tinybit data-API client. Standalone on purpose (excluded from the
+# workspace) — copy this whole directory as the starting point for your own
+# integration. Run with: cd examples/rust_client && cargo run
+[package]
+name = "tinybit-example-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde_json = "1"

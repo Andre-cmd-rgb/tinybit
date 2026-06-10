@@ -101,6 +101,7 @@ cargo build --release --workspace
 | `tinybit train` | Train from a model+train config. `--smoke-test` runs a short sanity loop; `--resume` continues from the latest checkpoint. |
 | `tinybit convert` | Export a checkpoint; `--quantize` packs 2D matrices to ternary (smaller on disk). |
 | `tinybit download` | Fetch `tokenizer.json` from HuggingFace. |
+| `tinybit ingest` | Push external data (smartwatch, health, app metrics) into the local integrations store — see [INTEGRATIONS.md](INTEGRATIONS.md). |
 
 Run `tinybit <command> --help` for all flags.
 
@@ -144,6 +145,7 @@ The runtime executes the tool and injects:
 | `todos` | Add / list / complete / delete tasks (SQLite) |
 | `notes` | Save and full-text search notes (SQLite FTS5) |
 | `calendar` | Add / list / delete events (SQLite) |
+| `user_data` | Query data your apps push in via the [data API](INTEGRATIONS.md): latest values, time-range stats, sources |
 
 `lookup` is the tiny-model answer to factual recall: **fetch, don't memorize**.
 It ships with a curated knowledge base
@@ -164,10 +166,24 @@ per user turn whether a tool is plausibly needed; if not, the sampler bans the
 tokens that begin `<|tool_call|>` so the model can't over-fire. `eval` always
 runs raw (`always`).
 
-Add your own by implementing the `Tool` trait in `tinybit-tools` and registering
-it. Note: reliable tool *calling* depends on instruction/tool fine-tuning — the
-plumbing (detect → execute → inject → continue) is complete and tested, but a
-base-pretrained model emits tool calls only loosely. See **Known limitations**.
+**Plug your data in (the tinybit data API).** Any app, any language, can push
+user data — smartwatch metrics, health, app counters — into tinybit's view:
+
+```bash
+echo '{"metric":"heart_rate","value":61,"unit":"bpm"}' | tinybit ingest --source watch
+# then in chat: "what's my heart rate?"  → the user_data tool fetches it
+```
+
+The API is a documented file contract (`data/integrations/`, JSONL) + the
+`ingest` CLI — no server, no daemon. The model is trained to *reason over*
+what it fetches, not to memorize your numbers. Spec + client examples
+(Python/Rust): **[INTEGRATIONS.md](INTEGRATIONS.md)**.
+
+Add your own tool by implementing the `Tool` trait in `tinybit-tools` and
+registering it. Note: reliable tool *calling* depends on instruction/tool
+fine-tuning — the plumbing (detect → execute → inject → continue) is complete
+and tested, but a base-pretrained model emits tool calls only loosely. See
+**Known limitations**.
 
 ---
 
@@ -311,6 +327,7 @@ crates/
 tests/             — integration tests (workspace member)
 configs/           — model + training TOML configs (6 model variants)
 scripts/           — data prep + GCP L4 launcher (Bash *.sh + PowerShell *.ps1)
+examples/          — data-API client examples (Python + standalone Rust crate)
 ```
 
 ---
