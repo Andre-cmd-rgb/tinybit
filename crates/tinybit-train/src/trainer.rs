@@ -69,6 +69,31 @@ pub struct TrainingConfig {
     /// more launches. Ignored unless `fused_ce = true`.
     #[serde(default = "default_fused_ce_chunk")]
     pub fused_ce_chunk: usize,
+
+    // --- Opt-in schedule/optimizer knobs. Every default below equals the
+    // value that was previously hardcoded, so a TOML without these fields
+    // trains bit-identically (pinned by `config_defaults_match_hardcoded`).
+    // The documented loss targets assume the defaults — revalidate a full run
+    // before shipping a change (CLAUDE.md decision 3).
+    /// Fraction of total_steps in linear LR warmup.
+    #[serde(default = "default_warmup_frac")]
+    pub warmup_frac: f64,
+    /// Fraction of total_steps in cosine LR decay (the remainder after warmup
+    /// is the stable plateau).
+    #[serde(default = "default_decay_frac")]
+    pub decay_frac: f64,
+    /// The decay floor as a fraction of peak_lr.
+    #[serde(default = "default_min_lr_frac")]
+    pub min_lr_frac: f64,
+    /// AdamW β1 (first-moment decay).
+    #[serde(default = "default_adam_beta1")]
+    pub adam_beta1: f64,
+    /// AdamW β2 (second-moment decay).
+    #[serde(default = "default_adam_beta2")]
+    pub adam_beta2: f64,
+    /// AdamW ε.
+    #[serde(default = "default_adam_eps")]
+    pub adam_eps: f64,
 }
 
 fn default_muon_lr() -> f64 {
@@ -77,6 +102,30 @@ fn default_muon_lr() -> f64 {
 
 fn default_fused_ce_chunk() -> usize {
     4096
+}
+
+fn default_warmup_frac() -> f64 {
+    0.02
+}
+
+fn default_decay_frac() -> f64 {
+    0.20
+}
+
+fn default_min_lr_frac() -> f64 {
+    0.1
+}
+
+fn default_adam_beta1() -> f64 {
+    0.9
+}
+
+fn default_adam_beta2() -> f64 {
+    0.95
+}
+
+fn default_adam_eps() -> f64 {
+    1e-8
 }
 
 impl TrainingConfig {
@@ -160,12 +209,18 @@ impl Trainer {
         let mut train_loader = DataLoader::new(train_ds, self.config.batch_size, true);
         let mut val_loader = DataLoader::new(val_ds, self.config.batch_size, false);
 
-        let scheduler = WsdScheduler::new(self.config.peak_lr, self.config.total_steps);
+        let scheduler = WsdScheduler::with_shape(
+            self.config.peak_lr,
+            self.config.total_steps,
+            self.config.warmup_frac,
+            self.config.decay_frac,
+            self.config.min_lr_frac,
+        );
         let params = ParamsAdamW {
             lr: self.config.peak_lr,
-            beta1: 0.9,
-            beta2: 0.95,
-            eps: 1e-8,
+            beta1: self.config.adam_beta1,
+            beta2: self.config.adam_beta2,
+            eps: self.config.adam_eps,
             weight_decay: self.config.weight_decay,
         };
         let all_vars = varmap.all_vars();
@@ -204,7 +259,13 @@ impl Trainer {
         } else {
             None
         };
-        let muon_scheduler = WsdScheduler::new(self.config.muon_lr, self.config.total_steps);
+        let muon_scheduler = WsdScheduler::with_shape(
+            self.config.muon_lr,
+            self.config.total_steps,
+            self.config.warmup_frac,
+            self.config.decay_frac,
+            self.config.min_lr_frac,
+        );
         let mut skipped_steps = 0usize;
 
         let total_steps = if self.config.smoke_test_steps > 0 {
@@ -569,4 +630,76 @@ fn clip_grad_norm(
         }
     }
     Ok(total_norm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrainingConfig;
+
+    /// A train TOML WITHOUT the opt-in schedule/optimizer fields must
+    /// deserialize to exactly the previously hardcoded values — the shipped
+    /// configs/train-*-l4.toml deliberately omit them (absent = validated
+    /// defaults, decision 3).
+    #[test]
+    fn config_defaults_match_hardcoded() {
+        let toml_text = r#"
+            train_data = "data/train.bin"
+            val_data = "data/val.bin"
+            checkpoint_dir = "checkpoints/"
+            batch_size = 11
+            grad_accum = 6
+            total_steps = 25000
+            peak_lr = 3e-4
+            weight_decay = 0.01
+            grad_clip = 1.0
+            save_every = 500
+            eval_every = 250
+            eval_batches = 20
+            smoke_test_steps = 0
+        "#;
+        let cfg: TrainingConfig = toml::from_str(toml_text).expect("parse");
+        assert_eq!(cfg.warmup_frac, 0.02);
+        assert_eq!(cfg.decay_frac, 0.20);
+        assert_eq!(cfg.min_lr_frac, 0.1);
+        assert_eq!(cfg.adam_beta1, 0.9);
+        assert_eq!(cfg.adam_beta2, 0.95);
+        assert_eq!(cfg.adam_eps, 1e-8);
+        // Pre-existing optional fields keep their defaults too.
+        assert!(!cfg.bf16);
+        assert!(!cfg.fused_ce);
+        assert_eq!(cfg.muon_lr, 0.02);
+    }
+
+    /// And when present, the fields are honored.
+    #[test]
+    fn config_overrides_parse() {
+        let toml_text = r#"
+            train_data = "data/train.bin"
+            val_data = "data/val.bin"
+            checkpoint_dir = "checkpoints/"
+            batch_size = 1
+            grad_accum = 1
+            total_steps = 100
+            peak_lr = 1e-3
+            weight_decay = 0.0
+            grad_clip = 0.5
+            save_every = 10
+            eval_every = 10
+            eval_batches = 1
+            smoke_test_steps = 0
+            warmup_frac = 0.05
+            decay_frac = 0.30
+            min_lr_frac = 0.0
+            adam_beta1 = 0.95
+            adam_beta2 = 0.99
+            adam_eps = 1e-9
+        "#;
+        let cfg: TrainingConfig = toml::from_str(toml_text).expect("parse");
+        assert_eq!(cfg.warmup_frac, 0.05);
+        assert_eq!(cfg.decay_frac, 0.30);
+        assert_eq!(cfg.min_lr_frac, 0.0);
+        assert_eq!(cfg.adam_beta1, 0.95);
+        assert_eq!(cfg.adam_beta2, 0.99);
+        assert_eq!(cfg.adam_eps, 1e-9);
+    }
 }
