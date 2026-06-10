@@ -31,6 +31,19 @@ impl Rwkv7Block {
         Ok((x + h)?)
     }
 
+    /// Sequence inference (prefill): (1, T, D), LayerState → (1, T, D).
+    /// Mirrors `forward_step` exactly, processing T tokens per call.
+    pub fn forward_seq(
+        &self,
+        x: &Tensor,
+        state: &mut LayerState,
+    ) -> anyhow::Result<Tensor> {
+        let h = self.time_mix.forward_seq(&self.ln1.forward(x)?, state)?;
+        let x = (x + h)?;
+        let h = self.channel_mix.forward_seq(&self.ln2.forward(&x)?, state)?;
+        Ok((x + h)?)
+    }
+
     /// Inference: (B, D), LayerState → (B, D)
     pub fn forward_step(
         &self,

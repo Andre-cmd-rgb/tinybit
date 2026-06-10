@@ -155,41 +155,121 @@ impl TimeMix {
             let vf = v.to_dtype(DType::F32)?;
             crate::model::wkv::fused_wkv(&rf, &kf, &vf, &w)?.reshape((b, t, d))?
         } else {
-            // Sequential candle scan (CPU default). decay broadcast (1,H,dh,1),
-            // hoisted out of the per-timestep loop.
+            // Sequential candle scan (CPU default), zero initial state.
             let w_b = w.unsqueeze(0)?.unsqueeze(candle_core::D::Minus1)?.contiguous()?;
-            let mut state = Tensor::zeros(
+            let init = Tensor::zeros(
                 (b, self.num_heads, self.head_dim, self.head_dim),
                 DType::F32,
                 x.device(),
             )?;
-            let mut outputs: Vec<Tensor> = Vec::with_capacity(t);
-            for ti in 0..t {
-                let k_t = k.narrow(1, ti, 1)?.squeeze(1)?; // (B, H, dh)
-                let v_t = v.narrow(1, ti, 1)?.squeeze(1)?;
-                let r_t = r.narrow(1, ti, 1)?.squeeze(1)?;
-
-                let k_f = k_t.to_dtype(DType::F32)?;
-                let v_f = v_t.to_dtype(DType::F32)?;
-
-                // outer product: (B, H, dh, 1) × (B, H, 1, dh) → (B, H, dh, dh)
-                let k_unsq = k_f.unsqueeze(candle_core::D::Minus1)?.contiguous()?;
-                let v_unsq = v_f.unsqueeze(candle_core::D::Minus2)?.contiguous()?;
-                let outer = k_unsq.broadcast_mul(&v_unsq)?;
-
-                state = state.broadcast_mul(&w_b)?.add(&outer)?;
-
-                // readout: r_t → (B, H, 1, dh)
-                let r_unsq = r_t.to_dtype(DType::F32)?
-                    .unsqueeze(candle_core::D::Minus2)?
-                    .contiguous()?;
-                let y_t = r_unsq.matmul(&state.contiguous()?)?; // (B, H, 1, dh)
-                let y_t = y_t.squeeze(candle_core::D::Minus2)?;  // (B, H, dh)
-                let y_t = y_t.reshape((b, d))?;
-                outputs.push(y_t.unsqueeze(1)?); // (B, 1, D)
-            }
-            Tensor::cat(&outputs, 1)? // (B, T, D)
+            let (y, _final_state) = self.wkv_loop(&r, &k, &v, &w_b, init)?;
+            y
         };
+
+        let y = self.group_norm(&y.to_dtype(x.dtype())?)?;
+        let out = y.broadcast_mul(&g)?;
+        linear_autocast(&self.w_o, &out)
+    }
+
+    /// Sequential WKV scan: one timestep at a time, carrying the recurrent
+    /// state. Shared by `forward_train` (zero init, autograd flows through) and
+    /// `forward_seq` (init = the session's `wkv_state`). r/k/v are
+    /// (B, T, H, dh); `w_b` is the decay broadcast (1, H, dh, 1) f32; `init` is
+    /// (B, H, dh, dh) f32. Returns (y: (B, T, D) f32, final state).
+    fn wkv_loop(
+        &self,
+        r: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        w_b: &Tensor,
+        init: Tensor,
+    ) -> anyhow::Result<(Tensor, Tensor)> {
+        let (b, t, _h, _dh) = r.dims4()?;
+        let d = self.d_model;
+        let mut state = init;
+        let mut outputs: Vec<Tensor> = Vec::with_capacity(t);
+        for ti in 0..t {
+            let k_t = k.narrow(1, ti, 1)?.squeeze(1)?; // (B, H, dh)
+            let v_t = v.narrow(1, ti, 1)?.squeeze(1)?;
+            let r_t = r.narrow(1, ti, 1)?.squeeze(1)?;
+
+            let k_f = k_t.to_dtype(DType::F32)?;
+            let v_f = v_t.to_dtype(DType::F32)?;
+
+            // outer product: (B, H, dh, 1) × (B, H, 1, dh) → (B, H, dh, dh)
+            let k_unsq = k_f.unsqueeze(candle_core::D::Minus1)?.contiguous()?;
+            let v_unsq = v_f.unsqueeze(candle_core::D::Minus2)?.contiguous()?;
+            let outer = k_unsq.broadcast_mul(&v_unsq)?;
+
+            state = state.broadcast_mul(w_b)?.add(&outer)?;
+
+            // readout: r_t → (B, H, 1, dh)
+            let r_unsq = r_t.to_dtype(DType::F32)?
+                .unsqueeze(candle_core::D::Minus2)?
+                .contiguous()?;
+            let y_t = r_unsq.matmul(&state.contiguous()?)?; // (B, H, 1, dh)
+            let y_t = y_t.squeeze(candle_core::D::Minus2)?;  // (B, H, dh)
+            let y_t = y_t.reshape((b, d))?;
+            outputs.push(y_t.unsqueeze(1)?); // (B, 1, D)
+        }
+        Ok((Tensor::cat(&outputs, 1)?, state)) // (B, T, D)
+    }
+
+    /// Sequence inference (prefill): (1, T, D) → (1, T, D), reading the shift /
+    /// WKV state from `state` and leaving it exactly as T successive
+    /// `forward_step` calls would (pinned by `test_prefill_matches_step`).
+    /// Unlike `forward_train` this seeds the token shift and the scan from the
+    /// session state instead of zeros; unlike `forward_step` it runs each
+    /// projection as ONE GEMM over all T rows (decision 20). Inference-only —
+    /// always uses the candle scan loop (the fused CUDA op returns no state).
+    pub fn forward_seq(
+        &self,
+        x: &Tensor, // (1, T, D)
+        state: &mut LayerState,
+    ) -> anyhow::Result<Tensor> {
+        let (b, t, d) = x.dims3()?;
+        anyhow::ensure!(b == 1, "forward_seq expects batch size 1, got {b}");
+
+        // Token shift seeded from the previous token's post-ln1 input.
+        let prev0 = state.time_shift.to_dtype(x.dtype())?.reshape((1, 1, d))?;
+        let prev_x = if t == 1 {
+            prev0
+        } else {
+            Tensor::cat(&[&prev0, &x.narrow(1, 0, t - 1)?], 1)?
+        };
+
+        let maa_x = self.time_maa_x.to_dtype(x.dtype())?;
+        let maa_r = self.time_maa_r.to_dtype(x.dtype())?;
+        let maa_k = self.time_maa_k.to_dtype(x.dtype())?;
+        let maa_v = self.time_maa_v.to_dtype(x.dtype())?;
+
+        let diff = x.broadcast_sub(&prev_x)?;
+        let x_x = prev_x.broadcast_add(&maa_x.broadcast_mul(&diff)?)?;
+        let x_r = prev_x.broadcast_add(&maa_r.broadcast_mul(&diff)?)?;
+        let x_k = prev_x.broadcast_add(&maa_k.broadcast_mul(&diff)?)?;
+        let x_v = prev_x.broadcast_add(&maa_v.broadcast_mul(&diff)?)?;
+
+        let r = self.w_r.forward(&x_r)?;
+        let k = linear_autocast(&self.w_k, &x_k)?;
+        let v = linear_autocast(&self.w_v, &x_v)?;
+        let g = silu(&linear_autocast(&self.w_g1, &x_x)?)?
+            .broadcast_mul(&linear_autocast(&self.w_g2, &x_x)?)?;
+
+        let w = self.compute_decay()?; // (H, dh)
+        let r = r.reshape((b, t, self.num_heads, self.head_dim))?;
+        let k = k.reshape((b, t, self.num_heads, self.head_dim))?;
+        let v = v.reshape((b, t, self.num_heads, self.head_dim))?;
+
+        let w_b = w.unsqueeze(0)?.unsqueeze(candle_core::D::Minus1)?.contiguous()?;
+        let init = state.wkv_state.to_dtype(DType::F32)?.unsqueeze(0)?; // (1, H, dh, dh)
+        let (y, final_state) = self.wkv_loop(&r, &k, &v, &w_b, init)?;
+
+        state.wkv_state = final_state.squeeze(0)?.detach();
+        state.time_shift = x
+            .narrow(1, t - 1, 1)?
+            .reshape(d)?
+            .to_dtype(DType::F32)?
+            .detach();
 
         let y = self.group_norm(&y.to_dtype(x.dtype())?)?;
         let out = y.broadcast_mul(&g)?;

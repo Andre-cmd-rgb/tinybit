@@ -64,6 +64,45 @@ impl ChannelMix {
         Ok(r.broadcast_mul(&v)?)
     }
 
+    /// Sequence inference (prefill): (1, T, D) → (1, T, D), seeding the token
+    /// shift from `state.ffn_shift` and leaving it exactly as T successive
+    /// `forward_step` calls would (the last token's post-ln2 input).
+    pub fn forward_seq(
+        &self,
+        x: &Tensor, // (1, T, D)
+        state: &mut LayerState,
+    ) -> anyhow::Result<Tensor> {
+        let (b, t, d) = x.dims3()?;
+        anyhow::ensure!(b == 1, "forward_seq expects batch size 1, got {b}");
+
+        let prev0 = state.ffn_shift.to_dtype(x.dtype())?.reshape((1, 1, d))?;
+        let prev_x = if t == 1 {
+            prev0
+        } else {
+            Tensor::cat(&[&prev0, &x.narrow(1, 0, t - 1)?], 1)?
+        };
+
+        let maa_k = self.time_maa_k.to_dtype(x.dtype())?;
+        let maa_r = self.time_maa_r.to_dtype(x.dtype())?;
+        let diff = x.broadcast_sub(&prev_x)?;
+        let x_k = prev_x.broadcast_add(&maa_k.broadcast_mul(&diff)?)?;
+        let x_r = prev_x.broadcast_add(&maa_r.broadcast_mul(&diff)?)?;
+
+        state.ffn_shift = x
+            .narrow(1, t - 1, 1)?
+            .reshape(d)?
+            .to_dtype(DType::F32)?
+            .detach();
+
+        let k_pre = self.w_k.forward(&x_k)?;
+        let k = silu(&k_pre)?;
+        let k_sq = k.sqr()?;
+        let v = self.w_v.forward(&k_sq)?;
+        let r_pre = self.w_r.forward(&x_r)?;
+        let r = sigmoid(&r_pre)?;
+        Ok(r.broadcast_mul(&v)?)
+    }
+
     /// Inference step: (B, D) → (B, D), updates ffn_shift in state
     pub fn forward_step(
         &self,

@@ -12,6 +12,20 @@ use embedding::EmbeddingHead;
 use candle_core::{Device, DType, Tensor};
 use candle_nn::{Linear, VarBuilder};
 
+/// Prefill chunk length: bounds per-chunk activation memory (~chunk × d_ffn per
+/// layer) regardless of prompt length while keeping the per-chunk GEMMs large
+/// enough to amortize dispatch.
+pub const PREFILL_CHUNK: usize = 128;
+
+/// Sequence prefill is ON by default; `TINYBIT_SEQ_PREFILL=off|0` forces the
+/// per-token `forward_step` fallback.
+fn seq_prefill_enabled() -> bool {
+    !matches!(
+        std::env::var("TINYBIT_SEQ_PREFILL").as_deref(),
+        Ok("off") | Ok("0")
+    )
+}
+
 /// The complete tinybit model.
 pub struct TinyBit {
     pub config: ModelConfig,
@@ -112,6 +126,56 @@ impl TinyBit {
         let x_t = x.unsqueeze(1)?; // (B, 1, D)
         let logits = self.embed.lm_head(&x_t)?.squeeze(1)?; // (B, vocab_size)
         Ok(logits)
+    }
+
+    /// Prefill: process a whole prompt segment (1, T) through the sequence
+    /// forward, updating `state` exactly as T successive `forward_step` calls
+    /// would (pinned by `test_prefill_matches_step`). Returns the logits for
+    /// the LAST position only (1, vocab_size) — intermediate logits are never
+    /// materialized.
+    ///
+    /// Tokens are processed in chunks of [`PREFILL_CHUNK`] so activation memory
+    /// stays bounded regardless of prompt length (RWKV has no positional limit;
+    /// the recurrent state carries across chunks by construction). Each chunk
+    /// runs every linear projection as a single GEMM over its rows instead of T
+    /// per-token GEMVs — the long-context speed win.
+    ///
+    /// `TINYBIT_SEQ_PREFILL=off` falls back to per-token `forward_step`
+    /// (escape hatch, mirrors the `TINYBIT_FUSED_WKV` pattern).
+    pub fn forward_prefill(
+        &self,
+        token_ids: &Tensor, // (1, T)
+        state: &mut InferenceState,
+    ) -> anyhow::Result<Tensor> {
+        let (b, t) = token_ids.dims2()?;
+        anyhow::ensure!(b == 1, "forward_prefill expects batch size 1, got {b}");
+        anyhow::ensure!(t >= 1, "forward_prefill expects at least one token");
+
+        if !seq_prefill_enabled() {
+            let mut logits = None;
+            for ti in 0..t {
+                let tid = token_ids.narrow(1, ti, 1)?;
+                logits = Some(self.forward_step(&tid, state)?);
+            }
+            return logits.ok_or_else(|| anyhow::anyhow!("empty prefill"));
+        }
+
+        let mut last_hidden: Option<Tensor> = None;
+        let mut start = 0;
+        while start < t {
+            let len = PREFILL_CHUNK.min(t - start);
+            let chunk = token_ids.narrow(1, start, len)?;
+            let mut x = self.embed.embed(&chunk)?; // (1, len, D)
+            for (i, block) in self.blocks.iter().enumerate() {
+                x = block.forward_seq(&x, &mut state.layers[i])?;
+            }
+            if start + len == t {
+                last_hidden = Some(x.narrow(1, len - 1, 1)?); // (1, 1, D)
+            }
+            start += len;
+        }
+        let h = last_hidden.ok_or_else(|| anyhow::anyhow!("empty prefill"))?;
+        Ok(self.embed.lm_head(&h)?.squeeze(1)?) // (1, vocab_size)
     }
 
     /// Load weights from a safetensors file.

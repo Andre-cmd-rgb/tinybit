@@ -204,9 +204,14 @@ impl<'a> ToolProcessor<'a> {
             None => (&[][..], eng.tokenizer.bos_token_id),
         };
         let t_prefill = Instant::now();
-        for &id in prefill_ids {
-            let tid = Tensor::from_vec(vec![id], (1, 1), &eng.device)?.to_dtype(DType::U32)?;
-            eng.model.forward_step(&tid, state)?;
+        if !prefill_ids.is_empty() {
+            // One chunked sequence forward instead of a per-token loop — every
+            // projection runs as a single GEMM over the prompt rows (decision 20)
+            // and the state ends exactly as token-by-token stepping would
+            // (parity pinned by test_prefill_matches_step).
+            let ids = Tensor::from_vec(prefill_ids.to_vec(), (1, prefill_ids.len()), &eng.device)?
+                .to_dtype(DType::U32)?;
+            eng.model.forward_prefill(&ids, state)?;
         }
         stats.prefill_secs = t_prefill.elapsed().as_secs_f64();
 
@@ -295,16 +300,23 @@ impl<'a> ToolProcessor<'a> {
                             }
                             // Inject the marker-wrapped result back into context —
                             // the format the model was trained on. (encode is
-                            // vocab-safe and drops any overflow ids.)
+                            // vocab-safe and drops any overflow ids.) Feed all but
+                            // the LAST result token: the next decode iteration
+                            // forward-steps `prev_id`, so feeding the last one here
+                            // too would apply it to the recurrent state twice
+                            // (same invariant as the prompt prefill above).
                             let result_str = format_tool_result(&result);
                             let result_ids = eng.tokenizer.encode(&result_str, false)?;
-                            for &rid in &result_ids {
-                                let tid = Tensor::from_vec(vec![rid], (1, 1), &eng.device)?
-                                    .to_dtype(DType::U32)?;
-                                eng.model.forward_step(&tid, state)?;
-                                current_ids.push(rid);
+                            if let Some((&last, head)) = result_ids.split_last() {
+                                if !head.is_empty() {
+                                    let ids =
+                                        Tensor::from_vec(head.to_vec(), (1, head.len()), &eng.device)?
+                                            .to_dtype(DType::U32)?;
+                                    eng.model.forward_prefill(&ids, state)?;
+                                }
+                                current_ids.extend_from_slice(&result_ids);
+                                prev_id = last;
                             }
-                            prev_id = *result_ids.last().unwrap_or(&prev_id);
                             round_tokens.clear();
                             break; // next round
                         }

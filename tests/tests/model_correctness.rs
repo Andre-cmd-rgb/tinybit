@@ -78,6 +78,153 @@ fn test_inference_step_matches_train() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Max-abs-diff between two equal-shape tensors.
+fn max_abs_diff(a: &Tensor, b: &Tensor) -> anyhow::Result<f32> {
+    let a = a.flatten_all()?.to_vec1::<f32>()?;
+    let b = b.flatten_all()?.to_vec1::<f32>()?;
+    assert_eq!(a.len(), b.len(), "shape mismatch");
+    Ok(a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max))
+}
+
+/// Assert every LayerState tensor of two InferenceStates matches within tol.
+fn assert_states_match(a: &InferenceState, b: &InferenceState, tol: f32) -> anyhow::Result<()> {
+    assert_eq!(a.layers.len(), b.layers.len());
+    for (i, (la, lb)) in a.layers.iter().zip(b.layers.iter()).enumerate() {
+        for (name, ta, tb) in [
+            ("wkv_state", &la.wkv_state, &lb.wkv_state),
+            ("time_shift", &la.time_shift, &lb.time_shift),
+            ("ffn_shift", &la.ffn_shift, &lb.ffn_shift),
+        ] {
+            let d = max_abs_diff(ta, tb)?;
+            assert!(d < tol, "layer {i} {name} diverged: max diff {d}");
+        }
+    }
+    Ok(())
+}
+
+/// Run `forward_step` over each id in turn, returning the last logits.
+fn step_all(
+    model: &TinyBit,
+    ids: &[u32],
+    state: &mut InferenceState,
+    device: &Device,
+) -> anyhow::Result<Tensor> {
+    let mut logits = None;
+    for &id in ids {
+        let tid = Tensor::from_vec(vec![id], (1, 1), device)?.to_dtype(DType::U32)?;
+        logits = Some(model.forward_step(&tid, state)?);
+    }
+    logits.ok_or_else(|| anyhow::anyhow!("empty ids"))
+}
+
+/// The chunked sequence prefill must leave the recurrent state — every
+/// wkv_state / time_shift / ffn_shift tensor — and the final logits exactly
+/// where token-by-token `forward_step` leaves them. T=150 crosses the
+/// PREFILL_CHUNK=128 boundary mid-sequence.
+#[test]
+fn test_prefill_matches_step() -> anyhow::Result<()> {
+    let (model, config) = nano_model()?;
+    let device = Device::Cpu;
+    let t = 150usize;
+    let ids: Vec<u32> = (0..t)
+        .map(|i| ((i * 2654435761) % config.vocab_size) as u32)
+        .collect();
+
+    let mut step_state = InferenceState::zeros(&config, &device)?;
+    let step_logits = step_all(&model, &ids, &mut step_state, &device)?;
+
+    let mut prefill_state = InferenceState::zeros(&config, &device)?;
+    let ids_t = Tensor::from_vec(ids.clone(), (1, t), &device)?.to_dtype(DType::U32)?;
+    let prefill_logits = model.forward_prefill(&ids_t, &mut prefill_state)?;
+
+    let tol = 1e-4_f32;
+    let d = max_abs_diff(&step_logits, &prefill_logits)?;
+    assert!(d < tol, "prefill/step logits diverged: max diff {d}");
+    assert_states_match(&step_state, &prefill_state, tol)?;
+    Ok(())
+}
+
+/// Edge cases: T=1 (shift comes purely from state) and T=PREFILL_CHUNK (exact
+/// chunk boundary), both seeded from a NON-zero state (run a few tokens first)
+/// so the state-carry path is exercised, not just the zero init.
+#[test]
+fn test_prefill_edge_lengths_match_step() -> anyhow::Result<()> {
+    let (model, config) = nano_model()?;
+    let device = Device::Cpu;
+    let warmup: Vec<u32> = vec![5, 9, 13];
+
+    for t in [1usize, tinybit_core::model::PREFILL_CHUNK] {
+        let ids: Vec<u32> = (0..t)
+            .map(|i| ((i * 48271 + 7) % config.vocab_size) as u32)
+            .collect();
+
+        let mut step_state = InferenceState::zeros(&config, &device)?;
+        step_all(&model, &warmup, &mut step_state, &device)?;
+        let step_logits = step_all(&model, &ids, &mut step_state, &device)?;
+
+        let mut prefill_state = InferenceState::zeros(&config, &device)?;
+        step_all(&model, &warmup, &mut prefill_state, &device)?;
+        let ids_t = Tensor::from_vec(ids.clone(), (1, t), &device)?.to_dtype(DType::U32)?;
+        let prefill_logits = model.forward_prefill(&ids_t, &mut prefill_state)?;
+
+        let tol = 1e-4_f32;
+        let d = max_abs_diff(&step_logits, &prefill_logits)?;
+        assert!(d < tol, "T={t}: prefill/step logits diverged: max diff {d}");
+        assert_states_match(&step_state, &prefill_state, tol)?;
+    }
+    Ok(())
+}
+
+/// End-to-end guarantee: greedy decoding after a sequence prefill produces the
+/// SAME tokens as greedy decoding after token-by-token prefill — chat output
+/// is unchanged by the speedup.
+#[test]
+fn test_prefill_then_decode_matches() -> anyhow::Result<()> {
+    let (model, config) = nano_model()?;
+    let device = Device::Cpu;
+    let t = 140usize; // crosses the chunk boundary
+    let prompt: Vec<u32> = (0..t)
+        .map(|i| ((i * 69621 + 3) % config.vocab_size) as u32)
+        .collect();
+
+    let greedy_decode = |state: &mut InferenceState, first: u32| -> anyhow::Result<Vec<u32>> {
+        let mut out = Vec::new();
+        let mut prev = first;
+        for _ in 0..8 {
+            let tid = Tensor::from_vec(vec![prev], (1, 1), &device)?.to_dtype(DType::U32)?;
+            let logits = model.forward_step(&tid, state)?;
+            let v = logits.flatten_all()?.to_vec1::<f32>()?;
+            let best = v
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            out.push(best);
+            prev = best;
+        }
+        Ok(out)
+    };
+
+    // Token-by-token: prefill head, decode from the last prompt token.
+    let (last, head) = prompt.split_last().expect("non-empty");
+    let mut step_state = InferenceState::zeros(&config, &device)?;
+    step_all(&model, head, &mut step_state, &device)?;
+    let step_tokens = greedy_decode(&mut step_state, *last)?;
+
+    // Sequence prefill of the head, then the same greedy decode.
+    let mut prefill_state = InferenceState::zeros(&config, &device)?;
+    let head_t = Tensor::from_vec(head.to_vec(), (1, head.len()), &device)?.to_dtype(DType::U32)?;
+    model.forward_prefill(&head_t, &mut prefill_state)?;
+    let prefill_tokens = greedy_decode(&mut prefill_state, *last)?;
+
+    assert_eq!(step_tokens, prefill_tokens, "greedy continuation diverged after prefill");
+    Ok(())
+}
+
 #[test]
 fn test_state_is_fixed_size() -> anyhow::Result<()> {
     let config = tiny_config();

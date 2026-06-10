@@ -117,9 +117,11 @@ impl InferenceEngine {
             Some((last, head)) => (head, *last),
             None => (&[][..], self.tokenizer.bos_token_id),
         };
-        for &id in prefill_ids {
-            let tid = Tensor::from_vec(vec![id], (1, 1), &self.device)?.to_dtype(DType::U32)?;
-            self.model.forward_step(&tid, state)?;
+        if !prefill_ids.is_empty() {
+            // Chunked sequence prefill — see ToolProcessor::run.
+            let ids_t = Tensor::from_vec(prefill_ids.to_vec(), (1, prefill_ids.len()), &self.device)?
+                .to_dtype(DType::U32)?;
+            self.model.forward_prefill(&ids_t, state)?;
         }
         let mut history: Vec<u32> = ids.clone();
 
