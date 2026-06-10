@@ -4,6 +4,43 @@ All notable changes to tinybit are documented here.
 
 ## [Unreleased]
 
+### Added (this branch)
+- **`lookup` searches your local documents.** Drop `.md`/`.txt` files into
+  `data/docs/` and `lookup` falls back to a BM25 search over paragraph chunks
+  (markdown headings folded in as matching context) when the curated knowledge
+  base has no answer. Results come back as `From <file>: <excerpt>` (≤400
+  chars, sentence-trimmed) so a 50M recurrent state isn't flooded; weak
+  matches (fewer than 2 matched terms and no rare term) still return the
+  load-bearing "No local entry" phrasing. The docs dir is fingerprinted
+  (mtime+size) per query and the index rebuilt only on change — files added
+  mid-chat are picked up live. Gate: "search my docs/files/documents…"
+  phrasings arm the tool.
+
+### Performance (this branch)
+- **Chunked sequence prefill.** Prompts and injected tool results are now
+  processed with `TinyBit::forward_prefill` (chunks of 128 tokens through a
+  state-seeded sequence forward) instead of one `forward_step` per token —
+  every projection becomes a single GEMM over the chunk rows. Parity with
+  token-by-token stepping is pinned to <1e-4 on logits AND every state tensor,
+  plus an identical-greedy-continuation test. `TINYBIT_SEQ_PREFILL=off`
+  restores per-token stepping. Also fixes a latent double-feed: the last
+  token of an injected tool result was stepped into the recurrent state twice.
+- **O(1)-per-token decode in the generation loop.** The tool loop re-decoded
+  the whole round buffer twice per token (O(n²) per turn); a sliding-window
+  incremental decoder (`Tokenizer::decode_stream`) now yields each token's
+  appended text, with partial byte-fallback UTF-8 held back until complete.
+  Marker/stop detection latency is unchanged (the markers end in ASCII).
+- **Sampler: one selection instead of two full-vocab sorts per token.** Top-k
+  uses an O(V) selection; top-p partitions the top candidates under a strict
+  total order that reproduces the old stable sort bit-for-bit (pinned by a
+  parity test); repetition penalty counts history once (semantics preserved:
+  per-occurrence `penalty^count`).
+
+### Training (this branch)
+- **Opt-in scheduler/optimizer knobs** (`warmup_frac`, `decay_frac`,
+  `min_lr_frac`, `adam_beta1/2/eps`) — absent fields default to the previous
+  hardcoded values (pinned by tests); the shipped L4 configs are unchanged.
+
 ### Docs
 - **README**: the tools table now lists `lookup`; the commands table documents
   the chat tool gate (`--tools auto|always|never`); the user-extensible

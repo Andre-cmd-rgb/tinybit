@@ -140,7 +140,7 @@ The runtime executes the tool and injects:
 |------|-------------|
 | `time` | Current date, time, timezone |
 | `calculator` | Math via `evalexpr` (e.g. `2+2`, `12^2`, `sqrt(144)`) |
-| `lookup` | Local fact retrieval from an editable knowledge base (IDF-weighted matching; answers "no local entry" instead of bluffing) |
+| `lookup` | Local fact retrieval: curated knowledge base + BM25 search over your `data/docs/*.md\|txt` (answers "no local entry" instead of bluffing) |
 | `todos` | Add / list / complete / delete tasks (SQLite) |
 | `notes` | Save and full-text search notes (SQLite FTS5) |
 | `calendar` | Add / list / delete events (SQLite) |
@@ -150,6 +150,14 @@ It ships with a curated knowledge base
 (`crates/tinybit-tools/data/knowledge.json`) and merges an optional user
 extension at `data/knowledge.json` (same `[{"q": ..., "a": ..., "alt": [...]}]`
 shape) at startup.
+
+**Give tinybit your documents.** Drop `.md`/`.txt` files into `data/docs/`
+(subfolders fine) and `lookup` searches them too: files are split into
+paragraph chunks (markdown headings kept as context) and ranked with BM25;
+the best chunk comes back as `From <file>: <excerpt>` with the source named.
+The curated knowledge base always wins over documents; weak matches return
+"No local entry" instead of noise. New or edited files are picked up live —
+no restart needed.
 
 In `chat`, a **tool gate** (`--tools auto|always|never`, default `auto`) decides
 per user turn whether a tool is plausibly needed; if not, the sampler bans the

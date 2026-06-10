@@ -112,6 +112,16 @@ pub fn message_needs_tools(msg: &str) -> bool {
         return true;
     }
 
+    // lookup over the user's local documents ("search my docs for the deploy
+    // schedule", "what do my files say about the cabin wifi").
+    if (m.contains("my docs") || m.contains("my documents") || m.contains("my files")
+        || m.contains("my notes"))
+        && ["search", "find", "look", "check", "what", "say", "anything"]
+            .iter().any(|w| m.contains(w))
+    {
+        return true;
+    }
+
     // lookup — general factual questions ("what is the capital of france",
     // "who invented the telephone", "how many planets"), but NOT questions about
     // tinybit itself (those are identity, answered directly, not looked up).
@@ -402,6 +412,10 @@ mod tests {
             "what is the capital of france?", "who invented the telephone",
             "how many planets are there", "tell me about the great wall of china",
             "what is the largest ocean?", "what's the third planet?",
+            // lookup over local documents
+            "search my docs for the deploy schedule",
+            "what do my files say about the cabin wifi?",
+            "check my documents for the meeting agenda",
         ] {
             assert!(message_needs_tools(m), "SHOULD arm tools: {m:?}");
         }

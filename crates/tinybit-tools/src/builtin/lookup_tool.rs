@@ -1,6 +1,8 @@
+use crate::builtin::doc_index::{scan_docs_dir, trim_to_sentence, DocIndex, Fingerprint};
 use crate::tool::{Tool, ToolOutput};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Bundled default knowledge base, compiled into the binary. Users extend it by
 /// dropping a `knowledge.json` with the same shape into the tools data dir.
@@ -28,13 +30,26 @@ struct Entry {
 
 /// Local read-only fact lookup. A tiny model can't *store* facts reliably, but
 /// it can learn to *fetch* them: this returns the best-matching curated fact for
-/// a query, or a clear "not found" so the model doesn't bluff.
+/// a query, falls back to a BM25 search over the user's local documents
+/// (`<data_dir>/docs/*.md|txt`), and otherwise returns a clear "not found" so
+/// the model doesn't bluff.
 pub struct LookupTool {
-    entries: Vec<Entry>,
-    idf:     HashMap<String, f64>,
+    entries:  Vec<Entry>,
+    idf:      HashMap<String, f64>,
+    docs_dir: PathBuf,
+    /// Cached doc index + the dir fingerprint it was built from. Re-statted on
+    /// each query (cheap), rebuilt only when files changed — so docs dropped
+    /// in mid-chat are picked up live. Mutex keeps the tool Send + Sync with
+    /// `execute(&self)`.
+    docs:     Mutex<DocCache>,
 }
 
-const STOPWORDS: &[&str] = &[
+struct DocCache {
+    index:       DocIndex,
+    fingerprint: Fingerprint,
+}
+
+pub(crate) const STOPWORDS: &[&str] = &[
     "the", "a", "an", "is", "are", "was", "were", "be", "of", "in", "on", "at",
     "to", "for", "and", "or", "what", "whats", "who", "whom", "when", "where",
     "why", "how", "which", "many", "much", "does", "do", "did", "tell", "me",
@@ -42,7 +57,7 @@ const STOPWORDS: &[&str] = &[
     "from", "your", "you", "yourself", "we", "they", "he", "she", "my",
 ];
 
-fn tokenize(text: &str) -> Vec<String> {
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
     text.to_ascii_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
@@ -55,7 +70,7 @@ fn tokenize(text: &str) -> Vec<String> {
 
 /// Two tokens match if equal, or one is a ≥4-char prefix of the other — cheap
 /// stemming so "tall"~"tallest" and "mount"~"mountain".
-fn tok_match(a: &str, b: &str) -> bool {
+pub(crate) fn tok_match(a: &str, b: &str) -> bool {
     a == b || (a.len() >= 4 && b.starts_with(a)) || (b.len() >= 4 && a.starts_with(b))
 }
 
@@ -101,7 +116,38 @@ impl LookupTool {
             .into_iter()
             .map(|(t, c)| (t, (n / c as f64).ln() + 1.0))
             .collect();
-        Ok(Self { entries, idf })
+
+        let docs_dir = data_dir.join("docs");
+        let fingerprint = scan_docs_dir(&docs_dir);
+        let index = DocIndex::build(&docs_dir, &fingerprint);
+        Ok(Self {
+            entries,
+            idf,
+            docs_dir,
+            docs: Mutex::new(DocCache { index, fingerprint }),
+        })
+    }
+
+    /// Search the user's local documents, rebuilding the index first if the
+    /// docs dir changed since the last query. Returns the rendered result
+    /// (`From <file>: <chunk>`), trimmed to a tiny-model-friendly length.
+    fn search_docs(&self, query: &str) -> Option<String> {
+        let mut cache = match self.docs.lock() {
+            Ok(c) => c,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let current = scan_docs_dir(&self.docs_dir);
+        if current != cache.fingerprint {
+            cache.index = DocIndex::build(&self.docs_dir, &current);
+            cache.fingerprint = current;
+        }
+        if cache.index.is_empty() {
+            return None;
+        }
+        cache
+            .index
+            .search(query)
+            .map(|chunk| format!("From {}: {}", chunk.source, trim_to_sentence(&chunk.text, 400)))
     }
 
     fn idf(&self, t: &str) -> f64 {
@@ -147,7 +193,7 @@ impl Tool for LookupTool {
         "lookup"
     }
     fn description(&self) -> &str {
-        "Look up a fact from the local knowledge base (capitals, geography, science, space, definitions). Use it for factual questions instead of guessing."
+        "Look up a fact from the local knowledge base (capitals, geography, science, space, definitions) or search the user's local documents (data/docs). Use it for factual questions instead of guessing."
     }
     fn args_schema(&self) -> &str {
         r#"{"query":"string"}"#
@@ -156,13 +202,20 @@ impl Tool for LookupTool {
     fn execute(&self, args: &str) -> anyhow::Result<ToolOutput> {
         let parsed: LookupArgs =
             serde_json::from_str(args).map_err(|e| anyhow::anyhow!("invalid args: {e}"))?;
-        match self.best_match(&parsed.query) {
-            Some(answer) => Ok(ToolOutput::ok(answer.to_string())),
-            None => Ok(ToolOutput::ok(format!(
-                "No local entry for \"{}\".",
-                parsed.query.trim()
-            ))),
+        // Precedence: curated KB first (precise, hand-written answers), then
+        // the user's documents, then an honest miss. The "No local entry"
+        // phrasing is load-bearing — training data teaches the model to admit
+        // a miss when it sees exactly this shape.
+        if let Some(answer) = self.best_match(&parsed.query) {
+            return Ok(ToolOutput::ok(answer.to_string()));
         }
+        if let Some(hit) = self.search_docs(&parsed.query) {
+            return Ok(ToolOutput::ok(hit));
+        }
+        Ok(ToolOutput::ok(format!(
+            "No local entry for \"{}\".",
+            parsed.query.trim()
+        )))
     }
 }
 
@@ -216,5 +269,67 @@ mod tests {
     fn identity_query_does_not_false_match() {
         // "who are you" tokenizes to nothing significant → no spurious fact.
         assert!(ask(&tool(), "who are you").starts_with("No local entry"));
+    }
+
+    fn docs_data_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tinybit-lookup-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn docs_fallback_answers_with_attribution() {
+        let data_dir = docs_data_dir("fallback");
+        std::fs::write(
+            data_dir.join("docs/projects.md"),
+            "# Hydra deployment\n\nThe hydra service deploys every Tuesday at noon from the release branch.",
+        )
+        .unwrap();
+        let t = LookupTool::new(&data_dir).unwrap();
+        let a = ask(&t, "when does the hydra service deploy");
+        assert!(a.starts_with("From projects.md:"), "got: {a}");
+        assert!(a.contains("Tuesday"), "got: {a}");
+    }
+
+    #[test]
+    fn curated_kb_beats_docs() {
+        let data_dir = docs_data_dir("precedence");
+        // A decoy doc that also mentions France must not shadow the curated answer.
+        std::fs::write(
+            data_dir.join("docs/travel.txt"),
+            "Our France itinerary: the capital stay is three nights, then trains south.",
+        )
+        .unwrap();
+        let t = LookupTool::new(&data_dir).unwrap();
+        let a = ask(&t, "what is the capital of france");
+        assert!(a.contains("Paris"), "KB should win: {a}");
+        assert!(!a.starts_with("From "), "doc result shadowed the KB: {a}");
+    }
+
+    #[test]
+    fn docs_added_mid_session_are_picked_up() {
+        let data_dir = docs_data_dir("reload");
+        let t = LookupTool::new(&data_dir).unwrap();
+        assert!(ask(&t, "wifi password for the cabin").starts_with("No local entry"));
+        std::fs::write(
+            data_dir.join("docs/cabin.txt"),
+            "Cabin checklist: the wifi password is stored in the hallway drawer notebook.",
+        )
+        .unwrap();
+        let a = ask(&t, "wifi password for the cabin");
+        assert!(a.starts_with("From cabin.txt:"), "reload missed the new file: {a}");
+    }
+
+    #[test]
+    fn docs_miss_still_returns_not_found() {
+        let data_dir = docs_data_dir("miss");
+        std::fs::write(data_dir.join("docs/one.txt"), "Grocery list: oats, lentils, coffee.").unwrap();
+        let t = LookupTool::new(&data_dir).unwrap();
+        let a = ask(&t, "what is the airspeed velocity of an unladen swallow");
+        assert!(a.starts_with("No local entry"), "got: {a}");
     }
 }
