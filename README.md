@@ -34,8 +34,9 @@ V1.0 is **local CLI inference first**: `chat`, `eval`, `train`, `convert`,
   See [MODELS.md](MODELS.md).
 - **BitLinear quantization** — ternary weights `{-1, 0, +1}` (BitNet b1.58 STE),
   packed on export.
-- **Built-in local tools** — calculator, time, todos, notes, calendar
-  (SQLite-backed, user-extensible) via a stable token protocol.
+- **Built-in local tools** — calculator, time, lookup (local fact retrieval),
+  todos, notes, calendar (SQLite-backed, user-extensible) via a stable token
+  protocol.
 - **Stable prompt format** — the exact `system:/user:/assistant:` template used
   in `tinybit chat` is the one the training data is formatted with.
 - **Cheap training** — a 50M `micro` model is ~1.9 days / ~$32 on a single L4
@@ -95,7 +96,7 @@ cargo build --release --workspace
 
 | Command | What it does |
 |---------|--------------|
-| `tinybit chat` | Interactive local REPL. Streams tokens, supports tools, slash-commands (`/help`, `/reset`, `/system`, `/save`). |
+| `tinybit chat` | Interactive local REPL. Streams tokens, supports tools (`--tools auto\|always\|never`, default `auto`), slash-commands (`/help`, `/reset`, `/system`, `/save`). |
 | `tinybit eval` | Perplexity over a token file + greedy generation sanity prompts (with tok/s). |
 | `tinybit train` | Train from a model+train config. `--smoke-test` runs a short sanity loop; `--resume` continues from the latest checkpoint. |
 | `tinybit convert` | Export a checkpoint; `--quantize` packs 2D matrices to ternary (smaller on disk). |
@@ -139,9 +140,21 @@ The runtime executes the tool and injects:
 |------|-------------|
 | `time` | Current date, time, timezone |
 | `calculator` | Math via `evalexpr` (e.g. `2+2`, `12^2`, `sqrt(144)`) |
+| `lookup` | Local fact retrieval from an editable knowledge base (IDF-weighted matching; answers "no local entry" instead of bluffing) |
 | `todos` | Add / list / complete / delete tasks (SQLite) |
 | `notes` | Save and full-text search notes (SQLite FTS5) |
 | `calendar` | Add / list / delete events (SQLite) |
+
+`lookup` is the tiny-model answer to factual recall: **fetch, don't memorize**.
+It ships with a curated knowledge base
+(`crates/tinybit-tools/data/knowledge.json`) and merges an optional user
+extension at `data/knowledge.json` (same `[{"q": ..., "a": ..., "alt": [...]}]`
+shape) at startup.
+
+In `chat`, a **tool gate** (`--tools auto|always|never`, default `auto`) decides
+per user turn whether a tool is plausibly needed; if not, the sampler bans the
+tokens that begin `<|tool_call|>` so the model can't over-fire. `eval` always
+runs raw (`always`).
 
 Add your own by implementing the `Tool` trait in `tinybit-tools` and registering
 it. Note: reliable tool *calling* depends on instruction/tool fine-tuning — the

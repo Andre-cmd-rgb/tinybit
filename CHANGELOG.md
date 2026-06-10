@@ -4,6 +4,16 @@ All notable changes to tinybit are documented here.
 
 ## [Unreleased]
 
+### Docs
+- **README**: the tools table now lists `lookup`; the commands table documents
+  the chat tool gate (`--tools auto|always|never`); the user-extensible
+  knowledge base path (`data/knowledge.json`) is documented.
+- **TRAINING.md**: new "Next-run checklist" — custom-data balance
+  (`CUSTOM_CHAT_EPOCHS=8`, ~15% tool-call ratio), `DATA_TOKENS` reminder, the
+  pending `fused_ce`/batch-size live A/Bs, opt-in scheduler/optimizer knobs,
+  and an eval gate (perplexity + tool-emission sanity) before promoting a
+  checkpoint.
+
 ### Added
 - **`lookup` tool — local fact retrieval (RAG-lite for a tiny model).** A 50M model
   can't reliably *store* facts, so it can learn to *fetch* them. `lookup` answers

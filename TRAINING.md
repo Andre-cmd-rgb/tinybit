@@ -156,6 +156,41 @@ size); the L4 startup adds 32 GB swap as a safety net.
 
 ---
 
+## Next-run checklist
+
+What to do (and verify) before and during the next full L4 run:
+
+1. **Custom chat data** — keep `CUSTOM_CHAT_EPOCHS=8` (not 50: memorization +
+   tool over-fire). The active `datasets/*.jsonl` set targets **~15% tool-call
+   examples overall**; retired (over-tooled) files live in `datasets/retired/`
+   which the data prep does not scan. Validate every active file first:
+   `python scripts/validate_chat_jsonl.py datasets/*.jsonl`.
+2. **Token budget** — pass `DATA_TOKENS=1500000000` (the default 20M is a smoke
+   amount, decision in CLAUDE.md "Common mistakes").
+3. **Optional live A/Bs** (each needs an idle L4 and must clear step 0 before
+   being adopted; see `configs/train-micro-l4.toml` comments):
+   - `fused_ce = true` — root-caused and fixed in code (loss.rs detaches both
+     `normed` and `weight`), but it OOMed in the 2026-05-31 live A/B, so it
+     stays off until a new A/B shows a real memory win.
+   - **Batch-size headroom** — the fused WKV kernel removed the old VRAM
+     governor (design decision 16); batch > 11 may now fit. Raise only after a
+     live A/B clears step 0 and a few hundred steps without OOM.
+   - Scheduler/optimizer knobs (`warmup_frac`, `decay_frac`, `min_lr_frac`,
+     `adam_beta1/2/eps`) are opt-in TOML fields. The documented loss targets
+     assume the defaults — revalidate a full run before changing them
+     (design decision 3 applies to all of these).
+4. **Eval gate before promoting a checkpoint** — run `tinybit eval` against the
+   previous best checkpoint: compare val perplexity AND generation sanity, and
+   spot-check tool emission (`chat --tools always` with a tool-shaped prompt,
+   `--tools auto` with a greeting — it must not fire). A checkpoint that wins
+   perplexity but over-fires tools is a regression.
+5. **New-tool data** — the `user_data` (integrations) and lookup-over-documents
+   behaviors only exist after a retrain that includes
+   `datasets/chat-userdata-08.jsonl` / `datasets/chat-docsearch-09.jsonl`.
+   Checkpoints from before those files never emit them.
+
+---
+
 ## Monitoring
 
 ```bash
