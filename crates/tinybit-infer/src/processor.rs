@@ -112,6 +112,22 @@ pub fn message_needs_tools(msg: &str) -> bool {
         return true;
     }
 
+    // user_data — questions about the user's own metrics (smartwatch/health/
+    // app data pushed via `tinybit ingest`). Conservative: a health keyword
+    // alone ("weight loss is hard") must not arm; it needs an inquiry or
+    // possessive cue too.
+    let metric_word = ["heart rate", "steps", "sleep", "calories", "blood pressure",
+                       "workout", "smartwatch", "my data", "my stats", "my metrics",
+                       "my weight"]
+        .iter().any(|w| m.contains(w));
+    let inquiry = ["my ", "how many", "how much", "what was", "what is", "what's",
+                   "whats", "show", "average", "last ", "today", "yesterday",
+                   "this week", "did i"]
+        .iter().any(|w| m.contains(w));
+    if metric_word && inquiry {
+        return true;
+    }
+
     // lookup over the user's local documents ("search my docs for the deploy
     // schedule", "what do my files say about the cabin wifi").
     if (m.contains("my docs") || m.contains("my documents") || m.contains("my files")
@@ -416,8 +432,24 @@ mod tests {
             "search my docs for the deploy schedule",
             "what do my files say about the cabin wifi?",
             "check my documents for the meeting agenda",
+            // user_data (integrations)
+            "what's my heart rate?", "how many steps did i do today?",
+            "show my sleep this week", "what was my average heart rate yesterday?",
+            "how much did i sleep last night?",
         ] {
             assert!(message_needs_tools(m), "SHOULD arm tools: {m:?}");
+        }
+    }
+
+    #[test]
+    fn gate_suppresses_incidental_health_words() {
+        for m in [
+            "weight loss is hard",
+            "i should sleep more",
+            "a good workout playlist would help",
+            "steps to install rust",
+        ] {
+            assert!(!message_needs_tools(m), "should NOT arm tools: {m:?}");
         }
     }
 

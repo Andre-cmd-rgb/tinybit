@@ -1,4 +1,5 @@
 pub mod builtin;
+pub mod integrations;
 pub mod parser;
 pub mod registry;
 pub mod tool;

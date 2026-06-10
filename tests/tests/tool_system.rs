@@ -107,3 +107,34 @@ fn tempdir() -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+/// End-to-end through the integrations data API, model-independent: ingest
+/// events the way `tinybit ingest` does, then query them through the registry
+/// with the exact ToolCall shape the model emits.
+#[test]
+fn test_ingest_to_user_data_round_trip() {
+    let dir = std::env::temp_dir().join(format!("tinybit-e2e-userdata-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let store = tinybit_tools::integrations::IntegrationsStore::open(&dir);
+    let report = store
+        .ingest(
+            "watch",
+            r#"[{"metric":"heart_rate","value":61,"unit":"bpm"},
+                {"metric":"steps","value":8204}]"#,
+        )
+        .unwrap();
+    assert_eq!(report.events, 2);
+
+    let registry = ToolRegistry::with_builtins(&dir).unwrap();
+    let text = r#"<|tool_call|>{"tool":"user_data","args":{"action":"latest","metric":"heart_rate"}}<|end_tool_call|>"#;
+    let (call, _, _) = parse_tool_call(text).unwrap();
+    let out = registry.execute(&call).unwrap();
+    assert!(!out.is_error);
+    assert!(out.content.contains("heart_rate: 61 bpm"), "got: {}", out.content);
+    assert!(out.content.contains("(watch)"), "got: {}", out.content);
+
+    // The registry's system-prompt section advertises the new tool.
+    assert!(registry.system_prompt_section().contains("user_data"));
+}

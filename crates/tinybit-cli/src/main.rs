@@ -30,6 +30,9 @@ enum Commands {
     Convert(commands::convert::ConvertArgs),
     /// Download the tokenizer from HuggingFace.
     Download(commands::download::DownloadArgs),
+    /// Push external data (smartwatch, health, app metrics) into the local
+    /// integrations store — the tinybit data API (see INTEGRATIONS.md).
+    Ingest(commands::ingest::IngestArgs),
 }
 
 #[tokio::main]
@@ -48,5 +51,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Train(args) => commands::train::run(args),
         Commands::Convert(args) => commands::convert::run(args),
         Commands::Download(args) => commands::download::run(args).await,
+        Commands::Ingest(args) => commands::ingest::run(args),
     }
 }
