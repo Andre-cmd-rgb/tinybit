@@ -223,6 +223,16 @@ impl<'a> ToolProcessor<'a> {
             let mut hit_stop = false;
             let mut emitted = 0usize; // chars of this round already streamed
 
+            // Incremental decoders for this round: `partial` mirrors
+            // decode(&round_tokens, false) for the per-token marker/stop scan,
+            // `visible` mirrors decode(&round_tokens, true) for streaming.
+            // Each token costs O(1) amortized instead of re-decoding the whole
+            // round buffer (which made a turn O(n²) in generated length).
+            let mut scan_stream = eng.tokenizer.decode_stream(false);
+            let mut partial = String::new();
+            let mut vis_stream = eng.tokenizer.decode_stream(true);
+            let mut visible = String::new();
+
             for _ in 0..eng.params.max_new_tokens {
                 let tid =
                     Tensor::from_vec(vec![prev_id], (1, 1), &eng.device)?.to_dtype(DType::U32)?;
@@ -250,7 +260,9 @@ impl<'a> ToolProcessor<'a> {
                 prev_id = next_id;
 
                 if streaming {
-                    let visible = eng.tokenizer.decode(&round_tokens, true).unwrap_or_default();
+                    if let Ok(Some(chunk)) = vis_stream.step(next_id) {
+                        visible.push_str(&chunk);
+                    }
                     let (chunk, new_emitted) = next_chunk(&visible, emitted, holdback);
                     if !chunk.is_empty() {
                         if let Some(cb) = on_token.as_deref_mut() {
@@ -268,12 +280,14 @@ impl<'a> ToolProcessor<'a> {
                 // 1–3 extra tokens — the model's own start of a `<|tool_result|>`
                 // — were forward_step'd into the recurrent state BEFORE we
                 // injected the real result, corrupting the state and tipping the
-                // model into post-call garbage. The streaming path already
-                // decodes every token, so this adds no cost there; the eval path
-                // generates few tokens.
+                // model into post-call garbage. `partial` is maintained
+                // incrementally (see scan_stream above) and the markers end in
+                // ASCII, so the completing token always surfaces its chunk in
+                // the same step — detection latency is unchanged.
                 {
-                    let partial =
-                        eng.tokenizer.decode(&round_tokens, false).unwrap_or_default();
+                    if let Ok(Some(chunk)) = scan_stream.step(next_id) {
+                        partial.push_str(&chunk);
+                    }
 
                     // Complete tool call?
                     if partial.contains(CALL_END) {

@@ -195,6 +195,23 @@ impl Tokenizer {
             .map_err(|e| anyhow::anyhow!("decode error: {e}"))
     }
 
+    /// Start an incremental decoder: feed ids one at a time with
+    /// [`IncrementalDecoder::step`]; the concatenation of the yielded chunks
+    /// equals `decode(&all_ids, skip_special_tokens)` (pinned by
+    /// `test_incremental_decoder_matches_full_decode`). Each step decodes only
+    /// a small sliding window of ids, so a generation loop that needs the
+    /// decoded-so-far text every token pays O(1) amortized per token instead
+    /// of re-decoding the whole buffer (O(n²) over a turn).
+    pub fn decode_stream(&self, skip_special_tokens: bool) -> IncrementalDecoder<'_> {
+        IncrementalDecoder {
+            tok: self,
+            skip_special_tokens,
+            ids: Vec::new(),
+            prefix: String::new(),
+            prefix_index: 0,
+        }
+    }
+
     /// Model-visible vocabulary size.
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
@@ -232,5 +249,47 @@ impl Tokenizer {
         text.push_str(user);
         text.push_str(ROLE_ASSISTANT_PREFIX);
         self.encode(&text, false)
+    }
+}
+
+/// Streaming decoder over a [`Tokenizer`] (see [`Tokenizer::decode_stream`]).
+///
+/// Same sliding-window algorithm as `tokenizers::DecodeStream` (kept here so
+/// the vocab-capped wrapper stays the project's only tokenizer surface):
+/// decode a window `[carried ids..., new id]`, emit the text that extends the
+/// previously decoded prefix, then shrink the window to what the new suffix
+/// needs. A step returns `None` while the window's text ends mid-UTF-8
+/// (byte-fallback tokens spell one code point over several ids) — the chunk
+/// is emitted as soon as a later id completes the code point. Marker/stop
+/// scanning stays per-token safe: ASCII-terminated strings like
+/// `<|end_tool_call|>` and `\nuser:` can never end mid-code-point, so their
+/// completing token always yields its chunk immediately.
+pub struct IncrementalDecoder<'a> {
+    tok: &'a Tokenizer,
+    skip_special_tokens: bool,
+    ids: Vec<u32>,
+    prefix: String,
+    prefix_index: usize,
+}
+
+impl IncrementalDecoder<'_> {
+    /// Feed the next id; returns the newly appended text, if any completed.
+    pub fn step(&mut self, id: u32) -> anyhow::Result<Option<String>> {
+        self.ids.push(id);
+        let string = self.tok.decode(&self.ids, self.skip_special_tokens)?;
+        if string.len() > self.prefix.len() && !string.ends_with('\u{FFFD}') {
+            anyhow::ensure!(
+                string.starts_with(&self.prefix),
+                "incremental decode produced an invalid prefix"
+            );
+            let new_text = string[self.prefix.len()..].to_string();
+            let new_prefix_index = self.ids.len() - self.prefix_index;
+            self.ids = self.ids.split_off(self.prefix_index);
+            self.prefix = self.tok.decode(&self.ids, self.skip_special_tokens)?;
+            self.prefix_index = new_prefix_index;
+            Ok(Some(new_text))
+        } else {
+            Ok(None)
+        }
     }
 }
