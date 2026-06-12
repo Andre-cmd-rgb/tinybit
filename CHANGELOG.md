@@ -54,6 +54,14 @@ All notable changes to tinybit are documented here.
 - **Opt-in scheduler/optimizer knobs** (`warmup_frac`, `decay_frac`,
   `min_lr_frac`, `adam_beta1/2/eps`) — absent fields default to the previous
   hardcoded values (pinned by tests); the shipped L4 configs are unchanged.
+- **Next-run training data rebalanced to a 20% tool-call ratio** (was ~50%).
+  The over-tooled `identity-tools-01/02/03` moved to `datasets/retired/`
+  (excluded from tokenization); new series: `identity-07` (353 no-tool
+  backbone), `chat-userdata-08` (the `user_data` tool + reasoning over
+  fetched numbers), `chat-docsearch-09` (lookup over local documents),
+  `chat-think-10` (multi-round tool chains + long-passage comprehension).
+  All validated; result strings byte-aligned with the real tools. Takes
+  effect at the next retrain (see TRAINING.md's next-run checklist).
 
 ### Docs
 - **README**: the tools table now lists `lookup`; the commands table documents

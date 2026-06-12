@@ -257,9 +257,65 @@ cargo test --workspace
     This is why quantization-for-speed (decision 22) is doubly pointless here: the
     bottleneck for small-model decode is launch latency, not weight bandwidth.
 
+24. SEQUENCE PREFILL: prompts and injected tool results are prefilled with
+    `TinyBit::forward_prefill` (model/mod.rs) — chunks of `PREFILL_CHUNK=128`
+    through `forward_seq` (TimeMix/ChannelMix/Rwkv7Block), which runs every
+    projection as ONE GEMM over the chunk rows and seeds/writes the
+    `InferenceState` (token shift from `state.time_shift`/`ffn_shift`, WKV scan
+    init from `state.wkv_state`). The fused WKV CustomOp is TRAINING-ONLY and
+    returns no state — do NOT extend it for prefill (single-return-tensor
+    contract; the scan is ~1% of prefill FLOPs anyway). The scan loop is shared
+    (`wkv_loop`) between `forward_train` (zero init) and `forward_seq` (state
+    init) — `forward_train`'s output must stay bit-identical. Invariants:
+    `time_shift` = last token's post-ln1 input, `ffn_shift` = last token's
+    post-ln2 input; logits + EVERY state tensor parity vs `forward_step` is
+    pinned by `test_prefill_matches_step` / `test_prefill_then_decode_matches`
+    (tests/model_correctness.rs). NEVER feed the last token of a prefilled
+    span again in decode (the prompt prefill feeds head-only; tool-result
+    injection feeds all-but-last — the old all+last double-feed was a state
+    corruption bug, fixed 2026-06-12). Escape hatch: `TINYBIT_SEQ_PREFILL=off`
+    falls back to per-token stepping.
+
+25. INTEGRATIONS ARE FILES, NOT SOCKETS. The "tinybit data API" (INTEGRATIONS.md)
+    is `data/integrations/<source>/{events.jsonl,latest.json,meta.json}` +
+    `tinybit ingest` + the `user_data` tool — reaffirming decision 19 (no
+    server). Shared implementation: `tinybit_tools::integrations`
+    (`IntegrationsStore`), used by both the CLI and the tool. Contract:
+    third-party DIRECT appends of complete JSON lines are allowed (that's the
+    language-agnostic point); readers must SKIP AND COUNT malformed lines,
+    never fail; `latest.json` writes are temp-file + atomic rename; JSONL not
+    SQLite so any language can write. `parse_time_spec` accepts
+    today/yesterday/now/<N>d/<N>h — trainable forms for a 50M model. Keep tool
+    OUTPUT strings stable: `datasets/chat-userdata-08.jsonl` mirrors them
+    byte-for-byte (training/inference agreement, same rule as decision 18).
+
+26. ONE RETRIEVAL TOOL. Document search lives INSIDE `lookup` (lookup_tool.rs +
+    doc_index.rs): curated KB first, then BM25 over paragraph chunks of
+    `data/docs/*.{md,txt}` (heading folded into match tokens, ≥2-matched-terms
+    evidence threshold), result rendered `From <file>: <chunk>` trimmed to
+    ~400 chars (tool results feed a 50M recurrent state — keep them short).
+    The docs dir is fingerprinted (mtime+size) per query, index rebuilt only
+    on change (live pickup, no watcher). The `No local entry for "…"` phrasing
+    is LOAD-BEARING — training data teaches the honest-miss behavior against
+    exactly that string. Do NOT split doc search into a second tool: a second
+    tool name needs its own gate rules, its own training data, and a 50M model
+    that can discriminate between two retrieval tools — all cost, no benefit.
+
 ## Common mistakes to avoid
 
 - Do NOT use .unwrap() in library code — propagate with anyhow::Result + ?
+- The sampler's repetition penalty is PER OCCURRENCE (`penalty^count` per
+  token, sign-preserving) — pinned by tests in sampler.rs. Do NOT "fix" it to
+  HF's once-per-distinct-token semantics without revalidating generation
+  quality. Top-p's tiered partial selection uses a strict total order
+  (prob desc, index asc) precisely so it stays bit-identical to the old
+  stable full sort — keep any comparator change total.
+- The generation loop's per-token text comes from `Tokenizer::decode_stream`
+  (IncrementalDecoder). Its chunk concatenation must stay byte-identical to a
+  one-shot decode (pinned in tests/tokenizer.rs incl. a mini LLaMA-style
+  tokenizer that runs without tokenizer.json). Do NOT reintroduce a
+  full-buffer decode per token (O(n²) per turn), and do NOT scan markers less
+  than every token (decision 4).
 - Do NOT load entire dataset into RAM — use memory-mapped TokenDataset
 - Do NOT mix training mode and inference mode forward passes
 - Do NOT forget to call .detach() on state tensors to stop gradient tracking through state
