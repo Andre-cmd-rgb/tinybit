@@ -111,7 +111,14 @@ fn mini_tokenizer() -> Tokenizer {
         "unk_token": "<unk>"
       }
     }"#;
-    let path = std::env::temp_dir().join(format!("tinybit-mini-tok-{}.json", std::process::id()));
+    // Unique per CALL, not just per process — tests run in parallel threads
+    // and a shared path races (one test deletes the file mid-load of another).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "tinybit-mini-tok-{}-{}.json",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::write(&path, json).expect("write mini tokenizer");
     let tok = Tokenizer::from_file(&path).expect("load mini tokenizer");
     let _ = std::fs::remove_file(&path);
