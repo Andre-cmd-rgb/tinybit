@@ -57,9 +57,11 @@ first definitive run did. Two rules:
 
 ## Current files
 
-- `identity-tools-01.jsonl` — 442 identity + tool-use examples (AI-generated, validated).
-- `identity-tools-02.jsonl` — 663 identity + tool-use examples (AI-generated, validated).
-- `identity-tools-03.jsonl` — 240 identity + tool-use examples (AI-generated, validated).
+The active set (everything in THIS folder; `datasets/retired/` is not scanned —
+the data prep's file sweep is non-recursive) is balanced to **20% tool-call
+examples overall**. Validate after any change:
+`python scripts/validate_chat_jsonl.py datasets/<file>.jsonl`.
+
 - `chat-notools-04.jsonl` — 90 no-tool examples (identity, general help, and
   "tool-shaped but answered directly") added 2026-06-07 to dilute the tool ratio.
 - `chat-lookup-05.jsonl` — 58 examples teaching the `lookup` tool (facts →
@@ -69,9 +71,29 @@ first definitive run did. Two rules:
 - `chat-summary-06.jsonl` — 41 no-tool examples for the headline skills:
   summarising, explaining/ELI5, paraphrasing, and reading comprehension. Added
   2026-06-07 alongside the language-first base-mix retune (no code).
+- `identity-07.jsonl` — 353 no-tool examples (2026-06-12): identity/persona,
+  honesty about limits (offline, no live data, small-model caveats), greetings,
+  practical help, writing/rewriting/grammar, quick reasoning, and tool-shaped
+  prompts answered directly. The dilution backbone of the set. Deliberately
+  avoids lookup-shaped factual questions (those belong to 05/09).
+- `chat-userdata-08.jsonl` — 44 examples (80% tool) teaching `user_data` (the
+  integrations data API, INTEGRATIONS.md): latest/range/sources calls with
+  results byte-aligned to the real tool output, honest "No data" misses,
+  REASONING over fetched numbers (restate + interpret, never invent), and
+  when NOT to call (incidental health talk, general questions).
+- `chat-docsearch-09.jsonl` — 27 examples (81% tool) teaching lookup over the
+  user's documents (`data/docs/`): grounded answers citing `From <file>: …`,
+  honest misses, and "found a chunk but it doesn't answer" honesty.
+- `chat-think-10.jsonl` — 28 examples (57% tool): multi-round tool chains
+  (lookup→calculator, time→calendar, user_data→calculator, lookup×2
+  comparisons), chains that fail midway handled honestly, and long-passage
+  no-tool reading comprehension (deadlines, risks, policy questions,
+  changelog-breakage, option comparisons).
 
-⚠️ The `identity-tools-0{1,2,3}` files are **~54% tool calls** — too tool-heavy on
-their own (see balance rules above). For the next run, prefer regenerating them
-with the updated `prompts/tinybit-identity-tools-dataset.md` (now ~15% tools) so
-the whole set lands near a ~15–20% tool ratio, and train with
-`CUSTOM_CHAT_EPOCHS≈8` (NOT 50, which caused the over-firing).
+### Retired
+
+`retired/identity-tools-0{1,2,3}.jsonl` (2026-06-12) — the first-generation
+identity/tool set. At ~54% tool calls it taught the model that a tool call is
+the *default* reply (see balance rules above). Kept for history; NOT tokenized
+(the custom-file scan does not recurse into subfolders). The replacement is
+the 07–10 series above.

@@ -15,6 +15,7 @@ TOOLS = {
     "todos":      {"action", "text", "id"},
     "notes":      {"action", "title", "content", "query", "id"},
     "calendar":   {"action", "title", "date", "time", "notes", "from", "to", "id"},
+    "user_data":  {"action", "source", "metric", "since", "until"},
 }
 SYS_CANON = ("You are tinybit, a small and efficient AI assistant built on the "
              "RWKV-7 architecture. You are helpful, concise, and honest.")

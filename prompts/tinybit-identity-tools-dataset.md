@@ -98,7 +98,7 @@ TOOL-CALL PROTOCOL (must be byte-exact — this is how tinybit's runtime parses 
   fields beyond the schemas below. Make the <|tool_result|> content REALISTIC for
   the call (plausible value/confirmation string), since this is synthetic.
 
-THE 6 TOOLS (name → args schema → what the result looks like):
+THE 7 TOOLS (name → args schema → what the result looks like):
 1. time      args: {}
    result e.g.: "2026-05-31 14:23:07, Saturday, UTC"
 2. calculator args: {"expr":"string"}   (supports + - * / ^ sqrt() sin() cos() log() pi e)
@@ -115,6 +115,31 @@ THE 6 TOOLS (name → args schema → what the result looks like):
    results e.g.: "Saved note #2: Recipe" / "#2 Recipe" / "# Recipe\n\n2 eggs, flour, milk"
 6. calendar  args: {"action":"add|today|week|list|delete","title":"string","date":"YYYY-MM-DD","time":"HH:MM","notes":"string","from":"YYYY-MM-DD","to":"YYYY-MM-DD","id":"int"}
    results e.g.: "Added event #5: Dentist on 2026-06-02" / "No events today."
+7. user_data args: {"action":"latest|range|sources","source":"string?","metric":"string?","since":"string?","until":"string?"}
+   The user's own data, pushed in by external apps (smartwatch, scale — see
+   INTEGRATIONS.md). USE IT for questions about the user's metrics ("what's my
+   heart rate", "steps this week") — NEVER invent the user's numbers.
+   since/until accept "today", "yesterday", "7d", "12h", or RFC3339.
+   results, byte-exact formats:
+     latest : "heart_rate: 61 bpm at 2026-06-10T08:31Z (watch)"  (one line per metric)
+     range  : "steps 2026-06-03→2026-06-10: count=14 min=4102 max=11873 mean=8204 last=9120"
+     sources: "Sources: scale (weight), watch (heart_rate, steps)"
+     no data: "No data for \"blood_pressure\"." → ADMIT it and suggest connecting
+              a source; never make a number up.
+
+LOOKUP ALSO SEARCHES THE USER'S DOCUMENTS: when the user says "search my
+docs/files/notes for …", lookup may return
+  "From <file>: <chunk text>"
+→ the assistant answers GROUNDED in that chunk and cites the file ("Per
+projects.md, …"). If the chunk doesn't actually answer the question, SAY SO.
+Misses still return "No local entry for \"…\".".
+
+REASON OVER RESULTS (the most important behavior): after a tool result, the
+assistant RESTATES the fetched value and INTERPRETS it for the user (compare to
+a goal, note a trend, draw the conclusion) — it never invents numbers and never
+contradicts the result. Chains are allowed and encouraged in a minority of tool
+examples: fetch a fact with lookup, then compute with calculator; check time,
+then add a calendar entry; fetch user_data, then compute a percentage.
 
 DIVERSITY RULES:
 - Vary user wording, tone, and length heavily; avoid reusing the same sentence
