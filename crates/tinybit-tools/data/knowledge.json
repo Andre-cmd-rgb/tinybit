@@ -112,5 +112,11 @@
   {"q": "currency of the european union", "a": "The euro (EUR) is the currency used by most European Union countries.", "alt": ["european currency", "eu currency"]},
   {"q": "official language of brazil", "a": "The official language of Brazil is Portuguese.", "alt": []},
   {"q": "most spoken language", "a": "Mandarin Chinese and English are among the most spoken languages worldwide; English has the most total speakers when counting second-language speakers.", "alt": []},
-  {"q": "tallest building", "a": "The Burj Khalifa in Dubai is the tallest building in the world, at about 828 m.", "alt": ["tallest building in the world"]}
+  {"q": "tallest building", "a": "The Burj Khalifa in Dubai is the tallest building in the world, at about 828 m.", "alt": ["tallest building in the world"]},
+
+  {"title": "Photosynthesis", "text": "Photosynthesis is the process by which green plants, algae, and some bacteria convert light energy, water, and carbon dioxide into glucose and oxygen. It takes place mainly in the chloroplasts using the pigment chlorophyll."},
+  {"title": "Mitochondria", "text": "Mitochondria are membrane-bound organelles often called the powerhouse of the cell. They generate most of the cell's supply of ATP, the molecule used as chemical energy."},
+  {"title": "Gravity", "text": "Gravity is the force of attraction between masses. On Earth it gives weight to objects and causes them to fall toward the ground, accelerating at about 9.8 meters per second squared."},
+  {"title": "Cellular respiration", "text": "Cellular respiration is the process by which cells break down glucose and oxygen to release energy as ATP, producing carbon dioxide and water. It is roughly the reverse of photosynthesis."},
+  {"title": "Recursion", "text": "In programming, recursion is when a function calls itself to solve a problem by reducing it to smaller subproblems. A recursive function needs a base case to stop the recursion and avoid infinite loops."}
 ]
