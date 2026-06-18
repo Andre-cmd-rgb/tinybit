@@ -257,6 +257,74 @@ cargo test --workspace
     This is why quantization-for-speed (decision 22) is doubly pointless here: the
     bottleneck for small-model decode is launch latency, not weight bandwidth.
 
+24. BRAIN-INSPIRED EXTENSIONS are opt-in and config-gated. New `ModelConfig`
+    fields (`spike_threshold`, `fast_weights`/`fw_eta`/`fw_decay`, `ponder_steps`)
+    all default to off/zero via `#[serde(default)]`, so EVERY existing config and
+    checkpoint deserializes and behaves byte-identically (micro/bit/qbit set them
+    off explicitly; `nano` turns them on). The mechanisms:
+    - SPIKING SPARSITY ("efficient", `spike_threshold`): `channel_mix` zeros
+      post-SiLU activations with |a| below the threshold (the neuron doesn't
+      fire). ReLU-like straight-through (the mask is a non-diff constant), so it's
+      differentiable and INERT at threshold 0 (|a|>=0 is always true). The FLOPs
+      win needs a sparse kernel (unbuilt) — like ternary (decision 22) this is
+      "sparsity-ready", honest about no realized speedup yet; what it buys now is
+      training the model to use a sparse code. Lives in BOTH forward_train and
+      forward_step (train/infer must match).
+    - HEBBIAN FAST-WEIGHTS ("rewires itself", `fast_weights`): a per-layer
+      decaying associative ΔW (d_model×d_model) held in `LayerState::fast_w`,
+      updated ONLINE during inference (`time_mix::forward_step`, no gradients) as
+      `ΔW ← decay·ΔW + η·(post⊗pre)` and added to the value path (`v += ΔW·pre`).
+      Inference-ONLY — `forward_train` is untouched so training-time activation
+      stats are unchanged. Bounded by `fw_decay`<1 (keep `fw_eta` small). Uses
+      `post` BEFORE augmentation to avoid feedback runaway. `InferenceState`
+      save/load now PROBES per-layer keys (`layer_{i}_wkv` … optional
+      `layer_{i}_fast`) instead of the old `len()/3` divisor, so state files with
+      or without the trace both load — do NOT reintroduce `len()/3`.
+    - PONDERING ("thinks", `ponder_steps`): `TinyBit::ponder` runs N latent
+      recurrence steps over a learned `thought` embedding (a model param allocated
+      only when `ponder_steps>0`) to evolve the recurrent state before emitting,
+      called after prefill in `processor::run`. Inert (no-op, no param) when 0.
+      The fixed-N form is experimental (the thought embedding starts at zeros and
+      isn't yet supervised by a training objective); treat quality benefit as
+      unverified until trained. Guarded by `crates/tinybit-core/tests/brain.rs`
+      (inertness-when-off + behavior-when-on for all three).
+
+25. EXTERNAL MEMORY / LOCAL RETRIEVAL ("hippocampus" — fetch, don't memorize).
+    The small model should carry language, not world-facts; facts live in a local
+    store it SEARCHES. `tinybit-tools/src/knowledge.rs` `KnowledgeStore` is the
+    shared IDF retriever over `knowledge.json` (bundled + optional user
+    `data/knowledge.json`). It holds BOTH Q/A facts (`{"q","a","alt"}`, gated on
+    phrase coverage — what blocks a generic shared token like "capital" matching
+    the wrong country) AND definition/document passages (`{"title","text"}`, gated
+    on query coverage). `best_qa` preserves the old single-answer `lookup`
+    behavior; `search(query,k,min_cov)` returns ranked top-k for RAG. The engine
+    does AUTOMATIC RAG: `chat --rag N` (default 3) searches per turn and prepends
+    the top-k passages to the system prompt; non-factual turns match nothing and
+    get no spurious context. `eval`/training are untouched (rag defaults to 0 in
+    the engine; the chat command opts in).
+
+26. DREAM CONSOLIDATION ("dreams", `tinybit dream`). Offline sleep-style replay:
+    `tinybit-train/src/dream.rs::consolidate` replays saved-session tokens
+    (cross-entropy, CONSOLIDATE) while distilling toward a FROZEN copy of the base
+    model on a pseudo-rehearsal set the base generates itself (KL, ANTI-FORGETTING)
+    — the KL anchor is load-bearing, not optional. Reuses `loss::cross_entropy_loss`
+    + candle AdamW; a few low-LR steps → a consolidated full checkpoint (reversible
+    LoRA adapters are future work). The base must stay truly frozen (teacher via
+    `TinyBit::load`; student is the only thing in the optimizer). The `dream`
+    command formats session histories with the SHARED chat template (decision 18)
+    so consolidated tokens match training. Requires an f32 checkpoint matching the
+    config (a quantized export won't `varmap.load`).
+
+27. The `nano` model (`ModelConfig::nano` / `configs/nano.toml`, ~17M: 8 layers,
+    d_model 256, 4 heads) is the brain-native variant — smaller/faster than micro
+    with decisions 24–26 ON. It is NOT yet trained at scale; its quality vs the old
+    micro is an OPEN, MEASURED question (run `eval` against the micro baseline).
+    The design bet (smaller-but-smarter) rests on offloading facts to retrieval
+    (decision 25), not on the params alone — do not claim it is "smarter" without
+    eval numbers. Train with `configs/train-nano-l4.toml` + `DATA_PROFILE=grounded`
+    (a language/summarization/grounded-QA mix, to be added to prepare_data.py;
+    de-emphasize parametric world-facts).
+
 ## Common mistakes to avoid
 
 - Do NOT use .unwrap() in library code — propagate with anyhow::Result + ?
@@ -307,3 +375,21 @@ cargo test --workspace
   The kernel launches `B*H` blocks of `dh` threads; occupancy is fine at the
   micro batch (b=11 → 66 blocks) — a chunked parallel scan over time would add
   more, but is unneeded now that the atomic storm is gone.
+- Do NOT add a new per-layer tensor to `LayerState` and rely on the old
+  `loaded.len() / 3` to count layers in `InferenceState::load` — it now PROBES
+  `layer_{i}_wkv` keys. Adding state the old way silently mis-parsed every saved
+  session (decision 24).
+- Do NOT put the Hebbian fast-weight update in `forward_train` — it is
+  inference-ONLY (`forward_step`, detached). Putting it in training would change
+  activation stats and entangle the plastic ΔW with gradients (decision 24).
+- A brain extension that is "off" MUST be numerically inert: spiking at
+  `threshold 0`, `ponder_steps 0`, and `fast_weights=false` each reproduce the
+  legacy output bit-for-bit. The `brain.rs` tests assert this — run them after
+  touching `channel_mix`, `time_mix::forward_step`, `state.rs`, or `ponder`.
+- Do NOT enable spiking/fast-weights/pondering on a checkpoint trained WITHOUT
+  them and expect quality — they perturb a distribution the dense model never
+  saw. They are meant to be trained-in (`nano`) or measured via `eval` before use.
+- `dream` must keep the teacher FROZEN (load it read-only; only the student
+  varmap goes into the optimizer) and the KL anchor non-zero — without it a few
+  replay steps overfit the narrow session set and forget everything else
+  (decision 26).

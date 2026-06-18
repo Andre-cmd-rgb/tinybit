@@ -98,10 +98,48 @@ cargo build --release --workspace
 | `tinybit chat` | Interactive local REPL. Streams tokens, supports tools, slash-commands (`/help`, `/reset`, `/system`, `/save`). |
 | `tinybit eval` | Perplexity over a token file + greedy generation sanity prompts (with tok/s). |
 | `tinybit train` | Train from a model+train config. `--smoke-test` runs a short sanity loop; `--resume` continues from the latest checkpoint. |
+| `tinybit dream` | Offline "sleep" consolidation: replay saved conversations into the model with an anti-forgetting anchor; writes a consolidated checkpoint. |
 | `tinybit convert` | Export a checkpoint; `--quantize` packs 2D matrices to ternary (smaller on disk). |
 | `tinybit download` | Fetch `tokenizer.json` from HuggingFace. |
 
 Run `tinybit <command> --help` for all flags.
+
+---
+
+## Brain-inspired mode (`nano`)
+
+tinybit's RWKV-7 core is already brain-like — recurrent, attention-free, O(1)
+memory with a persistent state. The `nano` model (`configs/nano.toml`, ~17M)
+turns on opt-in, biologically-motivated mechanisms (all default **off** on
+micro/bit/qbit, so existing checkpoints are unchanged):
+
+- **Spiking sparsity** (`spike_threshold`) — neurons fire only when activated
+  past a threshold (event-driven sparse coding). *Efficient.*
+- **Hebbian fast-weights** (`fast_weights`) — a decaying associative weight delta
+  updated *online during a conversation* and added to the value path. *It rewires
+  itself.* (Inference-only; training is unchanged.)
+- **Pondering** (`ponder_steps`) — latent recurrence steps over a learned thought
+  embedding before answering. *It thinks before it speaks.*
+- **Fetch, don't memorize** — `tinybit chat --rag N` searches a local knowledge
+  store (`KnowledgeStore`, facts + definitions) and grounds the answer in what it
+  retrieves, so a tiny model spends its parameters on language, not trivia.
+- **Dreaming** — `tinybit dream` consolidates saved conversations offline (replay
+  + pseudo-rehearsal with a frozen-base KL anchor), like sleep.
+
+```bash
+# train the brain-native nano model
+tinybit train --model-config configs/nano.toml --train-config configs/train-nano-l4.toml
+# chat with local retrieval grounding on
+tinybit chat --config configs/nano.toml --model models/tinybit-nano.safetensors --rag 3
+# consolidate today's saved conversations ("sleep")
+tinybit dream --config configs/nano.toml --model models/tinybit-nano.safetensors --sessions sessions
+```
+
+**Honesty:** these mechanisms add efficiency, in-context adaptivity, and memory —
+they do not magically make a 17M model "smart." Whether `nano` beats `micro` is a
+*measured* question (`tinybit eval` against the micro baseline), not an assumption.
+At this size, raw capability is bounded by parameters and data; the brain features
+are about *how* it uses them. `nano` is not yet trained at scale.
 
 ---
 

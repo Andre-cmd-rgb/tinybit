@@ -5,6 +5,34 @@ All notable changes to tinybit are documented here.
 ## [Unreleased]
 
 ### Added
+- **Brain-inspired extensions (opt-in, config-gated; default OFF so existing
+  checkpoints/configs are byte-identical).** A step toward a smaller, always-on,
+  brain-like tinybit. All live behind new `ModelConfig` fields and are exercised
+  by `crates/tinybit-core/tests/brain.rs` (inertness-when-off + behavior-when-on):
+  - **Spiking sparsity** (`spike_threshold`) — channel-mix neurons below a
+    magnitude threshold don't fire (event-driven sparse code; ReLU-like
+    straight-through, inert at 0). "Efficient." FLOPs win awaits a sparse kernel.
+  - **Hebbian fast-weights** (`fast_weights`/`fw_eta`/`fw_decay`) — a decaying
+    associative ΔW per layer, updated online during inference and added to the
+    value path, so the model adapts within a conversation. "Rewires itself."
+    Inference-only; training unchanged.
+  - **Pondering** (`ponder_steps`) — latent recurrence steps over a learned
+    thought embedding before emitting, so the model deliberates. "Thinks."
+- **`nano` model (~17M)** — `ModelConfig::nano` / `configs/nano.toml` /
+  `configs/train-nano-l4.toml`. The brain-native variant: smaller and faster than
+  micro with the mechanisms above ON, designed to fetch facts from the local store
+  rather than memorize them. Quality vs micro is a measured open question (`eval`).
+- **Automatic local retrieval (RAG) in `chat` (`--rag N`, default 3).** Each turn
+  searches the local knowledge store and prepends the top-k passages to the system
+  prompt — "fetch, don't memorize." Non-factual turns get no spurious context.
+- **`KnowledgeStore`** (`tinybit-tools/src/knowledge.rs`) — the `lookup` knowledge
+  base, generalized: now holds definition/document passages (`{"title","text"}`)
+  alongside Q/A facts, with a ranked top-k `search()` for RAG. `lookup` is unchanged
+  in behavior (precise Q/A first, then best definition).
+- **`tinybit dream` — offline replay consolidation ("sleep").** Replays saved
+  conversations into the model (cross-entropy) while distilling toward a frozen
+  copy of the base on self-generated pseudo-rehearsal (KL anti-forgetting), then
+  writes a consolidated checkpoint. Reuses the trainer's loss + AdamW.
 - **`lookup` tool — local fact retrieval (RAG-lite for a tiny model).** A 50M model
   can't reliably *store* facts, so it can learn to *fetch* them. `lookup` answers
   factual questions (capitals, geography, space, science, definitions) from a local,
