@@ -12,6 +12,10 @@ pub struct LayerState {
     pub time_shift: Tensor,
     /// Shift state for channel-mix. Shape: (d_model,).
     pub ffn_shift: Tensor,
+    /// Hebbian fast-weight trace ΔW for the time-mix value path, shape
+    /// (d_model, d_model). `None` unless `fast_weights` is enabled. Updated
+    /// online during inference (no gradients); this is what "rewires itself".
+    pub fast_w: Option<Tensor>,
 }
 
 /// Complete model inference state (one per active session).
@@ -33,7 +37,16 @@ impl InferenceState {
             )?;
             let time_shift = Tensor::zeros(config.d_model, candle_core::DType::F32, device)?;
             let ffn_shift = Tensor::zeros(config.d_model, candle_core::DType::F32, device)?;
-            layers.push(LayerState { wkv_state, time_shift, ffn_shift });
+            let fast_w = if config.fast_weights {
+                Some(Tensor::zeros(
+                    (config.d_model, config.d_model),
+                    candle_core::DType::F32,
+                    device,
+                )?)
+            } else {
+                None
+            };
+            layers.push(LayerState { wkv_state, time_shift, ffn_shift, fast_w });
         }
         Ok(Self { layers, device: device.clone() })
     }
@@ -46,21 +59,22 @@ impl InferenceState {
             map.insert(format!("layer_{i}_wkv"), layer.wkv_state.clone());
             map.insert(format!("layer_{i}_time"), layer.time_shift.clone());
             map.insert(format!("layer_{i}_ffn"), layer.ffn_shift.clone());
+            if let Some(fw) = &layer.fast_w {
+                map.insert(format!("layer_{i}_fast"), fw.clone());
+            }
         }
         candle_core::safetensors::save(&map, path)?;
         Ok(())
     }
 
-    /// Load state from disk.
+    /// Load state from disk. Layers are discovered by probing `layer_{i}_wkv`
+    /// keys (not by a fixed tensor-per-layer count), so state files written with
+    /// or without the optional fast-weight trace both load correctly.
     pub fn load(path: &Path, device: &Device) -> anyhow::Result<Self> {
         let loaded = candle_core::safetensors::load(path, device)?;
-        let num_layers = loaded.len() / 3;
-        let mut layers = Vec::with_capacity(num_layers);
-        for i in 0..num_layers {
-            let wkv_state = loaded
-                .get(&format!("layer_{i}_wkv"))
-                .with_context(|| format!("missing layer_{i}_wkv"))?
-                .clone();
+        let mut layers = Vec::new();
+        let mut i = 0;
+        while let Some(wkv_state) = loaded.get(&format!("layer_{i}_wkv")) {
             let time_shift = loaded
                 .get(&format!("layer_{i}_time"))
                 .with_context(|| format!("missing layer_{i}_time"))?
@@ -69,7 +83,14 @@ impl InferenceState {
                 .get(&format!("layer_{i}_ffn"))
                 .with_context(|| format!("missing layer_{i}_ffn"))?
                 .clone();
-            layers.push(LayerState { wkv_state, time_shift, ffn_shift });
+            let fast_w = loaded.get(&format!("layer_{i}_fast")).cloned();
+            layers.push(LayerState {
+                wkv_state: wkv_state.clone(),
+                time_shift,
+                ffn_shift,
+                fast_w,
+            });
+            i += 1;
         }
         Ok(Self { layers, device: device.clone() })
     }
@@ -82,6 +103,7 @@ impl InferenceState {
                 wkv_state: layer.wkv_state.detach(),
                 time_shift: layer.time_shift.detach(),
                 ffn_shift: layer.ffn_shift.detach(),
+                fast_w: layer.fast_w.as_ref().map(|t| t.detach()),
             });
         }
         Ok(Self { layers, device: self.device.clone() })

@@ -23,6 +23,10 @@ pub struct TinyBit {
     /// (tensor cores) while norms, the WKV scan, and the loss stay f32. Default
     /// f32 — inference and CPU are unaffected.
     compute_dtype: DType,
+    /// Learned "thought" embedding for pondering (shape (d_model,)). Present only
+    /// when `config.ponder_steps > 0`; fed through the stack to evolve the
+    /// recurrent state during latent deliberation. See `ponder`.
+    thought: Option<Tensor>,
 }
 
 impl TinyBit {
@@ -45,7 +49,32 @@ impl TinyBit {
         } else {
             None
         };
-        Ok(Self { config, embed, blocks, spec_heads, compute_dtype: DType::F32 })
+        let thought = if config.ponder_steps > 0 {
+            Some(vb.get_with_hints(config.d_model, "thought", candle_nn::Init::Const(0.0))?)
+        } else {
+            None
+        };
+        Ok(Self { config, embed, blocks, spec_heads, compute_dtype: DType::F32, thought })
+    }
+
+    /// Pondering ("thinks"): run `config.ponder_steps` latent recurrence steps
+    /// over the learned thought embedding, evolving the recurrent `state` without
+    /// emitting any token. Called at the start of an assistant turn so the model
+    /// "deliberates" before its first output. No-op when pondering is disabled.
+    pub fn ponder(&self, state: &mut InferenceState) -> anyhow::Result<()> {
+        let steps = self.config.ponder_steps;
+        let thought = match (&self.thought, steps) {
+            (Some(t), s) if s > 0 => t,
+            _ => return Ok(()),
+        };
+        for _ in 0..steps {
+            let mut x = thought.unsqueeze(0)?; // (1, D)
+            for (i, block) in self.blocks.iter().enumerate() {
+                x = block.forward_step(&x, &mut state.layers[i])?;
+            }
+            // Output discarded: pondering updates state, it does not sample.
+        }
+        Ok(())
     }
 
     /// Set the training-forward compute dtype (e.g. `DType::BF16` for mixed

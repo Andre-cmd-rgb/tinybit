@@ -1,0 +1,38 @@
+# ~17M brain-native `nano` model on a single NVIDIA L4 (24 GB VRAM).
+#
+# nano is ~3x smaller than micro, so it trains and runs faster. The bet is that
+# offloading facts to the local knowledge store (retrieval) lets a small model
+# spend its capacity on language + reasoning rather than memorization.
+#
+# Per-step token budget:
+#   batch 24 × seq 512 × grad_accum 4 = 49_152 tokens / step
+# nano is small enough that VRAM is not the binding constraint at the micro
+# batch; the larger batch keeps the fused WKV kernel's blocks (B*H) occupied
+# (24*4 = 96 blocks). Validate the exact batch on a live L4 before a long run
+# (see CLAUDE.md decision 16 — do not assume VRAM headroom).
+#
+# Pair with:
+#   DATA_PROFILE=grounded   (language + summarization + retrieval-grounded QA;
+#                            de-emphasize parametric world-facts)
+#   DATA_TOKENS=1500000000
+#   CUSTOM_CHAT_EPOCHS=8
+
+train_data     = "data/train.bin"
+val_data       = "data/val.bin"
+checkpoint_dir = "checkpoints/"
+
+batch_size     = 24
+grad_accum     = 4
+total_steps    = 60000
+peak_lr        = 4e-4
+weight_decay   = 0.01
+grad_clip      = 1.0
+bf16           = true
+
+fused_ce       = false
+
+save_every     = 500
+eval_every     = 500
+eval_batches   = 20
+
+smoke_test_steps = 0

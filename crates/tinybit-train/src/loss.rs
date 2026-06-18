@@ -260,6 +260,11 @@ mod tests {
             max_seq_len: 32,
             dropout: 0.0,
             spec_heads: 0,
+            spike_threshold: 0.0,
+            fast_weights: false,
+            fw_eta: 0.0,
+            fw_decay: 0.0,
+            ponder_steps: 0,
         };
         let (b, t) = (2usize, 12usize);
         let vocab = cfg.vocab_size as u32;

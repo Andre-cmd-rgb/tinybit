@@ -10,6 +10,8 @@ fn tiny_config() -> ModelConfig {
         vocab_size: 256, num_layers: 3, d_model: 64, d_ffn: 224,
         num_heads: 1, head_dim: 64, ternary_ffn: false, int8_time: false,
         max_seq_len: 64, dropout: 0.0, spec_heads: 0,
+        spike_threshold: 0.0, fast_weights: false, fw_eta: 0.0,
+        fw_decay: 0.0, ponder_steps: 0,
     }
 }
 

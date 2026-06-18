@@ -1,0 +1,37 @@
+# nano — the brain-native tinybit (~17M params).
+#
+# Smaller and faster to train and run than `micro`, with the brain-inspired
+# mechanisms turned ON. The design bet: keep the model small and teach it
+# language + summarizing + conversation, and let it FETCH facts from the local
+# knowledge store (the `lookup` tool / retrieval "hippocampus") instead of
+# memorizing them. See CLAUDE.md and configs/train-nano-l4.toml.
+#
+# Architecture (8 layers, d_model 256, 3.5x FFN):
+vocab_size  = 32008
+num_layers  = 8
+d_model     = 256
+d_ffn       = 896
+num_heads   = 4
+head_dim    = 64
+max_seq_len = 512
+dropout     = 0.05
+spec_heads  = 0
+ternary_ffn = false
+int8_time   = false
+
+# --- Brain-inspired mechanisms (this model is trained from scratch with them) ---
+
+# Spiking activation sparsity ("efficient"): channel-mix activations below this
+# magnitude don't fire. 0.0 = dense. Small value → event-driven sparse code.
+spike_threshold = 0.02
+
+# Hebbian fast-weights ("rewires itself"): a decaying associative ΔW updated
+# online during inference and added to the time-mix value path, so the model
+# adapts within a conversation. Inference-only (training is unchanged).
+fast_weights = true
+fw_eta       = 0.02   # Hebbian learning rate
+fw_decay     = 0.97   # per-step forgetting (memory horizon ~33 steps)
+
+# Pondering ("thinks"): latent recurrence steps over a learned thought embedding
+# at the start of each assistant turn, before emitting — internal deliberation.
+ponder_steps = 2

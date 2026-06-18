@@ -24,6 +24,13 @@ pub struct TimeMix {
     pub num_heads: usize,
     pub head_dim: usize,
     pub d_model: usize,
+
+    /// Hebbian fast-weights (see `ModelConfig`). When enabled, a decaying
+    /// associative ΔW (held in `LayerState::fast_w`) is added to the value path
+    /// and updated online from co-activation — inference-time plasticity.
+    fast_weights: bool,
+    fw_eta: f64,
+    fw_decay: f64,
 }
 
 impl TimeMix {
@@ -66,6 +73,9 @@ impl TimeMix {
             time_decay, group_norm_weight, group_norm_bias,
             time_maa_x, time_maa_r, time_maa_k, time_maa_v,
             num_heads: h, head_dim: dh, d_model: d,
+            fast_weights: config.fast_weights,
+            fw_eta: config.fw_eta,
+            fw_decay: config.fw_decay,
         })
     }
 
@@ -223,8 +233,24 @@ impl TimeMix {
 
         let r = self.w_r.forward(&x_r)?; // (B, D)
         let k = self.w_k.forward(&x_k)?;
-        let v = self.w_v.forward(&x_v)?;
+        let mut v = self.w_v.forward(&x_v)?;
         let g = silu(&self.w_g1.forward(&x_x)?)?.broadcast_mul(&self.w_g2.forward(&x_x)?)?;
+
+        // Hebbian fast-weights: add the decaying associative ΔW to the value path
+        // and update it from this step's (pre, post) co-activation. Inference-only
+        // (detached); this is the in-conversation "rewiring".
+        if self.fast_weights {
+            if let Some(fw) = state.fast_w.as_ref() {
+                // Use the first batch sample (interactive inference is B=1).
+                let pre = x_v.get(0)?.to_dtype(DType::F32)?; // (D,)
+                let post = v.get(0)?.to_dtype(DType::F32)?;  // (D,), pre-augmentation
+                let contrib = fw.matmul(&pre.unsqueeze(1)?)?.squeeze(1)?; // ΔW·pre, (D,)
+                v = v.broadcast_add(&contrib.unsqueeze(0)?.to_dtype(v.dtype())?)?;
+                let outer = post.unsqueeze(1)?.matmul(&pre.unsqueeze(0)?)?; // post⊗pre, (D,D)
+                let new_fw = ((fw * self.fw_decay)? + (outer * self.fw_eta)?)?;
+                state.fast_w = Some(new_fw.detach());
+            }
+        }
 
         let w = self.compute_decay()?; // (H, dh)
 

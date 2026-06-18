@@ -12,6 +12,21 @@ pub struct ChannelMix {
     time_maa_k: Tensor,
     time_maa_r: Tensor,
     d_model: usize,
+    /// Spiking sparsity threshold (see `ModelConfig::spike_threshold`). 0 = dense.
+    spike_threshold: f64,
+}
+
+/// Spiking gate: zero post-activation values whose magnitude is below `thresh`
+/// (the neuron "doesn't fire"). The mask is a non-differentiable constant, so
+/// gradient flows straight through the firing entries (ReLU-like) and is zero
+/// for the silenced ones. `thresh <= 0` returns the input unchanged (dense).
+fn spike_gate(a: &Tensor, thresh: f64) -> anyhow::Result<Tensor> {
+    if thresh <= 0.0 {
+        return Ok(a.clone());
+    }
+    let thr = Tensor::new(thresh as f32, a.device())?.to_dtype(a.dtype())?;
+    let mask = a.abs()?.broadcast_ge(&thr)?.to_dtype(a.dtype())?;
+    Ok((a * mask)?)
 }
 
 impl ChannelMix {
@@ -31,7 +46,11 @@ impl ChannelMix {
             "time_maa_r",
             candle_nn::Init::Const(0.5),
         )?;
-        Ok(Self { w_k, w_v, w_r, time_maa_k, time_maa_r, d_model: config.d_model })
+        Ok(Self {
+            w_k, w_v, w_r, time_maa_k, time_maa_r,
+            d_model: config.d_model,
+            spike_threshold: config.spike_threshold,
+        })
     }
 
     /// Training forward: (B, T, D) → (B, T, D)
@@ -56,7 +75,7 @@ impl ChannelMix {
         let x_r = prev_x.broadcast_add(&maa_r.broadcast_mul(&diff)?)?;
 
         let k_pre = self.w_k.forward(&x_k)?;
-        let k = silu(&k_pre)?;
+        let k = spike_gate(&silu(&k_pre)?, self.spike_threshold)?;
         let k_sq = k.sqr()?;
         let v = self.w_v.forward(&k_sq)?;
         let r_pre = self.w_r.forward(&x_r)?;
@@ -87,7 +106,7 @@ impl ChannelMix {
         state.ffn_shift = x_for_state.to_dtype(DType::F32)?.detach();
 
         let k_pre = self.w_k.forward(&x_k)?;
-        let k = silu(&k_pre)?;
+        let k = spike_gate(&silu(&k_pre)?, self.spike_threshold)?;
         let k_sq = k.sqr()?;
         let v = self.w_v.forward(&k_sq)?;
         let r_pre = self.w_r.forward(&x_r)?;
