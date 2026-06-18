@@ -26,6 +26,8 @@ enum Commands {
     Eval(commands::eval::EvalArgs),
     /// Train a model from a config (local smoke test or full run).
     Train(commands::train::TrainArgs),
+    /// Consolidate saved conversations into the model ("sleep"/dream replay).
+    Dream(commands::dream::DreamArgs),
     /// Export / quantize a checkpoint (safetensors; ternary packing optional).
     Convert(commands::convert::ConvertArgs),
     /// Download the tokenizer from HuggingFace.
@@ -46,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Chat(args) => commands::chat::run(args),
         Commands::Eval(args) => commands::eval::run(args),
         Commands::Train(args) => commands::train::run(args),
+        Commands::Dream(args) => commands::dream::run(args),
         Commands::Convert(args) => commands::convert::run(args),
         Commands::Download(args) => commands::download::run(args).await,
     }
