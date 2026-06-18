@@ -2,7 +2,7 @@ use crate::sampler::{sample, SamplingParams};
 use crate::session::Session;
 use candle_core::{Device, DType, Tensor};
 use tinybit_core::{config::ModelConfig, model::TinyBit, state::InferenceState, tokenizer::Tokenizer};
-use tinybit_tools::ToolRegistry;
+use tinybit_tools::{KnowledgeStore, ToolRegistry};
 
 pub struct InferenceEngine {
     pub model:     TinyBit,
@@ -14,6 +14,13 @@ pub struct InferenceEngine {
     /// at sampling time to stop the model emitting a tool call on a turn that
     /// doesn't warrant one. Precomputed from the tokenizer once at load.
     pub tool_start_ban: Vec<u32>,
+    /// Local knowledge store (the "hippocampus") for automatic retrieval.
+    pub knowledge: Option<KnowledgeStore>,
+    /// Automatic retrieval (RAG): when > 0, each chat turn searches the knowledge
+    /// store and prepends up to this many passages to the system prompt, so the
+    /// small model can answer factual questions by *fetching* rather than
+    /// memorizing. 0 = off.
+    pub rag_top_k: usize,
 }
 
 /// Timing and token counts for a single generation, surfaced to the CLI.
@@ -81,7 +88,50 @@ impl InferenceEngine {
         }
         tool_start_ban.sort_unstable();
         tool_start_ban.dedup();
-        Ok(Self { model, tokenizer, tools, device, params: SamplingParams::default(), tool_start_ban })
+        // Best-effort: a missing/invalid knowledge store just disables retrieval.
+        let knowledge = KnowledgeStore::new(data_dir).ok();
+        Ok(Self {
+            model,
+            tokenizer,
+            tools,
+            device,
+            params: SamplingParams::default(),
+            tool_start_ban,
+            knowledge,
+            rag_top_k: 0,
+        })
+    }
+
+    /// Enable/disable automatic retrieval (RAG). `k` passages are prepended to
+    /// the system prompt for factual turns; 0 disables it.
+    pub fn set_rag(&mut self, k: usize) {
+        self.rag_top_k = k;
+    }
+
+    /// Search the local knowledge store for the query and, if anything matches,
+    /// return a context block to prepend to the system prompt. `None` when RAG is
+    /// off, there's no store, or nothing clears the relevance bar (so non-factual
+    /// turns like greetings get no spurious context).
+    fn retrieve_context(&self, query: &str) -> Option<String> {
+        if self.rag_top_k == 0 {
+            return None;
+        }
+        let store = self.knowledge.as_ref()?;
+        let hits = store.search(query, self.rag_top_k, tinybit_tools::knowledge::DEFAULT_MIN_COVERAGE);
+        if hits.is_empty() {
+            return None;
+        }
+        let mut block = String::from(
+            "Use the following locally retrieved facts to answer if they are relevant. \
+             If they do not help, answer in your own words and do not invent facts.\nRetrieved facts:\n",
+        );
+        for p in &hits {
+            match &p.title {
+                Some(t) => block.push_str(&format!("- {t}: {}\n", p.text)),
+                None => block.push_str(&format!("- {}\n", p.text)),
+            }
+        }
+        Some(block)
     }
 
     /// Auto-detect best device: Metal on Apple Silicon, CUDA if available, else CPU.
@@ -162,8 +212,14 @@ impl InferenceEngine {
         on_token: Option<&mut dyn FnMut(&str)>,
     ) -> anyhow::Result<(String, GenStats)> {
         use crate::processor::{message_needs_tools, ToolMode, ToolProcessor};
+        // Automatic retrieval: fold any locally retrieved facts into the system
+        // prompt so the model answers by fetching, not memorizing.
+        let system_prompt = match self.retrieve_context(user_message) {
+            Some(ctx) => format!("{}\n\n{}", session.system_prompt, ctx),
+            None => session.system_prompt.clone(),
+        };
         let prompt = self.tokenizer.apply_chat_template(
-            Some(&session.system_prompt),
+            Some(&system_prompt),
             user_message,
         )?;
         // Decide whether to suppress tool emission for this turn.

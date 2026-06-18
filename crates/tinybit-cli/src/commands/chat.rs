@@ -52,6 +52,13 @@ pub struct ChatArgs {
     /// `never` (pure conversation, no tools).
     #[arg(long, default_value = "auto")]
     pub tools: String,
+
+    /// Automatic retrieval (RAG): number of passages from the local knowledge
+    /// store to prepend to the system prompt for factual turns. The "fetch,
+    /// don't memorize" path — a tiny model answers facts by searching local
+    /// knowledge. 0 disables it.
+    #[arg(long, default_value_t = 3)]
+    pub rag: usize,
 }
 
 pub fn run(args: ChatArgs) -> anyhow::Result<()> {
@@ -88,6 +95,7 @@ pub fn run(args: ChatArgs) -> anyhow::Result<()> {
         device.clone(),
     )?;
     engine.params.temperature = args.temperature;
+    engine.set_rag(args.rag);
 
     let mut session = if args.resume && args.session.exists() {
         Session::load(&args.session, &device)?
@@ -102,6 +110,11 @@ pub fn run(args: ChatArgs) -> anyhow::Result<()> {
 
     print_banner(&engine, &device, profile);
     println!("tools: {} (change with --tools auto|always|never)", args.tools.to_ascii_lowercase());
+    if engine.rag_top_k > 0 && engine.knowledge.is_some() {
+        println!("retrieval: on (local knowledge, top-{})", engine.rag_top_k);
+    } else {
+        println!("retrieval: off");
+    }
 
     let stdin = io::stdin();
     loop {

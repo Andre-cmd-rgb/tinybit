@@ -147,6 +147,45 @@ fn fast_weights_allocated_and_bounded() {
     assert!(prev < 1e4, "fast-weight trace not bounded: {prev}");
 }
 
+/// End-to-end model-side "turn" on the real `nano` brain config: all three
+/// mechanisms active together (spiking + fast-weights + pondering). Mirrors what
+/// the inference engine drives — prefill, ponder, decode — and asserts it stays
+/// finite and that the fast-weight trace actually engaged.
+#[test]
+fn nano_full_turn_runs_with_all_mechanisms() {
+    let cfg = ModelConfig::nano();
+    assert!(cfg.brain_enabled());
+    let varmap = VarMap::new();
+    let m = model_with(cfg.clone(), &varmap);
+    let mut state = InferenceState::zeros(&cfg, &Device::Cpu).unwrap();
+
+    // Prefill a short prompt.
+    for &id in &[1u32, 5, 9, 13, 17] {
+        let tok = Tensor::new(&[id], &Device::Cpu).unwrap();
+        m.forward_step(&tok, &mut state).unwrap();
+    }
+    // Deliberate.
+    m.ponder(&mut state).unwrap();
+
+    // Decode a few tokens greedily.
+    let mut prev = 17u32;
+    for _ in 0..5 {
+        let tok = Tensor::new(&[prev], &Device::Cpu).unwrap();
+        let logits = m.forward_step(&tok, &mut state).unwrap();
+        assert_eq!(logits.dims(), &[1, cfg.vocab_size]);
+        assert!(norm(&logits).is_finite(), "non-finite logits during nano turn");
+        prev = logits
+            .squeeze(0)
+            .unwrap()
+            .argmax(0)
+            .unwrap()
+            .to_scalar::<u32>()
+            .unwrap();
+    }
+    // Fast-weights engaged (trace is non-zero after the turn).
+    assert!(norm(state.layers[0].fast_w.as_ref().unwrap()) > 0.0);
+}
+
 /// Fast-weights make repeated exposure to a token shift its own next-step
 /// representation (in-conversation adaptation), while the disabled model is
 /// perfectly periodic. We compare the model's output vector drift across

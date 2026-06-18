@@ -208,6 +208,9 @@ impl<'a> ToolProcessor<'a> {
             let tid = Tensor::from_vec(vec![id], (1, 1), &eng.device)?.to_dtype(DType::U32)?;
             eng.model.forward_step(&tid, state)?;
         }
+        // Pondering ("thinks"): latent deliberation steps over the prompt before
+        // the model emits its first token. No-op when ponder_steps == 0.
+        eng.model.ponder(state)?;
         stats.prefill_secs = t_prefill.elapsed().as_secs_f64();
 
         let mut prev_id = last_id;
